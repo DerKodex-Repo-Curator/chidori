@@ -1317,11 +1317,14 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
     case CHIDORI_CUDA_LAUNCH_KERNEL: {
         /*
-         * Same payload layout as CHIDORI_CU_LAUNCH_KERNEL:
-         *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
+         * Payload: func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
          *   + blockX(4) + blockY(4) + blockZ(4)
-         *   + sharedMem(4) + stream_handle(8)
-         *   + has_params(1) + [buffer_size(4) + buffer_data(buffer_size)]
+         *   + sharedMem(4) + stream_handle(8) = 44 bytes
+         *   + has_params(1) + [buffer_size(4) + buffer_data(num_args*8)]
+         *
+         * The buffer contains num_args × 8 bytes, each being one kernel
+         * argument value. We reconstruct a kernelParams (void**) array
+         * pointing into the buffer, then call cuLaunchKernel.
          */
         if (req->payload_size < 44) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
@@ -1353,8 +1356,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         }
 
-        /* Parse kernel parameters if present */
+        /* Parse kernel parameters */
         size_t remaining = req->payload_size - 44;
+        void **kernel_params = NULL;
 
         if (remaining >= 1) {
             uint8_t has_params = 0;
@@ -1367,35 +1371,31 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 remaining -= 4;
 
                 if (buf_size > 0 && remaining >= buf_size) {
-                    void *param_buffer = p;
+                    /* Buffer has num_args * 8 bytes. Reconstruct void** array
+                     * where each entry points to its 8-byte value in the buffer. */
+                    int num_args = buf_size / 8;
+                    kernel_params = (void **)malloc(num_args * sizeof(void *));
+                    for (int i = 0; i < num_args; i++) {
+                        kernel_params[i] = p + (i * 8);
+                    }
 
-                    /* Use actual kernel param size, not client buffer size */
-                    int actual_ps = 0;
-                    cuFuncGetAttribute(&actual_ps, (CUfunction_attribute)74, func); /* PARAM_SIZE */
-                    size_t param_size = (actual_ps > 0) ? (size_t)actual_ps : (size_t)buf_size;
-
-                    void *extra[] = {
-                        CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
-                        CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
-                        CU_LAUNCH_PARAM_END
-                    };
-
-                    res = cuLaunchKernel(func,
-                                         gridX, gridY, gridZ,
-                                         blockX, blockY, blockZ,
-                                         shared, stream,
-                                         NULL, extra);
-                    return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+                    if (s_verbose)
+                        fprintf(stderr, "[cuda_dispatch] LAUNCH grid=(%u,%u,%u) block=(%u,%u,%u) args=%d\n",
+                                gridX, gridY, gridZ, blockX, blockY, blockZ, num_args);
                 }
             }
         }
 
-        /* No parameters — launch with NULL */
         res = cuLaunchKernel(func,
                              gridX, gridY, gridZ,
                              blockX, blockY, blockZ,
                              shared, stream,
-                             NULL, NULL);
+                             kernel_params, NULL);
+
+        free(kernel_params);
+
+        if (s_verbose)
+            fprintf(stderr, "[cuda_dispatch] LAUNCH result=%d\n", res);
 
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }

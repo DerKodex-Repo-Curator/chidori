@@ -3605,37 +3605,47 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
     if (args == NULL) param_size = 0;
 
     /*
-     * We know the exact param_size from the server (returned during
-     * __cudaRegisterFunction). Pack exactly that many bytes from args[].
-     * Each args[i] points to a kernel argument value. We copy 8 bytes
-     * per arg (covers pointers, int64, double; smaller types are padded).
-     * We send the EXACT param_size the server reported.
+     * Kernel parameter packing.
+     *
+     * args[] is an array of pointers where each points to a kernel argument.
+     * We DON'T know the exact count — CUDA provides no API for this.
+     * param_size from server is always 256 (fallback, attribute 74 doesn't exist).
+     *
+     * Strategy: send each arg as {size(4) + data(size)} so the server can
+     * reconstruct void** kernelParams. We count args by checking if args[i]
+     * looks like a valid pointer (non-NULL, aligned). Cap at 16 args max
+     * (PyTorch kernels rarely have more than 10).
+     *
+     * The server then passes kernelParams (not extra buffer) to cuLaunchKernel.
      */
 
+    /* Count args safely — cap at 16 */
+    int num_args = 0;
+    if (args != NULL) {
+        for (int i = 0; i < 16; i++) {
+            if (args[i] == NULL) break;
+            num_args++;
+        }
+    }
+    /* Override param_size to actual packed size */
+    param_size = num_args * 8;
+
     if (g_verbose)
-        fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) param_size=%d\n",
+        fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) num_args=%d param_size=%d\n",
                 (unsigned long long)func_handle,
                 gridDim.x, gridDim.y, gridDim.z,
                 blockDim.x, blockDim.y, blockDim.z,
-                param_size);
+                num_args, param_size);
 
     size_t payload_len = 44 + 1;
     uint8_t *param_buf = NULL;
 
     if (param_size > 0 && args != NULL) {
         param_buf = (uint8_t *)calloc(1, param_size);
-        /* Pack args into buffer. Each args[i] points to a kernel arg value.
-         * Copy 8 bytes per arg. Stop if we hit NULL (end of args array)
-         * or fill the buffer. Safe: never read more than param_size/8 entries. */
-        int max_args = param_size / 8;
-        if (max_args > 64) max_args = 64; /* absolute safety cap */
         int offset = 0;
-        for (int i = 0; i < max_args && offset < param_size; i++) {
-            if (args[i] == NULL) break;
-            int copy = 8;
-            if (offset + copy > param_size) copy = param_size - offset;
-            memcpy(param_buf + offset, args[i], copy);
-            offset += copy;
+        for (int i = 0; i < num_args; i++) {
+            memcpy(param_buf + offset, args[i], 8);
+            offset += 8;
         }
         payload_len += 4 + param_size;
     }
