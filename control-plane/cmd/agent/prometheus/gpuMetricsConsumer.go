@@ -9,8 +9,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/fpolica91/juice/control-plane/cmd/agent/gpu"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/cmd/agent/gpu"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
 )
 
 const (

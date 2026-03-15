@@ -9,7 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 )
 
 func getVersion() (string, error) {

@@ -10,9 +10,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
-	"github.com/fpolica91/juice/control-plane/pkg/server"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/chidori/control-plane/pkg/server"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 )
 
 type Frontend struct {

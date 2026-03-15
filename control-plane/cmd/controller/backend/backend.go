@@ -8,11 +8,11 @@ import (
 	"errors"
 	"time"
 
-	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
-	"github.com/fpolica91/juice/control-plane/pkg/gpu"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/chidori/control-plane/pkg/gpu"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 )
 
 type Backend struct {

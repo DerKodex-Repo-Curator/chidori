@@ -11,9 +11,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	pkgnet "github.com/fpolica91/juice/control-plane/pkg/net"
+	"github.com/fpolica91/chidori/control-plane/cmd/internal/build"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	pkgnet "github.com/fpolica91/chidori/control-plane/pkg/net"
 )
 
 // Pulled from former Node version

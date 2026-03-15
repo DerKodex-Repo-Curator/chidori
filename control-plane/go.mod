@@ -1,4 +1,4 @@
-module github.com/fpolica91/juice/control-plane
+module github.com/fpolica91/chidori/control-plane
 
 go 1.20
 

@@ -15,14 +15,14 @@ import (
 
 	"github.com/google/uuid"
 
-	cmdgpu "github.com/fpolica91/juice/control-plane/cmd/agent/gpu"
-	"github.com/fpolica91/juice/control-plane/pkg/errors"
-	"github.com/fpolica91/juice/control-plane/pkg/gpu"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/server"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
-	"github.com/fpolica91/juice/control-plane/pkg/utilities"
+	cmdgpu "github.com/fpolica91/chidori/control-plane/cmd/agent/gpu"
+	"github.com/fpolica91/chidori/control-plane/pkg/errors"
+	"github.com/fpolica91/chidori/control-plane/pkg/gpu"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/server"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/pkg/utilities"
 )
 
 var (

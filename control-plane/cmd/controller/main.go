@@ -13,21 +13,21 @@ import (
 	"os"
 	"strings"
 
-	"github.com/fpolica91/juice/control-plane/cmd/controller/backend"
-	"github.com/fpolica91/juice/control-plane/cmd/controller/frontend"
-	"github.com/fpolica91/juice/control-plane/cmd/controller/prometheus"
-	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
-	"github.com/fpolica91/juice/control-plane/cmd/controller/storage/gorm"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/backend"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/frontend"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/prometheus"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/storage/gorm"
 
 	"github.com/joho/godotenv"
 
-	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
-	"github.com/fpolica91/juice/control-plane/pkg/appmain"
-	"github.com/fpolica91/juice/control-plane/pkg/crypto"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	"github.com/fpolica91/juice/control-plane/pkg/sentry"
-	"github.com/fpolica91/juice/control-plane/pkg/server"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/cmd/internal/build"
+	"github.com/fpolica91/chidori/control-plane/pkg/appmain"
+	"github.com/fpolica91/chidori/control-plane/pkg/crypto"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/sentry"
+	"github.com/fpolica91/chidori/control-plane/pkg/server"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 )
 
 var (

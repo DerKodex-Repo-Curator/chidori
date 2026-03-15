@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/server"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/server"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 )
 
 var (

@@ -13,11 +13,11 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	pkgnet "github.com/fpolica91/juice/control-plane/pkg/net"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/utilities"
+	"github.com/fpolica91/chidori/control-plane/cmd/internal/build"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	pkgnet "github.com/fpolica91/chidori/control-plane/pkg/net"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/utilities"
 )
 
 const (

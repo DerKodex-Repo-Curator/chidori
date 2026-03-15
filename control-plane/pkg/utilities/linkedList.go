@@ -4,7 +4,7 @@
 package utilities
 
 import (
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
 )
 
 type Node[T any] struct {

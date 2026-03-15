@@ -11,9 +11,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-memdb"
 
-	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/utilities"
+	"github.com/fpolica91/chidori/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/utilities"
 )
 
 type Agent struct {

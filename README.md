@@ -1,8 +1,8 @@
-# Juice — GPU-over-IP
+# Chidori ⚡ — GPU-over-IP
 
 Transparent remote GPU access for CUDA compute workloads over TCP/IP.
 
-Run any CUDA application on a machine with **no GPU** — Juice intercepts CUDA API calls via `LD_PRELOAD` and forwards them to a remote GPU server over the network. The application doesn't know the GPU is remote.
+Run any CUDA application on a machine with **no GPU** — Chidori intercepts CUDA API calls via `LD_PRELOAD` and forwards them to a remote GPU server over the network. The application doesn't know the GPU is remote.
 
 ```
 CLIENT (no GPU)                         SERVER (has GPU)

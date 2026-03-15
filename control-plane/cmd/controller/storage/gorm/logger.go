@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
 	glogger "gorm.io/gorm/logger"
 	"gorm.io/gorm/utils"
 )

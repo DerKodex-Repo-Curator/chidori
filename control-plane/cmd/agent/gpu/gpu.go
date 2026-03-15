@@ -9,8 +9,8 @@ import (
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 
-	"github.com/fpolica91/juice/control-plane/pkg/gpu"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/gpu"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
 )
 
 func DetectGpus() (*gpu.GpuSet, error) {

@@ -6,8 +6,8 @@ package utilities
 import (
 	"reflect"
 
-	"github.com/fpolica91/juice/control-plane/pkg/errors"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/errors"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
 )
 
 var (

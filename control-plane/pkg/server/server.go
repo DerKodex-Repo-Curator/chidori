@@ -14,11 +14,11 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 
-	"github.com/fpolica91/juice/control-plane/pkg/errors"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	"github.com/fpolica91/juice/control-plane/pkg/middleware"
-	"github.com/fpolica91/juice/control-plane/pkg/sentry"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/chidori/control-plane/pkg/errors"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/middleware"
+	"github.com/fpolica91/chidori/control-plane/pkg/sentry"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 
 	sentryhttp "github.com/getsentry/sentry-go/http"
 )

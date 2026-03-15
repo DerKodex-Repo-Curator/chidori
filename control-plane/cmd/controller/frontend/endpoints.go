@@ -12,11 +12,11 @@ import (
 	"github.com/auth0/go-jwt-middleware/v2/validator"
 	"github.com/gorilla/mux"
 
-	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	pkgnet "github.com/fpolica91/juice/control-plane/pkg/net"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/server"
+	"github.com/fpolica91/chidori/control-plane/cmd/internal/build"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	pkgnet "github.com/fpolica91/chidori/control-plane/pkg/net"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/server"
 )
 
 func (frontend *Frontend) initializeEndpoints(server *server.Server) {

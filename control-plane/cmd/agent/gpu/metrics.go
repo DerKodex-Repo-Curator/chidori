@@ -10,10 +10,10 @@ import (
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 
-	pkggpu "github.com/fpolica91/juice/control-plane/pkg/gpu"
-	"github.com/fpolica91/juice/control-plane/pkg/logger"
-	"github.com/fpolica91/juice/control-plane/pkg/restapi"
-	"github.com/fpolica91/juice/control-plane/pkg/task"
+	pkggpu "github.com/fpolica91/chidori/control-plane/pkg/gpu"
+	"github.com/fpolica91/chidori/control-plane/pkg/logger"
+	"github.com/fpolica91/chidori/control-plane/pkg/restapi"
+	"github.com/fpolica91/chidori/control-plane/pkg/task"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"go.uber.org/zap/buffer"
 	"go.uber.org/zap/zapcore"
 
-	pool "github.com/fpolica91/juice/control-plane/pkg/logger/pool"
+	pool "github.com/fpolica91/chidori/control-plane/pkg/logger/pool"
 )
 
 // This is copy-pasta basically from zapcore.memory_encoder.go
