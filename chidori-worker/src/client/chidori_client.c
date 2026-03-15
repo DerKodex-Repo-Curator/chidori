@@ -3620,47 +3620,57 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
      */
 
     /*
-     * Count kernel args. The args[] array is NOT null-terminated.
-     * PyTorch packs arg values contiguously on the stack, and args[i]
-     * points into that region. Valid arg pointers are close together
-     * (within ~4KB). When we see a pointer far from args[0], we've
-     * passed the end of the real args into garbage memory.
+     * CONTIGUOUS BUFFER APPROACH:
+     * args[0], args[1], ... point into a contiguous parameter block
+     * (PyTorch packs kernel args on the stack). Instead of copying
+     * individual args, send the entire contiguous memory region from
+     * the lowest arg pointer to the highest + padding.
+     *
+     * The server passes this buffer to cuLaunchKernel via
+     * CU_LAUNCH_PARAM_BUFFER_POINTER — the CUDA driver knows the
+     * exact parameter layout from the kernel's metadata.
      */
-    int num_args = 0;
+    size_t total_param_size = 0;
+    uint8_t *param_buf = NULL;
+
     if (args != NULL && args[0] != NULL) {
-        uintptr_t base = (uintptr_t)args[0];
-        num_args = 1;
+        /* Find the span of the contiguous parameter block */
+        uintptr_t buf_start = (uintptr_t)args[0];
+        uintptr_t buf_end = buf_start + 8;
+
+        /* Count args using proximity check */
+        int num_args = 1;
         for (int i = 1; i < 16; i++) {
             if (args[i] == NULL) break;
             uintptr_t p = (uintptr_t)args[i];
-            /* Check if pointer is within 4KB of the base — same stack frame */
-            uintptr_t diff = (p > base) ? (p - base) : (base - p);
-            if (diff > 4096) break; /* left the arg region */
+            uintptr_t diff = (p > buf_start) ? (p - buf_start) : (buf_start - p);
+            if (diff > 4096) break;
             num_args++;
+            if (p < buf_start) buf_start = p;
+            if (p + 8 > buf_end) buf_end = p + 8;
         }
+
+        total_param_size = buf_end - buf_start;
+        /* Cap at reasonable size */
+        if (total_param_size > 4096) total_param_size = 4096;
+
+        param_buf = (uint8_t *)malloc(total_param_size);
+        memcpy(param_buf, (void *)buf_start, total_param_size);
+
+        if (g_verbose)
+            fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) "
+                    "num_args=%d buf_span=%zu (0x%llx-0x%llx)\n",
+                    (unsigned long long)func_handle,
+                    gridDim.x, gridDim.y, gridDim.z,
+                    blockDim.x, blockDim.y, blockDim.z,
+                    num_args, total_param_size,
+                    (unsigned long long)buf_start, (unsigned long long)buf_end);
     }
-    /* Override param_size to actual packed size */
-    param_size = num_args * 8;
 
-    if (g_verbose)
-        fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) num_args=%d param_size=%d\n",
-                (unsigned long long)func_handle,
-                gridDim.x, gridDim.y, gridDim.z,
-                blockDim.x, blockDim.y, blockDim.z,
-                num_args, param_size);
-
+    param_size = (int32_t)total_param_size;
     size_t payload_len = 44 + 1;
-    uint8_t *param_buf = NULL;
-
-    if (param_size > 0 && args != NULL) {
-        param_buf = (uint8_t *)calloc(1, param_size);
-        int offset = 0;
-        for (int i = 0; i < num_args; i++) {
-            memcpy(param_buf + offset, args[i], 8);
-            offset += 8;
-        }
-        payload_len += 4 + param_size;
-    }
+    if (total_param_size > 0)
+        payload_len += 4 + total_param_size;
 
     void *payload = malloc(payload_len);
     char *p = (char *)payload;

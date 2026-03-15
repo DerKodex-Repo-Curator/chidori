@@ -1320,11 +1320,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * Payload: func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
          *   + blockX(4) + blockY(4) + blockZ(4)
          *   + sharedMem(4) + stream_handle(8) = 44 bytes
-         *   + has_params(1) + [buffer_size(4) + buffer_data(num_args*8)]
+         *   + has_params(1) + [buffer_size(4) + buffer_data(buffer_size)]
          *
-         * The buffer contains num_args × 8 bytes, each being one kernel
-         * argument value. We reconstruct a kernelParams (void**) array
-         * pointing into the buffer, then call cuLaunchKernel.
+         * The buffer is a contiguous copy of the client's kernel parameter
+         * memory. We pass it directly to cuLaunchKernel via
+         * CU_LAUNCH_PARAM_BUFFER_POINTER — the CUDA driver parses it
+         * using the kernel's metadata (no need to reconstruct void**).
          */
         if (req->payload_size < 44) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
@@ -1356,47 +1357,51 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         }
 
-        /* Parse kernel parameters */
+        /* Parse kernel parameter buffer */
         size_t remaining = req->payload_size - 44;
-        void **kernel_params = NULL;
 
-        if (remaining >= 1) {
+        if (remaining >= 5) {
             uint8_t has_params = 0;
             memcpy(&has_params, p, 1); p += 1;
-            remaining -= 1;
 
-            if (has_params && remaining >= 4) {
+            if (has_params) {
                 uint32_t buf_size = 0;
                 memcpy(&buf_size, p, 4); p += 4;
-                remaining -= 4;
 
-                if (buf_size > 0 && remaining >= buf_size) {
-                    /* Buffer has num_args * 8 bytes. Reconstruct void** array
-                     * where each entry points to its 8-byte value in the buffer. */
-                    int num_args = buf_size / 8;
-                    kernel_params = (void **)malloc(num_args * sizeof(void *));
-                    for (int i = 0; i < num_args; i++) {
-                        kernel_params[i] = p + (i * 8);
-                    }
+                if (buf_size > 0) {
+                    void *param_buffer = p;
+                    size_t param_size = (size_t)buf_size;
 
                     if (s_verbose)
-                        fprintf(stderr, "[cuda_dispatch] LAUNCH grid=(%u,%u,%u) block=(%u,%u,%u) args=%d\n",
-                                gridX, gridY, gridZ, blockX, blockY, blockZ, num_args);
+                        fprintf(stderr, "[cuda_dispatch] LAUNCH grid=(%u,%u,%u) block=(%u,%u,%u) buf=%u\n",
+                                gridX, gridY, gridZ, blockX, blockY, blockZ, buf_size);
+
+                    void *extra[] = {
+                        CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
+                        CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
+                        CU_LAUNCH_PARAM_END
+                    };
+
+                    res = cuLaunchKernel(func,
+                                         gridX, gridY, gridZ,
+                                         blockX, blockY, blockZ,
+                                         shared, stream,
+                                         NULL, extra);
+
+                    if (s_verbose)
+                        fprintf(stderr, "[cuda_dispatch] LAUNCH result=%d\n", res);
+
+                    return chidori_send_response(fd, req->seq_num, res, NULL, 0);
                 }
             }
         }
 
+        /* No parameters */
         res = cuLaunchKernel(func,
                              gridX, gridY, gridZ,
                              blockX, blockY, blockZ,
                              shared, stream,
-                             kernel_params, NULL);
-
-        free(kernel_params);
-
-        if (s_verbose)
-            fprintf(stderr, "[cuda_dispatch] LAUNCH result=%d\n", res);
-
+                             NULL, NULL);
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
 
