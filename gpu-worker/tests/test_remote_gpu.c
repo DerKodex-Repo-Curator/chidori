@@ -59,6 +59,9 @@ typedef CUresult (*fn_cuEventRecord)(CUevent, CUstream);
 typedef CUresult (*fn_cuEventSynchronize)(CUevent);
 typedef CUresult (*fn_cuEventElapsedTime)(float *, CUevent, CUevent);
 typedef CUresult (*fn_cuMemsetD32)(CUdeviceptr, unsigned int, size_t);
+typedef CUresult (*fn_cuCtxCreate)(CUcontext *, unsigned int, CUdevice);
+typedef CUresult (*fn_cuCtxSetCurrent)(CUcontext);
+typedef CUresult (*fn_cuDevicePrimaryCtxRetain)(CUcontext *, CUdevice);
 
 #define LOAD(name) ((fn_##name)dlsym(RTLD_DEFAULT, #name))
 #define LOAD_V2(name) ((fn_##name)dlsym(RTLD_DEFAULT, #name "_v2"))
@@ -134,6 +137,9 @@ int main(void) {
     fn_cuEventRecord cuEventRecord = LOAD(cuEventRecord);
     fn_cuEventSynchronize cuEventSynchronize = LOAD(cuEventSynchronize);
     fn_cuEventElapsedTime cuEventElapsedTime = LOAD(cuEventElapsedTime);
+    fn_cuCtxCreate cuCtxCreate = LOAD_V2(cuCtxCreate);
+    fn_cuCtxSetCurrent cuCtxSetCurrent = LOAD(cuCtxSetCurrent);
+    fn_cuDevicePrimaryCtxRetain cuDevicePrimaryCtxRetain = LOAD(cuDevicePrimaryCtxRetain);
     (void)0; /* cuMemsetD32 available but not used in this test */
 
     /* ============================================================
@@ -405,7 +411,115 @@ int main(void) {
     }
 
     /* ============================================================
-     * 9. Final sync
+     * 9. Multi-GPU Support
+     * ============================================================ */
+    SECTION("Multi-GPU Support");
+
+    if (count >= 2 && cuCtxCreate && cuCtxSetCurrent && cuDevicePrimaryCtxRetain) {
+        TEST_FMT("Device count >= 2", count >= 2, "%d GPUs", count);
+
+        /* Query name and memory for each GPU */
+        int multigpu_ok = 1;
+        for (int i = 0; i < count && i < 8; i++) {
+            CUdevice gpu_dev = 0;
+            r = cuDeviceGet(&gpu_dev, i);
+            if (r != 0) { multigpu_ok = 0; break; }
+
+            char gpu_name[256] = {0};
+            r = cuDeviceGetName(gpu_name, sizeof(gpu_name), gpu_dev);
+            if (r != 0 || gpu_name[0] == '\0') { multigpu_ok = 0; break; }
+
+            size_t gpu_mem = 0;
+            r = cuDeviceTotalMem(&gpu_mem, gpu_dev);
+            if (r != 0 || gpu_mem == 0) { multigpu_ok = 0; break; }
+
+            printf("    GPU %d: %s (%.1f GB)\n", i, gpu_name,
+                   (double)gpu_mem / (1024.0 * 1024.0 * 1024.0));
+        }
+        TEST("Get name/memory for each GPU", multigpu_ok);
+
+        /* Get device handles for GPU 0 and GPU 1 */
+        CUdevice dev0 = 0, dev1 = 0;
+        cuDeviceGet(&dev0, 0);
+        cuDeviceGet(&dev1, 1);
+        TEST("Get device handles for GPU 0 and 1", dev0 != dev1);
+
+        /* Create/retain contexts on both devices */
+        CUcontext ctx0 = NULL, ctx1 = NULL;
+        r = cuDevicePrimaryCtxRetain(&ctx0, dev0);
+        TEST("PrimaryCtxRetain on GPU 0", r == 0 && ctx0 != NULL);
+
+        r = cuDevicePrimaryCtxRetain(&ctx1, dev1);
+        TEST("PrimaryCtxRetain on GPU 1", r == 0 && ctx1 != NULL);
+
+        TEST("Contexts are different", ctx0 != ctx1);
+
+        /* Allocate memory on GPU 0 */
+        r = cuCtxSetCurrent(ctx0);
+        TEST("Set context to GPU 0", r == 0);
+
+        CUdeviceptr d_gpu0 = 0;
+        r = cuMemAlloc(&d_gpu0, 1024 * 1024);
+        TEST_FMT("Alloc 1MB on GPU 0", r == 0, "ptr=0x%llx", (unsigned long long)d_gpu0);
+
+        /* Allocate memory on GPU 1 */
+        r = cuCtxSetCurrent(ctx1);
+        TEST("Set context to GPU 1", r == 0);
+
+        CUdeviceptr d_gpu1 = 0;
+        r = cuMemAlloc(&d_gpu1, 1024 * 1024);
+        TEST_FMT("Alloc 1MB on GPU 1", r == 0, "ptr=0x%llx", (unsigned long long)d_gpu1);
+
+        TEST("Allocations on different devices", d_gpu0 != d_gpu1);
+
+        /* Write data on GPU 0, read back */
+        r = cuCtxSetCurrent(ctx0);
+        float *mg_src = (float *)calloc(1024, sizeof(float));
+        for (int i = 0; i < 1024; i++) mg_src[i] = (float)i * 2.0f;
+        r = cuMemcpyHtoD(d_gpu0, mg_src, 1024 * sizeof(float));
+        TEST("HtoD on GPU 0", r == 0);
+
+        float *mg_dst = (float *)calloc(1024, sizeof(float));
+        r = cuMemcpyDtoH(mg_dst, d_gpu0, 1024 * sizeof(float));
+        int mg_match = 1;
+        for (int i = 0; i < 1024; i++) {
+            if (mg_src[i] != mg_dst[i]) { mg_match = 0; break; }
+        }
+        TEST("Data integrity on GPU 0", r == 0 && mg_match);
+
+        /* Write data on GPU 1, read back */
+        r = cuCtxSetCurrent(ctx1);
+        for (int i = 0; i < 1024; i++) mg_src[i] = (float)i * 3.0f;
+        r = cuMemcpyHtoD(d_gpu1, mg_src, 1024 * sizeof(float));
+        TEST("HtoD on GPU 1", r == 0);
+
+        memset(mg_dst, 0, 1024 * sizeof(float));
+        r = cuMemcpyDtoH(mg_dst, d_gpu1, 1024 * sizeof(float));
+        mg_match = 1;
+        for (int i = 0; i < 1024; i++) {
+            if (mg_src[i] != mg_dst[i]) { mg_match = 0; break; }
+        }
+        TEST("Data integrity on GPU 1", r == 0 && mg_match);
+
+        /* Free allocations */
+        cuCtxSetCurrent(ctx0);
+        cuMemFree(d_gpu0);
+        cuCtxSetCurrent(ctx1);
+        cuMemFree(d_gpu1);
+
+        free(mg_src);
+        free(mg_dst);
+
+        /* Restore context to GPU 0 */
+        cuCtxSetCurrent(ctx0);
+    } else if (count < 2) {
+        printf("  (only %d GPU detected, skipping multi-GPU tests)\n", count);
+    } else {
+        printf("  (context functions not available, skipping multi-GPU tests)\n");
+    }
+
+    /* ============================================================
+     * 10. Final sync
      * ============================================================ */
     SECTION("Cleanup");
 

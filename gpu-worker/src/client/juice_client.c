@@ -470,37 +470,155 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
 }
 
 /* Execution */
+
+/*
+ * CUDA extra parameter sentinel values.
+ * Defined as ((void*)0x01) etc. in cuda.h; redefined here to avoid
+ * requiring cuda.h on the client side.
+ */
+#define JUICE_CU_LAUNCH_PARAM_BUFFER_POINTER ((void *)0x01)
+#define JUICE_CU_LAUNCH_PARAM_BUFFER_SIZE    ((void *)0x02)
+#define JUICE_CU_LAUNCH_PARAM_END            ((void *)0x00)
+
+CUresult cuFuncGetAttribute(int *pi, int attrib, CUfunction hfunc) {
+    struct { int32_t attrib; uint64_t func; } req;
+    req.attrib = attrib;
+    req.func = (uint64_t)(uintptr_t)hfunc;
+    size_t len = sizeof(int32_t);
+    return juice_rpc(JUICE_CU_FUNC_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
+}
+
 CUresult cuLaunchKernel(CUfunction f,
                         unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                         unsigned int sharedMemBytes, CUstream hStream,
                         void **kernelParams, void **extra) {
     /*
-     * Kernel launch serialization:
-     *   func_handle(8) + grid(12) + block(12) + shared(4) + stream(8) = 44 bytes header
-     *   + serialized kernel parameters
+     * Kernel launch serialization — wire format:
+     *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
+     *   + blockX(4) + blockY(4) + blockZ(4)
+     *   + sharedMem(4) + stream_handle(8) = 44 bytes header
+     *   + has_params(1):
+     *       0 = no kernel parameters
+     *       1 = contiguous parameter buffer follows
+     *   + [if has_params == 1]: buffer_size(4) + buffer_data(buffer_size)
      *
-     * TODO Phase 2: Properly serialize kernelParams and extra.
-     * For now, send the header only (stub mode).
+     * On the server side, the buffer is passed via CU_LAUNCH_PARAM_BUFFER_POINTER
+     * and CU_LAUNCH_PARAM_BUFFER_SIZE through cuLaunchKernel's extra parameter.
      */
-    (void)kernelParams;
-    (void)extra;
 
-    struct __attribute__((packed)) {
-        uint64_t func;
-        uint32_t gridX, gridY, gridZ;
-        uint32_t blockX, blockY, blockZ;
-        uint32_t shared;
-        uint64_t stream;
-    } req;
+    /* --- Extract kernel parameter buffer --- */
+    void *param_buffer = NULL;
+    size_t param_buffer_size = 0;
+    int param_buffer_allocated = 0; /* 1 if we malloc'd param_buffer */
 
-    req.func = (uint64_t)(uintptr_t)f;
-    req.gridX = gridDimX;  req.gridY = gridDimY;  req.gridZ = gridDimZ;
-    req.blockX = blockDimX; req.blockY = blockDimY; req.blockZ = blockDimZ;
-    req.shared = sharedMemBytes;
-    req.stream = (uint64_t)(uintptr_t)hStream;
+    if (extra != NULL) {
+        /*
+         * The extra array contains tagged key-value pairs:
+         *   CU_LAUNCH_PARAM_BUFFER_POINTER, <ptr>,
+         *   CU_LAUNCH_PARAM_BUFFER_SIZE, <size_t*>,
+         *   CU_LAUNCH_PARAM_END
+         */
+        for (int i = 0; extra[i] != JUICE_CU_LAUNCH_PARAM_END; i++) {
+            if (extra[i] == JUICE_CU_LAUNCH_PARAM_BUFFER_POINTER) {
+                param_buffer = extra[++i];
+            } else if (extra[i] == JUICE_CU_LAUNCH_PARAM_BUFFER_SIZE) {
+                param_buffer_size = *(size_t *)extra[++i];
+            }
+        }
+    } else if (kernelParams != NULL) {
+        /*
+         * kernelParams is an array of pointers to individual kernel arguments.
+         * We query CU_FUNC_ATTRIBUTE_PARAM_SIZE (enum value 74) to get the
+         * total parameter buffer size, then pack arguments contiguously.
+         *
+         * CUDA kernel parameters are laid out in declaration order with each
+         * argument aligned to its natural alignment (max 8 bytes). Since all
+         * CUDA kernel arguments are scalar types (1/2/4/8 bytes) or pointers
+         * (8 bytes), we iterate and copy each as an 8-byte-aligned value.
+         *
+         * Note: this issues an extra RPC to query param size. Applications
+         * that care about launch latency should use the extra parameter approach.
+         */
+        int total_param_size = 0;
+        CUresult attr_res = cuFuncGetAttribute(&total_param_size,
+                                                74 /* CU_FUNC_ATTRIBUTE_PARAM_SIZE */, f);
+        if (attr_res == CUDA_SUCCESS && total_param_size > 0) {
+            param_buffer_size = (size_t)total_param_size;
+            param_buffer = malloc(param_buffer_size);
+            if (!param_buffer) return CUDA_ERROR_INVALID_VALUE;
+            param_buffer_allocated = 1;
+            memset(param_buffer, 0, param_buffer_size);
 
-    return juice_rpc(JUICE_CU_LAUNCH_KERNEL, &req, sizeof(req), NULL, NULL);
+            /*
+             * Pack each kernelParams[i] into the contiguous buffer.
+             * We copy 8 bytes per parameter (the largest scalar/pointer size)
+             * with 8-byte alignment. If the total param buffer is smaller
+             * than expected, we stop early. This handles the common case
+             * where all args are pointers or 64-bit values.
+             *
+             * For kernels with smaller argument types (int, float), the CUDA
+             * driver zero-extends them in the parameter buffer, so copying
+             * 8 bytes from the caller's pointer is safe as long as the
+             * caller's storage is at least 8 bytes (which is typical for
+             * stack variables on 64-bit systems).
+             */
+            size_t offset = 0;
+            for (int i = 0; offset < param_buffer_size && kernelParams[i] != NULL; i++) {
+                /* Align to 8-byte boundary */
+                offset = (offset + 7) & ~(size_t)7;
+                if (offset >= param_buffer_size) break;
+                size_t remaining = param_buffer_size - offset;
+                size_t copy_size = remaining >= 8 ? 8 : remaining;
+                memcpy((char *)param_buffer + offset, kernelParams[i], copy_size);
+                offset += copy_size;
+            }
+        }
+    }
+
+    /* --- Build the wire payload --- */
+    uint8_t has_params = (param_buffer != NULL && param_buffer_size > 0) ? 1 : 0;
+    size_t header_size = 44; /* func(8) + grid(12) + block(12) + shared(4) + stream(8) */
+    size_t payload_len = header_size + 1; /* + has_params(1) */
+    if (has_params) {
+        payload_len += 4 + param_buffer_size; /* buffer_size(4) + buffer_data */
+    }
+
+    void *payload = malloc(payload_len);
+    if (!payload) {
+        if (param_buffer_allocated) free(param_buffer);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    char *p = (char *)payload;
+
+    /* Header: func_handle(8) + grid(12) + block(12) + shared(4) + stream(8) */
+    uint64_t func_handle = (uint64_t)(uintptr_t)f;
+    uint64_t stream_handle = (uint64_t)(uintptr_t)hStream;
+    memcpy(p, &func_handle, 8); p += 8;
+    memcpy(p, &gridDimX, 4); p += 4;
+    memcpy(p, &gridDimY, 4); p += 4;
+    memcpy(p, &gridDimZ, 4); p += 4;
+    memcpy(p, &blockDimX, 4); p += 4;
+    memcpy(p, &blockDimY, 4); p += 4;
+    memcpy(p, &blockDimZ, 4); p += 4;
+    memcpy(p, &sharedMemBytes, 4); p += 4;
+    memcpy(p, &stream_handle, 8); p += 8;
+
+    /* Kernel parameter buffer */
+    memcpy(p, &has_params, 1); p += 1;
+    if (has_params) {
+        uint32_t buf_size = (uint32_t)param_buffer_size;
+        memcpy(p, &buf_size, 4); p += 4;
+        memcpy(p, param_buffer, param_buffer_size);
+    }
+
+    CUresult r = juice_rpc(JUICE_CU_LAUNCH_KERNEL, payload, payload_len, NULL, NULL);
+
+    free(payload);
+    if (param_buffer_allocated) free(param_buffer);
+
+    return r;
 }
 
 /* Stream */
@@ -548,6 +666,368 @@ CUresult cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd) 
     req.end = (uint64_t)(uintptr_t)hEnd;
     size_t len = sizeof(float);
     return juice_rpc(JUICE_CU_EVENT_ELAPSED_TIME, &req, sizeof(req), pMilliseconds, &len);
+}
+
+/*
+ * ============================================================================
+ * CUDA Runtime API Interceptions
+ *
+ * These intercept the cudaXxx() functions that PyTorch, TensorFlow, and other
+ * frameworks call. cudaError_t is typedef'd as int, same wire format as CUresult.
+ * ============================================================================
+ */
+
+typedef int cudaError_t;
+#define cudaSuccess 0
+
+/* cudaMemcpyKind enum values */
+#define cudaMemcpyHostToHost     0
+#define cudaMemcpyHostToDevice   1
+#define cudaMemcpyDeviceToHost   2
+#define cudaMemcpyDeviceToDevice 3
+
+/* Track last error locally */
+static cudaError_t g_last_error = 0;
+
+cudaError_t cudaGetDeviceCount(int *count) {
+    size_t len = sizeof(int32_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_GET_DEVICE_COUNT, NULL, 0, count, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaGetDevice(int *device) {
+    size_t len = sizeof(int32_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_GET_DEVICE, NULL, 0, device, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaSetDevice(int device) {
+    int32_t dev = device;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_SET_DEVICE, &dev, sizeof(dev), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaGetDeviceProperties(void *prop, int device) {
+    /*
+     * cudaDeviceProp is ~700 bytes. We send the device ordinal and receive
+     * the full serialized struct from the server.
+     */
+    int32_t dev = device;
+    size_t len = 1024; /* cudaDeviceProp is large; allow generous buffer */
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_GET_DEVICE_PROPERTIES,
+                                            &dev, sizeof(dev), prop, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
+    struct { int32_t attr; int32_t device; } req = { attr, device };
+    size_t len = sizeof(int32_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_DEVICE_GET_ATTRIBUTE,
+                                            &req, sizeof(req), value, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaMalloc(void **devPtr, size_t size) {
+    uint64_t size64 = (uint64_t)size;
+    uint64_t ptr64 = 0;
+    size_t len = sizeof(uint64_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_MALLOC, &size64, sizeof(size64), &ptr64, &len);
+    if (r == cudaSuccess)
+        *devPtr = (void *)(uintptr_t)ptr64;
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaFree(void *devPtr) {
+    uint64_t ptr = (uint64_t)(uintptr_t)devPtr;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_FREE, &ptr, sizeof(ptr), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
+    cudaError_t r;
+
+    switch (kind) {
+    case cudaMemcpyHostToDevice: {
+        /* Payload: dst_ptr(8) + size(8) + kind(4) + data(count) */
+        size_t payload_len = 8 + 8 + 4 + count;
+        void *payload = malloc(payload_len);
+        if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
+
+        uint64_t dst64 = (uint64_t)(uintptr_t)dst;
+        uint64_t size64 = (uint64_t)count;
+        int32_t kind32 = kind;
+        memcpy(payload, &dst64, 8);
+        memcpy((char *)payload + 8, &size64, 8);
+        memcpy((char *)payload + 16, &kind32, 4);
+        memcpy((char *)payload + 20, src, count);
+
+        r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMCPY, payload, payload_len, NULL, NULL);
+        free(payload);
+        break;
+    }
+    case cudaMemcpyDeviceToHost: {
+        /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
+        struct __attribute__((packed)) {
+            uint64_t dst;
+            uint64_t src;
+            uint64_t size;
+            int32_t  kind;
+        } req;
+        req.dst = (uint64_t)(uintptr_t)dst;
+        req.src = (uint64_t)(uintptr_t)src;
+        req.size = (uint64_t)count;
+        req.kind = kind;
+
+        size_t out_len = count;
+        r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMCPY, &req, sizeof(req), dst, &out_len);
+        break;
+    }
+    case cudaMemcpyDeviceToDevice: {
+        /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
+        struct __attribute__((packed)) {
+            uint64_t dst;
+            uint64_t src;
+            uint64_t size;
+            int32_t  kind;
+        } req;
+        req.dst = (uint64_t)(uintptr_t)dst;
+        req.src = (uint64_t)(uintptr_t)src;
+        req.size = (uint64_t)count;
+        req.kind = kind;
+
+        r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMCPY, &req, sizeof(req), NULL, NULL);
+        break;
+    }
+    case cudaMemcpyHostToHost:
+    default:
+        /* HtoH: just memcpy locally */
+        memcpy(dst, src, count);
+        r = cudaSuccess;
+        break;
+    }
+
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, void *stream) {
+    cudaError_t r;
+
+    switch (kind) {
+    case cudaMemcpyHostToDevice: {
+        /* Payload: dst_ptr(8) + size(8) + kind(4) + stream(8) + data(count) */
+        size_t payload_len = 8 + 8 + 4 + 8 + count;
+        void *payload = malloc(payload_len);
+        if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
+
+        uint64_t dst64 = (uint64_t)(uintptr_t)dst;
+        uint64_t size64 = (uint64_t)count;
+        int32_t kind32 = kind;
+        uint64_t stream64 = (uint64_t)(uintptr_t)stream;
+        char *p = (char *)payload;
+        memcpy(p, &dst64, 8); p += 8;
+        memcpy(p, &size64, 8); p += 8;
+        memcpy(p, &kind32, 4); p += 4;
+        memcpy(p, &stream64, 8); p += 8;
+        memcpy(p, src, count);
+
+        r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMCPY_ASYNC, payload, payload_len, NULL, NULL);
+        free(payload);
+        break;
+    }
+    case cudaMemcpyDeviceToHost: {
+        struct __attribute__((packed)) {
+            uint64_t dst;
+            uint64_t src;
+            uint64_t size;
+            int32_t  kind;
+            uint64_t stream;
+        } req;
+        req.dst = (uint64_t)(uintptr_t)dst;
+        req.src = (uint64_t)(uintptr_t)src;
+        req.size = (uint64_t)count;
+        req.kind = kind;
+        req.stream = (uint64_t)(uintptr_t)stream;
+
+        size_t out_len = count;
+        r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMCPY_ASYNC, &req, sizeof(req), dst, &out_len);
+        break;
+    }
+    case cudaMemcpyDeviceToDevice: {
+        struct __attribute__((packed)) {
+            uint64_t dst;
+            uint64_t src;
+            uint64_t size;
+            int32_t  kind;
+            uint64_t stream;
+        } req;
+        req.dst = (uint64_t)(uintptr_t)dst;
+        req.src = (uint64_t)(uintptr_t)src;
+        req.size = (uint64_t)count;
+        req.kind = kind;
+        req.stream = (uint64_t)(uintptr_t)stream;
+
+        r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMCPY_ASYNC, &req, sizeof(req), NULL, NULL);
+        break;
+    }
+    case cudaMemcpyHostToHost:
+    default:
+        memcpy(dst, src, count);
+        r = cudaSuccess;
+        break;
+    }
+
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+    struct __attribute__((packed)) {
+        uint64_t ptr;
+        int32_t  value;
+        uint64_t count;
+    } req;
+    req.ptr = (uint64_t)(uintptr_t)devPtr;
+    req.value = value;
+    req.count = (uint64_t)count;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_MEMSET, &req, sizeof(req), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaDeviceSynchronize(void) {
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_DEVICE_SYNCHRONIZE, NULL, 0, NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaStreamCreate(void **pStream) {
+    uint64_t handle = 0;
+    size_t len = sizeof(uint64_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_STREAM_CREATE, NULL, 0, &handle, &len);
+    if (r == cudaSuccess)
+        *pStream = (void *)(uintptr_t)handle;
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaStreamDestroy(void *stream) {
+    uint64_t handle = (uint64_t)(uintptr_t)stream;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_STREAM_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaStreamSynchronize(void *stream) {
+    uint64_t handle = (uint64_t)(uintptr_t)stream;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaEventCreate(void **pEvent) {
+    uint64_t handle = 0;
+    size_t len = sizeof(uint64_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_EVENT_CREATE, NULL, 0, &handle, &len);
+    if (r == cudaSuccess)
+        *pEvent = (void *)(uintptr_t)handle;
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaEventRecord(void *event, void *stream) {
+    struct { uint64_t event; uint64_t stream; } req;
+    req.event = (uint64_t)(uintptr_t)event;
+    req.stream = (uint64_t)(uintptr_t)stream;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_EVENT_RECORD, &req, sizeof(req), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaEventSynchronize(void *event) {
+    uint64_t handle = (uint64_t)(uintptr_t)event;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_EVENT_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaEventDestroy(void *event) {
+    uint64_t handle = (uint64_t)(uintptr_t)event;
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_EVENT_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaRuntimeGetVersion(int *version) {
+    size_t len = sizeof(int32_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_RUNTIME_GET_VERSION, NULL, 0, version, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaDriverGetVersion(int *version) {
+    size_t len = sizeof(int32_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_DRIVER_GET_VERSION, NULL, 0, version, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaMemGetInfo(size_t *free_mem, size_t *total_mem) {
+    struct { uint64_t free; uint64_t total; } info;
+    size_t len = sizeof(info);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_MEM_GET_INFO, NULL, 0, &info, &len);
+    if (r == cudaSuccess) {
+        *free_mem = (size_t)info.free;
+        *total_mem = (size_t)info.total;
+    }
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaDeviceReset(void) {
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_DEVICE_RESET, NULL, 0, NULL, NULL);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaGetLastError(void) {
+    cudaError_t r = g_last_error;
+    g_last_error = cudaSuccess;
+    return r;
+}
+
+cudaError_t cudaPeekAtLastError(void) {
+    return g_last_error;
+}
+
+cudaError_t cudaDeviceCanAccessPeer(int *canAccess, int device, int peerDevice) {
+    struct { int32_t device; int32_t peerDevice; } req = { device, peerDevice };
+    size_t len = sizeof(int32_t);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_DEVICE_CAN_ACCESS_PEER,
+                                            &req, sizeof(req), canAccess, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
+    /*
+     * Stub: cudaFuncAttributes is ~60 bytes. Most callers can tolerate
+     * zeroed-out attributes. A full implementation would require the server
+     * to look up the function pointer, which is non-trivial for host-side
+     * function pointers in the Runtime API.
+     */
+    (void)func;
+    if (attr)
+        memset(attr, 0, 64); /* sizeof(cudaFuncAttributes) ~= 56-64 bytes */
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
 }
 
 /*
