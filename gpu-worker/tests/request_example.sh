@@ -132,8 +132,8 @@ sleep 1
 PCIBUS_ARG=""
 [ -n "$GPU_PCI_BUS" ] && PCIBUS_ARG="--pcibus $GPU_PCI_BUS"
 
-ssh "$GPU_SSH" "cd $REMOTE_DIR/build && nohup ./juice-gpu-worker --standalone $GPU_SERVER_PORT $PCIBUS_ARG \
-    > /tmp/juice-worker.log 2>&1 &"
+ssh -f "$GPU_SSH" "cd $REMOTE_DIR/build && ./juice-gpu-worker --standalone $GPU_SERVER_PORT $PCIBUS_ARG \
+    > /tmp/juice-worker.log 2>&1 < /dev/null &"
 
 # Wait for CUDA init (can take 3-8 seconds on first run)
 log "Waiting for CUDA initialization..."
