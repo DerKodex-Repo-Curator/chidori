@@ -10,6 +10,8 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +40,9 @@ static handle_map_t g_ctx_to_dev;  /* Maps context handle -> device ordinal */
 /* Handle maps for Runtime API opaque objects */
 static handle_map_t g_rt_streams;  /* Runtime API cudaStream_t handles */
 static handle_map_t g_rt_events;   /* Runtime API cudaEvent_t handles */
+
+/* Handle maps for cuBLAS */
+static handle_map_t g_cublas_handles;  /* cublasHandle_t handles */
 
 static uint64_t g_next_handle = 0x10000;
 
@@ -85,6 +90,7 @@ int cuda_dispatch_init(const char *pcibus) {
     hmap_init(&g_ctx_to_dev);
     hmap_init(&g_rt_streams);
     hmap_init(&g_rt_events);
+    hmap_init(&g_cublas_handles);
 
     memset(g_devices, 0, sizeof(g_devices));
     memset(g_contexts, 0, sizeof(g_contexts));
@@ -1228,6 +1234,655 @@ int cuda_dispatch(int fd, juice_request_t *req, void *payload) {
     case JUICE_CUDA_PEEK_AT_LAST_ERROR: {
         cudaError_t err = cudaPeekAtLastError();
         return juice_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
+    }
+
+    /* ================================================================
+     * cuBLAS API
+     * ================================================================ */
+    case JUICE_CUBLAS_CREATE: {
+        cublasHandle_t handle;
+        cublasStatus_t st = cublasCreate(&handle);
+        if (st == CUBLAS_STATUS_SUCCESS) {
+            uint64_t wire_handle = alloc_handle();
+            hmap_put(&g_cublas_handles, wire_handle, (uint64_t)(uintptr_t)handle);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire_handle, sizeof(wire_handle));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_DESTROY: {
+        uint64_t wire_handle = 0;
+        if (req->payload_size >= 8) memcpy(&wire_handle, payload, 8);
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasDestroy(handle);
+        hmap_remove(&g_cublas_handles, wire_handle);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SET_STREAM: {
+        uint64_t wire_handle = 0, stream_handle = 0;
+        if (req->payload_size >= 16) {
+            memcpy(&wire_handle, payload, 8);
+            memcpy(&stream_handle, (char *)payload + 8, 8);
+        }
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        /* Resolve the stream: try runtime streams first, then driver streams, then raw */
+        cudaStream_t stream = NULL;
+        if (stream_handle != 0) {
+            uint64_t real_stream = hmap_get(&g_rt_streams, stream_handle);
+            if (real_stream == 0) real_stream = hmap_get(&g_streams, stream_handle);
+            if (real_stream != 0) stream = (cudaStream_t)(uintptr_t)real_stream;
+            else stream = (cudaStream_t)(uintptr_t)stream_handle;
+        }
+        cublasStatus_t st = cublasSetStream(handle, stream);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_GET_STREAM: {
+        uint64_t wire_handle = 0;
+        if (req->payload_size >= 8) memcpy(&wire_handle, payload, 8);
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cudaStream_t stream = NULL;
+        cublasStatus_t st = cublasGetStream(handle, &stream);
+        uint64_t s = (uint64_t)(uintptr_t)stream;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &s, sizeof(s));
+    }
+
+    case JUICE_CUBLAS_SET_MATH_MODE: {
+        uint64_t wire_handle = 0;
+        int32_t mode = 0;
+        if (req->payload_size >= 12) {
+            memcpy(&wire_handle, payload, 8);
+            memcpy(&mode, (char *)payload + 8, 4);
+        }
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSetMathMode(handle, (cublasMath_t)mode);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_GET_MATH_MODE: {
+        uint64_t wire_handle = 0;
+        if (req->payload_size >= 8) memcpy(&wire_handle, payload, 8);
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasMath_t mode;
+        cublasStatus_t st = cublasGetMathMode(handle, &mode);
+        int32_t m = (int32_t)mode;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &m, sizeof(m));
+    }
+
+    case JUICE_CUBLAS_GET_VERSION: {
+        uint64_t wire_handle = 0;
+        if (req->payload_size >= 8) memcpy(&wire_handle, payload, 8);
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        int version = 0;
+        cublasStatus_t st = cublasGetVersion(handle, &version);
+        int32_t v = (int32_t)version;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &v, sizeof(v));
+    }
+
+    case JUICE_CUBLAS_SGEMM: {
+        /* Payload: handle(8) + transa(4) + transb(4) + m(4) + n(4) + k(4)
+         *        + alpha(4) + A(8) + lda(4) + B(8) + ldb(4)
+         *        + beta(4) + C(8) + ldc(4) */
+        if (req->payload_size < 72) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        float beta; memcpy(&beta, p, 4); p += 4;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t ldc; memcpy(&ldc, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSgemm(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k, &alpha,
+            (const float *)(uintptr_t)A, lda,
+            (const float *)(uintptr_t)B, ldb,
+            &beta, (float *)(uintptr_t)C, ldc);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_DGEMM: {
+        if (req->payload_size < 80) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        double alpha; memcpy(&alpha, p, 8); p += 8;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        double beta; memcpy(&beta, p, 8); p += 8;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t ldc; memcpy(&ldc, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasDgemm(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k, &alpha,
+            (const double *)(uintptr_t)A, lda,
+            (const double *)(uintptr_t)B, ldb,
+            &beta, (double *)(uintptr_t)C, ldc);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_HGEMM: {
+        if (req->payload_size < 64) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        uint16_t alpha_h; memcpy(&alpha_h, p, 2); p += 2;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        uint16_t beta_h; memcpy(&beta_h, p, 2); p += 2;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t ldc; memcpy(&ldc, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        /* Use cublasGemmEx for fp16 — avoids __half C type dependency */
+        cublasStatus_t st = cublasGemmEx(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k, &alpha_h,
+            (const void *)(uintptr_t)A, CUDA_R_16F, lda,
+            (const void *)(uintptr_t)B, CUDA_R_16F, ldb,
+            &beta_h, (void *)(uintptr_t)C, CUDA_R_16F, ldc,
+            CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SGEMM_EX: {
+        if (req->payload_size < 80) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t Atype; memcpy(&Atype, p, 4); p += 4;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t Btype; memcpy(&Btype, p, 4); p += 4;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        float beta; memcpy(&beta, p, 4); p += 4;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t Ctype; memcpy(&Ctype, p, 4); p += 4;
+        int32_t ldc; memcpy(&ldc, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSgemmEx(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k, &alpha,
+            (const void *)(uintptr_t)A, (cudaDataType)Atype, lda,
+            (const void *)(uintptr_t)B, (cudaDataType)Btype, ldb,
+            &beta, (void *)(uintptr_t)C, (cudaDataType)Ctype, ldc);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_GEMM_EX: {
+        if (req->payload_size < 96) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        uint8_t alpha_buf[8]; memcpy(alpha_buf, p, 8); p += 8;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t Atype; memcpy(&Atype, p, 4); p += 4;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t Btype; memcpy(&Btype, p, 4); p += 4;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        uint8_t beta_buf[8]; memcpy(beta_buf, p, 8); p += 8;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t Ctype; memcpy(&Ctype, p, 4); p += 4;
+        int32_t ldc; memcpy(&ldc, p, 4); p += 4;
+        int32_t computeType; memcpy(&computeType, p, 4); p += 4;
+        int32_t algo; memcpy(&algo, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasGemmEx(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k,
+            alpha_buf, (const void *)(uintptr_t)A, (cudaDataType)Atype, lda,
+            (const void *)(uintptr_t)B, (cudaDataType)Btype, ldb,
+            beta_buf, (void *)(uintptr_t)C, (cudaDataType)Ctype, ldc,
+            (cublasComputeType_t)computeType, (cublasGemmAlgo_t)algo);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SGEMV: {
+        if (req->payload_size < 60) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t trans; memcpy(&trans, p, 4); p += 4;
+        int32_t m, n;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        float beta; memcpy(&beta, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSgemv(handle,
+            (cublasOperation_t)trans, m, n, &alpha,
+            (const float *)(uintptr_t)A, lda,
+            (const float *)(uintptr_t)x, incx,
+            &beta, (float *)(uintptr_t)y, incy);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_DGEMV: {
+        if (req->payload_size < 68) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t trans; memcpy(&trans, p, 4); p += 4;
+        int32_t m, n;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        double alpha; memcpy(&alpha, p, 8); p += 8;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        double beta; memcpy(&beta, p, 8); p += 8;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasDgemv(handle,
+            (cublasOperation_t)trans, m, n, &alpha,
+            (const double *)(uintptr_t)A, lda,
+            (const double *)(uintptr_t)x, incx,
+            &beta, (double *)(uintptr_t)y, incy);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SAXPY: {
+        if (req->payload_size < 36) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSaxpy(handle, n, &alpha,
+            (const float *)(uintptr_t)x, incx,
+            (float *)(uintptr_t)y, incy);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_DAXPY: {
+        if (req->payload_size < 40) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        double alpha; memcpy(&alpha, p, 8); p += 8;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasDaxpy(handle, n, &alpha,
+            (const double *)(uintptr_t)x, incx,
+            (double *)(uintptr_t)y, incy);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SNRM2: {
+        if (req->payload_size < 24) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        float result = 0.0f;
+        cublasStatus_t st = cublasSnrm2(handle, n,
+            (const float *)(uintptr_t)x, incx, &result);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &result, sizeof(result));
+    }
+
+    case JUICE_CUBLAS_DNRM2: {
+        if (req->payload_size < 24) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        double result = 0.0;
+        cublasStatus_t st = cublasDnrm2(handle, n,
+            (const double *)(uintptr_t)x, incx, &result);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &result, sizeof(result));
+    }
+
+    case JUICE_CUBLAS_SDOT: {
+        if (req->payload_size < 40) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        float result = 0.0f;
+        cublasStatus_t st = cublasSdot(handle, n,
+            (const float *)(uintptr_t)x, incx,
+            (const float *)(uintptr_t)y, incy, &result);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &result, sizeof(result));
+    }
+
+    case JUICE_CUBLAS_DDOT: {
+        if (req->payload_size < 40) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        double result = 0.0;
+        cublasStatus_t st = cublasDdot(handle, n,
+            (const double *)(uintptr_t)x, incx,
+            (const double *)(uintptr_t)y, incy, &result);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &result, sizeof(result));
+    }
+
+    case JUICE_CUBLAS_SSCAL: {
+        if (req->payload_size < 28) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSscal(handle, n, &alpha,
+            (float *)(uintptr_t)x, incx);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_DSCAL: {
+        if (req->payload_size < 32) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        double alpha; memcpy(&alpha, p, 8); p += 8;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasDscal(handle, n, &alpha,
+            (double *)(uintptr_t)x, incx);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SCOPY: {
+        if (req->payload_size < 36) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasScopy(handle, n,
+            (const float *)(uintptr_t)x, incx,
+            (float *)(uintptr_t)y, incy);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_DCOPY: {
+        if (req->payload_size < 36) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t n; memcpy(&n, p, 4); p += 4;
+        uint64_t x; memcpy(&x, p, 8); p += 8;
+        int32_t incx; memcpy(&incx, p, 4); p += 4;
+        uint64_t y; memcpy(&y, p, 8); p += 8;
+        int32_t incy; memcpy(&incy, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasDcopy(handle, n,
+            (const double *)(uintptr_t)x, incx,
+            (double *)(uintptr_t)y, incy);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SGEMM_BATCHED: {
+        /*
+         * Payload: handle(8) + transa(4) + transb(4) + m(4) + n(4) + k(4)
+         *        + alpha(4) + lda(4) + ldb(4) + beta(4) + ldc(4) + batchCount(4) = 52
+         *        + Aarray(8*bc) + Barray(8*bc) + Carray(8*bc)
+         */
+        if (req->payload_size < 52) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        float beta; memcpy(&beta, p, 4); p += 4;
+        int32_t ldc; memcpy(&ldc, p, 4); p += 4;
+        int32_t batchCount; memcpy(&batchCount, p, 4); p += 4;
+
+        size_t ptr_array_bytes = (size_t)batchCount * 8;
+        if (req->payload_size < 52 + 3 * ptr_array_bytes) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+
+        /* Build arrays of real device pointers */
+        const float **Aarray = (const float **)malloc((size_t)batchCount * sizeof(float *));
+        const float **Barray = (const float **)malloc((size_t)batchCount * sizeof(float *));
+        float **Carray = (float **)malloc((size_t)batchCount * sizeof(float *));
+        if (!Aarray || !Barray || !Carray) {
+            free(Aarray); free(Barray); free(Carray);
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_ALLOC_FAILED, NULL, 0);
+        }
+
+        for (int i = 0; i < batchCount; i++) {
+            uint64_t ptr; memcpy(&ptr, p, 8); p += 8;
+            Aarray[i] = (const float *)(uintptr_t)ptr;
+        }
+        for (int i = 0; i < batchCount; i++) {
+            uint64_t ptr; memcpy(&ptr, p, 8); p += 8;
+            Barray[i] = (const float *)(uintptr_t)ptr;
+        }
+        for (int i = 0; i < batchCount; i++) {
+            uint64_t ptr; memcpy(&ptr, p, 8); p += 8;
+            Carray[i] = (float *)(uintptr_t)ptr;
+        }
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+
+        /* cublasSgemmBatched needs device-side pointer arrays. Copy to device. */
+        const float **d_Aarray, **d_Barray;
+        float **d_Carray;
+        size_t arr_sz = (size_t)batchCount * sizeof(void *);
+        cudaMalloc((void **)&d_Aarray, arr_sz);
+        cudaMalloc((void **)&d_Barray, arr_sz);
+        cudaMalloc((void **)&d_Carray, arr_sz);
+        cudaMemcpy((void *)d_Aarray, Aarray, arr_sz, cudaMemcpyHostToDevice);
+        cudaMemcpy((void *)d_Barray, Barray, arr_sz, cudaMemcpyHostToDevice);
+        cudaMemcpy((void *)d_Carray, Carray, arr_sz, cudaMemcpyHostToDevice);
+
+        cublasStatus_t st = cublasSgemmBatched(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k, &alpha,
+            d_Aarray, lda, d_Barray, ldb,
+            &beta, d_Carray, ldc, batchCount);
+
+        cudaFree((void *)d_Aarray);
+        cudaFree((void *)d_Barray);
+        cudaFree((void *)d_Carray);
+        free(Aarray); free(Barray); free(Carray);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_SGEMM_STRIDED_BATCHED: {
+        if (req->payload_size < 88) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        float alpha; memcpy(&alpha, p, 4); p += 4;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        int64_t strideA; memcpy(&strideA, p, 8); p += 8;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        int64_t strideB; memcpy(&strideB, p, 8); p += 8;
+        float beta; memcpy(&beta, p, 4); p += 4;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t ldc; memcpy(&ldc, p, 4); p += 4;
+        int64_t strideC; memcpy(&strideC, p, 8); p += 8;
+        int32_t batchCount; memcpy(&batchCount, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasSgemmStridedBatched(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k, &alpha,
+            (const float *)(uintptr_t)A, lda, (long long)strideA,
+            (const float *)(uintptr_t)B, ldb, (long long)strideB,
+            &beta, (float *)(uintptr_t)C, ldc, (long long)strideC,
+            batchCount);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUBLAS_GEMM_STRIDED_BATCHED_EX: {
+        if (req->payload_size < 108) {
+            return juice_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_handle; memcpy(&wire_handle, p, 8); p += 8;
+        int32_t transa; memcpy(&transa, p, 4); p += 4;
+        int32_t transb; memcpy(&transb, p, 4); p += 4;
+        int32_t m, n, k;
+        memcpy(&m, p, 4); p += 4;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&k, p, 4); p += 4;
+        uint8_t alpha_buf[8]; memcpy(alpha_buf, p, 8); p += 8;
+        uint64_t A; memcpy(&A, p, 8); p += 8;
+        int32_t Atype; memcpy(&Atype, p, 4); p += 4;
+        int32_t lda; memcpy(&lda, p, 4); p += 4;
+        int64_t strideA; memcpy(&strideA, p, 8); p += 8;
+        uint64_t B; memcpy(&B, p, 8); p += 8;
+        int32_t Btype; memcpy(&Btype, p, 4); p += 4;
+        int32_t ldb; memcpy(&ldb, p, 4); p += 4;
+        int64_t strideB; memcpy(&strideB, p, 8); p += 8;
+        uint8_t beta_buf[8]; memcpy(beta_buf, p, 8); p += 8;
+        uint64_t C; memcpy(&C, p, 8); p += 8;
+        int32_t Ctype; memcpy(&Ctype, p, 4); p += 4;
+        int32_t ldc; memcpy(&ldc, p, 4); p += 4;
+        int64_t strideC; memcpy(&strideC, p, 8); p += 8;
+        int32_t batchCount; memcpy(&batchCount, p, 4); p += 4;
+        int32_t computeType; memcpy(&computeType, p, 4); p += 4;
+        int32_t algo; memcpy(&algo, p, 4);
+
+        cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
+        cublasStatus_t st = cublasGemmStridedBatchedEx(handle,
+            (cublasOperation_t)transa, (cublasOperation_t)transb,
+            m, n, k,
+            alpha_buf, (const void *)(uintptr_t)A, (cudaDataType)Atype, lda, (long long)strideA,
+            (const void *)(uintptr_t)B, (cudaDataType)Btype, ldb, (long long)strideB,
+            beta_buf, (void *)(uintptr_t)C, (cudaDataType)Ctype, ldc, (long long)strideC,
+            batchCount, (cublasComputeType_t)computeType, (cublasGemmAlgo_t)algo);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
     }
 
     /* ================================================================

@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -206,7 +207,71 @@ static int juice_connect(void) {
             return -1;
         }
 
-        usleep(6000000); /* Wait for agent + CUDA init */
+        /*
+         * Read the HTTP 101 Switching Protocols response from the agent.
+         * This confirms the agent has hijacked the connection and forwarded
+         * the socket to gpu-worker.  We read byte-by-byte looking for the
+         * end-of-headers marker "\r\n\r\n".  After this point the TCP
+         * stream carries raw Juice CUDA protocol.
+         *
+         * Timeout: we give the agent up to 30 seconds to respond (CUDA
+         * init on the worker side can take a while on first launch).
+         */
+        {
+            struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+            setsockopt(g_server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            char resp_buf[1024];
+            int resp_len = 0;
+            int found_end = 0;
+
+            while (resp_len < (int)sizeof(resp_buf) - 1) {
+                ssize_t n = read(g_server_fd, resp_buf + resp_len, 1);
+                if (n <= 0) {
+                    fprintf(stderr, "[juice-cuda] Failed to read HTTP response from agent (n=%zd errno=%d)\n", n, errno);
+                    close(g_server_fd);
+                    g_server_fd = -1;
+                    free(session_id);
+                    free(server);
+                    return -1;
+                }
+                resp_len += (int)n;
+                /* Look for \r\n\r\n end-of-headers */
+                if (resp_len >= 4 &&
+                    resp_buf[resp_len - 4] == '\r' &&
+                    resp_buf[resp_len - 3] == '\n' &&
+                    resp_buf[resp_len - 2] == '\r' &&
+                    resp_buf[resp_len - 1] == '\n') {
+                    found_end = 1;
+                    break;
+                }
+            }
+
+            /* Clear the receive timeout for subsequent CUDA RPC traffic */
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            setsockopt(g_server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            if (!found_end) {
+                fprintf(stderr, "[juice-cuda] Invalid HTTP response from agent\n");
+                close(g_server_fd);
+                g_server_fd = -1;
+                free(session_id);
+                free(server);
+                return -1;
+            }
+
+            resp_buf[resp_len] = '\0';
+            if (strstr(resp_buf, "101") == NULL) {
+                fprintf(stderr, "[juice-cuda] Agent did not return 101: %s\n", resp_buf);
+                close(g_server_fd);
+                g_server_fd = -1;
+                free(session_id);
+                free(server);
+                return -1;
+            }
+        }
+
         fprintf(stderr, "[juice-cuda] Connected to remote GPU (session %s)\n", session_id);
     }
 
@@ -1028,6 +1093,831 @@ cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
         memset(attr, 0, 64); /* sizeof(cudaFuncAttributes) ~= 56-64 bytes */
     g_last_error = cudaSuccess;
     return cudaSuccess;
+}
+
+/*
+ * ============================================================================
+ * cuBLAS API Interceptions
+ *
+ * cuBLAS uses cublasHandle_t (opaque pointer) and cublasStatus_t (int).
+ * alpha/beta parameters are HOST pointers to scalars, not device pointers.
+ * Matrix pointers (A, B, C) are device pointers sent as uint64_t handles.
+ * ============================================================================
+ */
+
+typedef int cublasStatus_t;
+typedef void *cublasHandle_t;
+typedef int cublasOperation_t;
+typedef int cublasMath_t;
+
+#define CUBLAS_STATUS_SUCCESS          0
+#define CUBLAS_STATUS_NOT_INITIALIZED  1
+#define CUBLAS_STATUS_ALLOC_FAILED     3
+#define CUBLAS_STATUS_INVALID_VALUE    7
+#define CUBLAS_STATUS_NOT_SUPPORTED    15
+
+/* Helper to determine scalar size from cudaDataType / cublasComputeType */
+static size_t juice_cublas_scalar_size(int dtype) {
+    switch (dtype) {
+    case 0:  /* CUDA_R_16F / CUBLAS_COMPUTE_16F */
+        return 2;
+    case 2:  /* CUDA_R_32F / CUBLAS_COMPUTE_32F */
+    case 6:  /* CUBLAS_COMPUTE_32F_FAST_16F etc */
+    case 7:
+    case 8:
+        return 4;
+    case 1:  /* CUDA_R_64F / CUBLAS_COMPUTE_64F */
+        return 8;
+    default:
+        return 4; /* safe default: float-sized */
+    }
+}
+
+cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cublasStatus_t r = (cublasStatus_t)juice_rpc(JUICE_CUBLAS_CREATE, NULL, 0, &h, &len);
+    if (r == CUBLAS_STATUS_SUCCESS)
+        *handle = (cublasHandle_t)(uintptr_t)h;
+    return r;
+}
+
+cublasStatus_t cublasDestroy_v2(cublasHandle_t handle) {
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DESTROY, &h, sizeof(h), NULL, NULL);
+}
+
+cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, CUstream stream) {
+    struct { uint64_t handle; uint64_t stream; } req;
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.stream = (uint64_t)(uintptr_t)stream;
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SET_STREAM, &req, sizeof(req), NULL, NULL);
+}
+
+cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    uint64_t s = 0;
+    size_t len = sizeof(uint64_t);
+    cublasStatus_t r = (cublasStatus_t)juice_rpc(JUICE_CUBLAS_GET_STREAM, &h, sizeof(h), &s, &len);
+    if (r == CUBLAS_STATUS_SUCCESS)
+        *stream = (CUstream)(uintptr_t)s;
+    return r;
+}
+
+cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
+    struct { uint64_t handle; int32_t mode; } req;
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.mode = (int32_t)mode;
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SET_MATH_MODE, &req, sizeof(req), NULL, NULL);
+}
+
+cublasStatus_t cublasGetMathMode(cublasHandle_t handle, cublasMath_t *mode) {
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    int32_t m = 0;
+    size_t len = sizeof(int32_t);
+    cublasStatus_t r = (cublasStatus_t)juice_rpc(JUICE_CUBLAS_GET_MATH_MODE, &h, sizeof(h), &m, &len);
+    if (r == CUBLAS_STATUS_SUCCESS)
+        *mode = (cublasMath_t)m;
+    return r;
+}
+
+cublasStatus_t cublasGetVersion_v2(cublasHandle_t handle, int *version) {
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    int32_t v = 0;
+    size_t len = sizeof(int32_t);
+    cublasStatus_t r = (cublasStatus_t)juice_rpc(JUICE_CUBLAS_GET_VERSION, &h, sizeof(h), &v, &len);
+    if (r == CUBLAS_STATUS_SUCCESS)
+        *version = (int)v;
+    return r;
+}
+
+/*
+ * cublasSgemm_v2 — single-precision GEMM
+ * C = alpha * op(A) * op(B) + beta * C
+ *
+ * Wire format:
+ *   handle(8) + transa(4) + transb(4) + m(4) + n(4) + k(4)
+ *   + alpha(4) + A(8) + lda(4) + B(8) + ldb(4)
+ *   + beta(4) + C(8) + ldc(4) = 72 bytes
+ */
+cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const float *alpha,
+    const void *A, int lda,
+    const void *B, int ldb,
+    const float *beta,
+    void *C, int ldc) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        float    alpha;
+        uint64_t A;
+        int32_t  lda;
+        uint64_t B;
+        int32_t  ldb;
+        float    beta;
+        uint64_t C;
+        int32_t  ldc;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+    req.alpha = *alpha;
+    req.A = (uint64_t)(uintptr_t)A;
+    req.lda = lda;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.ldb = ldb;
+    req.beta = *beta;
+    req.C = (uint64_t)(uintptr_t)C;
+    req.ldc = ldc;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SGEMM, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasDgemm_v2 — double-precision GEMM
+ * Same layout as Sgemm but with double alpha/beta.
+ */
+cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const double *alpha,
+    const void *A, int lda,
+    const void *B, int ldb,
+    const double *beta,
+    void *C, int ldc) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        double   alpha;
+        uint64_t A;
+        int32_t  lda;
+        uint64_t B;
+        int32_t  ldb;
+        double   beta;
+        uint64_t C;
+        int32_t  ldc;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+    req.alpha = *alpha;
+    req.A = (uint64_t)(uintptr_t)A;
+    req.lda = lda;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.ldb = ldb;
+    req.beta = *beta;
+    req.C = (uint64_t)(uintptr_t)C;
+    req.ldc = ldc;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DGEMM, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasHgemm — half-precision GEMM
+ * alpha/beta are __half (2 bytes each), sent as uint16_t.
+ */
+cublasStatus_t cublasHgemm(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const void *alpha,
+    const void *A, int lda,
+    const void *B, int ldb,
+    const void *beta,
+    void *C, int ldc) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        uint16_t alpha;
+        uint64_t A;
+        int32_t  lda;
+        uint64_t B;
+        int32_t  ldb;
+        uint16_t beta;
+        uint64_t C;
+        int32_t  ldc;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+    memcpy(&req.alpha, alpha, 2);
+    req.A = (uint64_t)(uintptr_t)A;
+    req.lda = lda;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.ldb = ldb;
+    memcpy(&req.beta, beta, 2);
+    req.C = (uint64_t)(uintptr_t)C;
+    req.ldc = ldc;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_HGEMM, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasSgemmEx — mixed-precision Sgemm with type descriptors
+ */
+cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const float *alpha,
+    const void *A, int Atype, int lda,
+    const void *B, int Btype, int ldb,
+    const float *beta,
+    void *C, int Ctype, int ldc) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        float    alpha;
+        uint64_t A;
+        int32_t  Atype, lda;
+        uint64_t B;
+        int32_t  Btype, ldb;
+        float    beta;
+        uint64_t C;
+        int32_t  Ctype, ldc;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+    req.alpha = *alpha;
+    req.A = (uint64_t)(uintptr_t)A;
+    req.Atype = Atype; req.lda = lda;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.Btype = Btype; req.ldb = ldb;
+    req.beta = *beta;
+    req.C = (uint64_t)(uintptr_t)C;
+    req.Ctype = Ctype; req.ldc = ldc;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SGEMM_EX, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasGemmEx — the critical mixed-precision GEMM used by PyTorch
+ *
+ * Wire format:
+ *   handle(8) + transa(4) + transb(4) + m(4) + n(4) + k(4)
+ *   + alpha_scalar(8) + A(8) + Atype(4) + lda(4) + B(8) + Btype(4) + ldb(4)
+ *   + beta_scalar(8) + C(8) + Ctype(4) + ldc(4)
+ *   + computeType(4) + algo(4)
+ *
+ * alpha/beta are sent as 8-byte values (max scalar size) with the actual
+ * type determined by computeType.
+ */
+cublasStatus_t cublasGemmEx(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const void *alpha,
+    const void *A, int Atype, int lda,
+    const void *B, int Btype, int ldb,
+    const void *beta,
+    void *C, int Ctype, int ldc,
+    int computeType, int algo) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        uint8_t  alpha[8]; /* up to double-precision scalar */
+        uint64_t A;
+        int32_t  Atype, lda;
+        uint64_t B;
+        int32_t  Btype, ldb;
+        uint8_t  beta[8];
+        uint64_t C;
+        int32_t  Ctype, ldc;
+        int32_t  computeType;
+        int32_t  algo;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+
+    size_t scalar_sz = juice_cublas_scalar_size(computeType);
+    memcpy(req.alpha, alpha, scalar_sz);
+    req.A = (uint64_t)(uintptr_t)A;
+    req.Atype = Atype; req.lda = lda;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.Btype = Btype; req.ldb = ldb;
+    memcpy(req.beta, beta, scalar_sz);
+    req.C = (uint64_t)(uintptr_t)C;
+    req.Ctype = Ctype; req.ldc = ldc;
+    req.computeType = computeType;
+    req.algo = algo;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_GEMM_EX, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasSgemv_v2 — single-precision matrix-vector multiply
+ * y = alpha * op(A) * x + beta * y
+ */
+cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
+    cublasOperation_t trans,
+    int m, int n,
+    const float *alpha,
+    const void *A, int lda,
+    const void *x, int incx,
+    const float *beta,
+    void *y, int incy) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  trans;
+        int32_t  m, n;
+        float    alpha;
+        uint64_t A;
+        int32_t  lda;
+        uint64_t x;
+        int32_t  incx;
+        float    beta;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.trans = (int32_t)trans;
+    req.m = m; req.n = n;
+    req.alpha = *alpha;
+    req.A = (uint64_t)(uintptr_t)A;
+    req.lda = lda;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.beta = *beta;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SGEMV, &req, sizeof(req), NULL, NULL);
+}
+
+cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
+    cublasOperation_t trans,
+    int m, int n,
+    const double *alpha,
+    const void *A, int lda,
+    const void *x, int incx,
+    const double *beta,
+    void *y, int incy) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  trans;
+        int32_t  m, n;
+        double   alpha;
+        uint64_t A;
+        int32_t  lda;
+        uint64_t x;
+        int32_t  incx;
+        double   beta;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.trans = (int32_t)trans;
+    req.m = m; req.n = n;
+    req.alpha = *alpha;
+    req.A = (uint64_t)(uintptr_t)A;
+    req.lda = lda;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.beta = *beta;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DGEMV, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * AXPY: y = alpha * x + y
+ */
+cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
+    int n, const float *alpha,
+    const void *x, int incx,
+    void *y, int incy) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        float    alpha;
+        uint64_t x;
+        int32_t  incx;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.alpha = *alpha;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SAXPY, &req, sizeof(req), NULL, NULL);
+}
+
+cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
+    int n, const double *alpha,
+    const void *x, int incx,
+    void *y, int incy) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        double   alpha;
+        uint64_t x;
+        int32_t  incx;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.alpha = *alpha;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DAXPY, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * NRM2: result = ||x||_2
+ * Result scalar is returned in the response payload.
+ */
+cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
+    int n, const void *x, int incx, float *result) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        uint64_t x;
+        int32_t  incx;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+
+    size_t len = sizeof(float);
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SNRM2, &req, sizeof(req), result, &len);
+}
+
+cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle,
+    int n, const void *x, int incx, double *result) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        uint64_t x;
+        int32_t  incx;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+
+    size_t len = sizeof(double);
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DNRM2, &req, sizeof(req), result, &len);
+}
+
+/*
+ * DOT: result = x . y
+ */
+cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
+    int n, const void *x, int incx,
+    const void *y, int incy, float *result) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        uint64_t x;
+        int32_t  incx;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    size_t len = sizeof(float);
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SDOT, &req, sizeof(req), result, &len);
+}
+
+cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
+    int n, const void *x, int incx,
+    const void *y, int incy, double *result) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        uint64_t x;
+        int32_t  incx;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    size_t len = sizeof(double);
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DDOT, &req, sizeof(req), result, &len);
+}
+
+/*
+ * SCAL: x = alpha * x
+ */
+cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
+    int n, const float *alpha, void *x, int incx) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        float    alpha;
+        uint64_t x;
+        int32_t  incx;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.alpha = *alpha;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SSCAL, &req, sizeof(req), NULL, NULL);
+}
+
+cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
+    int n, const double *alpha, void *x, int incx) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        double   alpha;
+        uint64_t x;
+        int32_t  incx;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.alpha = *alpha;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DSCAL, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * COPY: y = x
+ */
+cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
+    int n, const void *x, int incx, void *y, int incy) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        uint64_t x;
+        int32_t  incx;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SCOPY, &req, sizeof(req), NULL, NULL);
+}
+
+cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
+    int n, const void *x, int incx, void *y, int incy) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  n;
+        uint64_t x;
+        int32_t  incx;
+        uint64_t y;
+        int32_t  incy;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.n = n;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.incx = incx;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.incy = incy;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_DCOPY, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasSgemmBatched — batched Sgemm with array of device pointers
+ *
+ * Aarray, Barray, Carray are HOST arrays of device pointers.
+ * We send all batchCount pointers inline.
+ */
+cublasStatus_t cublasSgemmBatched(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const float *alpha,
+    const void * const *Aarray, int lda,
+    const void * const *Barray, int ldb,
+    const float *beta,
+    void * const *Carray, int ldc,
+    int batchCount) {
+
+    /*
+     * Wire format:
+     *   handle(8) + transa(4) + transb(4) + m(4) + n(4) + k(4)
+     *   + alpha(4) + lda(4) + ldb(4) + beta(4) + ldc(4) + batchCount(4)
+     *   = 52 bytes header
+     *   + Aarray(8*batchCount) + Barray(8*batchCount) + Carray(8*batchCount)
+     */
+    size_t ptr_array_size = (size_t)batchCount * sizeof(uint64_t);
+    size_t payload_len = 52 + 3 * ptr_array_size;
+    void *payload = malloc(payload_len);
+    if (!payload) return CUBLAS_STATUS_ALLOC_FAILED;
+
+    char *p = (char *)payload;
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    int32_t ta = (int32_t)transa, tb = (int32_t)transb;
+    int32_t m32 = m, n32 = n, k32 = k;
+    float a = *alpha, b = *beta;
+    int32_t lda32 = lda, ldb32 = ldb, ldc32 = ldc, bc32 = batchCount;
+
+    memcpy(p, &h, 8); p += 8;
+    memcpy(p, &ta, 4); p += 4;
+    memcpy(p, &tb, 4); p += 4;
+    memcpy(p, &m32, 4); p += 4;
+    memcpy(p, &n32, 4); p += 4;
+    memcpy(p, &k32, 4); p += 4;
+    memcpy(p, &a, 4); p += 4;
+    memcpy(p, &lda32, 4); p += 4;
+    memcpy(p, &ldb32, 4); p += 4;
+    memcpy(p, &b, 4); p += 4;
+    memcpy(p, &ldc32, 4); p += 4;
+    memcpy(p, &bc32, 4); p += 4;
+
+    /* Copy device pointer arrays */
+    for (int i = 0; i < batchCount; i++) {
+        uint64_t ptr = (uint64_t)(uintptr_t)Aarray[i];
+        memcpy(p, &ptr, 8); p += 8;
+    }
+    for (int i = 0; i < batchCount; i++) {
+        uint64_t ptr = (uint64_t)(uintptr_t)Barray[i];
+        memcpy(p, &ptr, 8); p += 8;
+    }
+    for (int i = 0; i < batchCount; i++) {
+        uint64_t ptr = (uint64_t)(uintptr_t)Carray[i];
+        memcpy(p, &ptr, 8); p += 8;
+    }
+
+    cublasStatus_t r = (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SGEMM_BATCHED, payload, payload_len, NULL, NULL);
+    free(payload);
+    return r;
+}
+
+/*
+ * cublasSgemmStridedBatched — strided batched Sgemm
+ */
+cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const float *alpha,
+    const void *A, int lda, long long int strideA,
+    const void *B, int ldb, long long int strideB,
+    const float *beta,
+    void *C, int ldc, long long int strideC,
+    int batchCount) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        float    alpha;
+        uint64_t A;
+        int32_t  lda;
+        int64_t  strideA;
+        uint64_t B;
+        int32_t  ldb;
+        int64_t  strideB;
+        float    beta;
+        uint64_t C;
+        int32_t  ldc;
+        int64_t  strideC;
+        int32_t  batchCount;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+    req.alpha = *alpha;
+    req.A = (uint64_t)(uintptr_t)A;
+    req.lda = lda;
+    req.strideA = (int64_t)strideA;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.ldb = ldb;
+    req.strideB = (int64_t)strideB;
+    req.beta = *beta;
+    req.C = (uint64_t)(uintptr_t)C;
+    req.ldc = ldc;
+    req.strideC = (int64_t)strideC;
+    req.batchCount = batchCount;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_SGEMM_STRIDED_BATCHED, &req, sizeof(req), NULL, NULL);
+}
+
+/*
+ * cublasGemmStridedBatchedEx — mixed-precision strided batched GEMM
+ */
+cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const void *alpha,
+    const void *A, int Atype, int lda, long long int strideA,
+    const void *B, int Btype, int ldb, long long int strideB,
+    const void *beta,
+    void *C, int Ctype, int ldc, long long int strideC,
+    int batchCount, int computeType, int algo) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        uint8_t  alpha[8];
+        uint64_t A;
+        int32_t  Atype, lda;
+        int64_t  strideA;
+        uint64_t B;
+        int32_t  Btype, ldb;
+        int64_t  strideB;
+        uint8_t  beta[8];
+        uint64_t C;
+        int32_t  Ctype, ldc;
+        int64_t  strideC;
+        int32_t  batchCount;
+        int32_t  computeType;
+        int32_t  algo;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.transa = (int32_t)transa;
+    req.transb = (int32_t)transb;
+    req.m = m; req.n = n; req.k = k;
+
+    size_t scalar_sz = juice_cublas_scalar_size(computeType);
+    memcpy(req.alpha, alpha, scalar_sz);
+    req.A = (uint64_t)(uintptr_t)A;
+    req.Atype = Atype; req.lda = lda;
+    req.strideA = (int64_t)strideA;
+    req.B = (uint64_t)(uintptr_t)B;
+    req.Btype = Btype; req.ldb = ldb;
+    req.strideB = (int64_t)strideB;
+    memcpy(req.beta, beta, scalar_sz);
+    req.C = (uint64_t)(uintptr_t)C;
+    req.Ctype = Ctype; req.ldc = ldc;
+    req.strideC = (int64_t)strideC;
+    req.batchCount = batchCount;
+    req.computeType = computeType;
+    req.algo = algo;
+
+    return (cublasStatus_t)juice_rpc(JUICE_CUBLAS_GEMM_STRIDED_BATCHED_EX, &req, sizeof(req), NULL, NULL);
 }
 
 /*

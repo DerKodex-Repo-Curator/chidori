@@ -31,6 +31,17 @@ type Connection struct {
 	cmd       *exec.Cmd
 	readPipe  *os.File
 	writePipe *os.File
+
+	// hijackedConn holds a reference to the hijacked TCP connection after
+	// it has been forwarded to juice-gpu-worker via SCM_RIGHTS. We MUST
+	// retain this reference to prevent Go's garbage collector from
+	// finalizing the net.Conn and calling close() on the underlying fd.
+	// Even though SCM_RIGHTS creates an independent kernel refcount,
+	// Go's Close() on the net.Conn can trigger a TCP RST (e.g. if there
+	// is unread data in the receive buffer) which kills the connection
+	// for the gpu-worker. The connection is closed when the Connection
+	// is torn down.
+	hijackedConn net.Conn
 }
 
 func newConnection(connectionData restapi.ConnectionData, juicePath string, pciBus string) *Connection {
@@ -96,11 +107,20 @@ func (connection *Connection) Start(group task.Group, exitCode chan int) error {
 					err = connection.cmd.Start()
 					if err == nil {
 						group.GoFn(fmt.Sprintf("connection %s", connection.Id), func(g task.Group) error {
-							err := errors.Join(
-								connection.cmd.Wait(),
+							waitErr := connection.cmd.Wait()
+
+							// Close IPC pipes and the hijacked TCP connection.
+							// The hijacked conn must be closed AFTER the gpu-worker
+							// exits so the TCP socket stays alive while it is in use.
+							closeErr := errors.Join(
 								connection.readPipe.Close(),
 								connection.writePipe.Close(),
 							)
+							if connection.hijackedConn != nil {
+								closeErr = errors.Join(closeErr, connection.hijackedConn.Close())
+								connection.hijackedConn = nil
+							}
+							err := errors.Join(waitErr, closeErr)
 							if err != nil {
 								logger.Errorf("connection %s failed to wait caused by %v", connection.Id, err)
 							}
@@ -156,13 +176,17 @@ func (connection *Connection) Connect(c net.Conn) error {
 		}
 	}
 
-	// NOTE: Do NOT close the hijacked connection here.
-	// The socket fd has been forwarded to juice-gpu-worker via SCM_RIGHTS.
-	// Closing it here would send TCP FIN/RST to the remote client.
-	// Let the gpu-worker own the socket lifetime.
 	if err != nil {
-		errors.Join(err, c.Close())
+		err = errors.Join(err, c.Close())
 		err = errors.Newf("connection %s failed to connect", connection.Id).Wrap(err)
+	} else {
+		// Keep a reference to the hijacked connection so that Go's GC does
+		// not finalize it and close the underlying TCP socket fd.  The fd
+		// has been forwarded to juice-gpu-worker via SCM_RIGHTS, but the
+		// agent's copy must remain open to avoid sending TCP FIN/RST to
+		// the remote client.  It will be closed when the Connection is
+		// torn down (see the goroutine in Start that waits for cmd.Wait).
+		connection.hijackedConn = c
 	}
 
 	return err

@@ -128,6 +128,19 @@ func (agent *Agent) connectSessionEp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Send 101 Switching Protocols before forwarding the socket to
+	// gpu-worker.  The client reads this response to know that the
+	// protocol transition has completed and it can start sending
+	// binary CUDA RPC data.  This replaces the old "blind sleep"
+	// approach which was fragile and timing-dependent.
+	switchResp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: juice-cuda\r\nConnection: Upgrade\r\n\r\n"
+	_, err = conn.Write([]byte(switchResp))
+	if err != nil {
+		logger.Errorf("failed to send 101 to client for session %s: %v", id, err)
+		conn.Close()
+		return
+	}
+
 	err = agent.connect(id, connectionData, conn)
 	if err != nil {
 		logger.Error(err)

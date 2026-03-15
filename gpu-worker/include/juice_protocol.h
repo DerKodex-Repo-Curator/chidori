@@ -177,11 +177,48 @@ typedef enum {
     JUICE_CUBLAS_CREATE                = 0x0200,
     JUICE_CUBLAS_DESTROY               = 0x0201,
     JUICE_CUBLAS_SET_STREAM            = 0x0202,
+    JUICE_CUBLAS_SET_MATH_MODE         = 0x0203,
+    JUICE_CUBLAS_GET_MATH_MODE         = 0x0204,
+    JUICE_CUBLAS_GET_STREAM            = 0x0205,
+
+    /* GEMM family (0x0210 - 0x021F) */
     JUICE_CUBLAS_SGEMM                 = 0x0210,
     JUICE_CUBLAS_DGEMM                 = 0x0211,
     JUICE_CUBLAS_HGEMM                 = 0x0212,
     JUICE_CUBLAS_SGEMM_EX             = 0x0213,
     JUICE_CUBLAS_GEMM_EX              = 0x0214,
+
+    /* GEMV family (0x0220 - 0x022F) */
+    JUICE_CUBLAS_SGEMV                 = 0x0220,
+    JUICE_CUBLAS_DGEMV                 = 0x0221,
+
+    /* AXPY family (0x0230 - 0x023F) */
+    JUICE_CUBLAS_SAXPY                 = 0x0230,
+    JUICE_CUBLAS_DAXPY                 = 0x0231,
+
+    /* NRM2 family (0x0240 - 0x024F) */
+    JUICE_CUBLAS_SNRM2                 = 0x0240,
+    JUICE_CUBLAS_DNRM2                 = 0x0241,
+
+    /* DOT family (0x0250 - 0x025F) */
+    JUICE_CUBLAS_SDOT                  = 0x0250,
+    JUICE_CUBLAS_DDOT                  = 0x0251,
+
+    /* SCAL family (0x0260 - 0x026F) */
+    JUICE_CUBLAS_SSCAL                 = 0x0260,
+    JUICE_CUBLAS_DSCAL                 = 0x0261,
+
+    /* COPY family (0x0270 - 0x027F) */
+    JUICE_CUBLAS_SCOPY                 = 0x0270,
+    JUICE_CUBLAS_DCOPY                 = 0x0271,
+
+    /* Batched GEMM (0x0280 - 0x028F) */
+    JUICE_CUBLAS_SGEMM_BATCHED         = 0x0280,
+    JUICE_CUBLAS_SGEMM_STRIDED_BATCHED = 0x0281,
+    JUICE_CUBLAS_GEMM_STRIDED_BATCHED_EX = 0x0282,
+
+    /* Utility (0x0290 - 0x029F) */
+    JUICE_CUBLAS_GET_VERSION           = 0x0290,
 
     /* Sentinel */
     JUICE_FUNC_MAX                     = 0xFFFF,
