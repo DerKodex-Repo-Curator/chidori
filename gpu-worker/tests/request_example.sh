@@ -114,8 +114,8 @@ if [ "$NEED_CLIENT" -eq 1 ]; then
     ssh "$CLIENT_SSH" "cd $REMOTE_DIR && make client 2>&1" || fail "Client lib build failed"
 
     log "Building test programs..."
-    ssh "$CLIENT_SSH" "cd $REMOTE_DIR && gcc -Wall -O2 -D_GNU_SOURCE -I include \
-        -o build/test_remote_gpu tests/test_remote_gpu.c -ldl 2>&1" || fail "Test build failed"
+    ssh "$CLIENT_SSH" "cd $REMOTE_DIR && gcc -Wall -O2 -I include \
+        -o build/test_remote_gpu tests/test_remote_gpu.c -ldl -lm 2>&1" || fail "Test build failed"
 
     ssh "$CLIENT_SSH" "cp $REMOTE_DIR/build/libjuice-cuda.so $REMOTE_DIR/build/"
     ok "Client built"

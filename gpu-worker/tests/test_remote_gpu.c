@@ -19,7 +19,9 @@
  * Run:   LD_PRELOAD=./libjuice-cuda.so ./test_remote_gpu
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,7 +90,7 @@ static double now_ms(void) {
     total++; \
     if (cond) { \
         char _buf[128]; \
-        snprintf(_buf, sizeof(_buf), fmt, __VA_ARGS__); \
+        snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
         printf("  %-50s\033[32mPASS\033[0m (%s)\n", label, _buf); \
         passed++; \
     } else { \
@@ -132,7 +134,7 @@ int main(void) {
     fn_cuEventRecord cuEventRecord = LOAD(cuEventRecord);
     fn_cuEventSynchronize cuEventSynchronize = LOAD(cuEventSynchronize);
     fn_cuEventElapsedTime cuEventElapsedTime = LOAD(cuEventElapsedTime);
-    fn_cuMemsetD32 cuMemsetD32 = LOAD_V2(cuMemsetD32);
+    (void)0; /* cuMemsetD32 available but not used in this test */
 
     /* ============================================================
      * 1. Device Discovery
@@ -325,7 +327,7 @@ int main(void) {
         if (r != 0) { alloc_ok = 0; break; }
     }
     TEST_FMT("Allocate 20 buffers (1-20 MB each)", alloc_ok,
-             "210 MB total");
+             "%s", "210 MB total");
 
     int free_ok = 1;
     for (int i = 0; i < NUM_ALLOCS; i++) {
