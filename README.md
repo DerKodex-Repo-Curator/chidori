@@ -22,7 +22,7 @@ CLIENT (no GPU)                         SERVER (has GPU)
 ## Proven Working
 
 - **PyTorch**: `tensor([1.], device='cuda:0')` on a remote H100 from a GPU-less machine
-- **8x H100-SXM4-*0GB**: All GPUs detected and usable (`torch.cuda.device_count() → 8`)
+- **8x H100-*80GB**: All GPUs detected and usable (`torch.cuda.device_count() → 8`)
 - **50/50 tests passing**: Device queries, 16MB data round-trips, DtoD copies (0 bytes over wire), multi-GPU, streams, events
 - **~280 CUDA functions intercepted**: Driver API, Runtime API, cuBLAS, cuDNN, plus 150+ stubs
 
