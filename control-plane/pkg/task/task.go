@@ -8,7 +8,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
 )
 
 type TaskFn = func(Group) error

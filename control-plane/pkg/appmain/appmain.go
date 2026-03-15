@@ -11,9 +11,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/sentry"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/sentry"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
 )
 
 type closable interface {

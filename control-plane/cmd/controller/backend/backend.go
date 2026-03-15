@@ -8,11 +8,11 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage"
-	"github.com/Juice-Labs/Juice-Labs/pkg/gpu"
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/restapi"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/juice/control-plane/pkg/gpu"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/restapi"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
 )
 
 type Backend struct {

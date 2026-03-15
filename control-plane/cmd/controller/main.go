@@ -13,21 +13,21 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/backend"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/frontend"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/prometheus"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage/gorm"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/backend"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/frontend"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/prometheus"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage/gorm"
 
 	"github.com/joho/godotenv"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/internal/build"
-	"github.com/Juice-Labs/Juice-Labs/pkg/appmain"
-	"github.com/Juice-Labs/Juice-Labs/pkg/crypto"
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/sentry"
-	"github.com/Juice-Labs/Juice-Labs/pkg/server"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
+	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
+	"github.com/fpolica91/juice/control-plane/pkg/appmain"
+	"github.com/fpolica91/juice/control-plane/pkg/crypto"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/sentry"
+	"github.com/fpolica91/juice/control-plane/pkg/server"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
 )
 
 var (

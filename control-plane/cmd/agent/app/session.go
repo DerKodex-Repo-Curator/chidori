@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/Juice-Labs/Juice-Labs/pkg/errors"
-	"github.com/Juice-Labs/Juice-Labs/pkg/gpu"
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/restapi"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
-	"github.com/Juice-Labs/Juice-Labs/pkg/utilities"
+	"github.com/fpolica91/juice/control-plane/pkg/errors"
+	"github.com/fpolica91/juice/control-plane/pkg/gpu"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/restapi"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
+	"github.com/fpolica91/juice/control-plane/pkg/utilities"
 )
 
 var (

@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/Juice-Labs/Juice-Labs/pkg/errors"
+	"github.com/fpolica91/juice/control-plane/pkg/errors"
 )
 
 var (

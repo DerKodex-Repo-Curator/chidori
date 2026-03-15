@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/internal/build"
-	"github.com/Juice-Labs/Juice-Labs/cmd/juicify/app"
-	"github.com/Juice-Labs/Juice-Labs/pkg/appmain"
-	"github.com/Juice-Labs/Juice-Labs/pkg/sentry"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
+	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
+	"github.com/fpolica91/juice/control-plane/cmd/juicify/app"
+	"github.com/fpolica91/juice/control-plane/pkg/appmain"
+	"github.com/fpolica91/juice/control-plane/pkg/sentry"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
 )
 
 func main() {

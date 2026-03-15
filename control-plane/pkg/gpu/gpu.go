@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/restapi"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/restapi"
 )
 
 type Gpu struct {

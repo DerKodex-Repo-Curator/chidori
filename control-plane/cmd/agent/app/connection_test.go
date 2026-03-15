@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Juice-Labs/Juice-Labs/pkg/errors"
-	"github.com/Juice-Labs/Juice-Labs/pkg/restapi"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
+	"github.com/fpolica91/juice/control-plane/pkg/errors"
+	"github.com/fpolica91/juice/control-plane/pkg/restapi"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
 )
 
 var (

@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage/gorm/models"
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/restapi"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage/gorm/models"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/restapi"
 	uuid "github.com/satori/go.uuid"
 
 	"gorm.io/driver/postgres"

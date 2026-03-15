@@ -9,14 +9,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/agent/app"
-	"github.com/Juice-Labs/Juice-Labs/cmd/agent/prometheus"
-	"github.com/Juice-Labs/Juice-Labs/cmd/internal/build"
-	"github.com/Juice-Labs/Juice-Labs/pkg/appmain"
-	"github.com/Juice-Labs/Juice-Labs/pkg/crypto"
-	"github.com/Juice-Labs/Juice-Labs/pkg/logger"
-	"github.com/Juice-Labs/Juice-Labs/pkg/sentry"
-	"github.com/Juice-Labs/Juice-Labs/pkg/task"
+	"github.com/fpolica91/juice/control-plane/cmd/agent/app"
+	"github.com/fpolica91/juice/control-plane/cmd/agent/prometheus"
+	"github.com/fpolica91/juice/control-plane/cmd/internal/build"
+	"github.com/fpolica91/juice/control-plane/pkg/appmain"
+	"github.com/fpolica91/juice/control-plane/pkg/crypto"
+	"github.com/fpolica91/juice/control-plane/pkg/logger"
+	"github.com/fpolica91/juice/control-plane/pkg/sentry"
+	"github.com/fpolica91/juice/control-plane/pkg/task"
 	"github.com/joho/godotenv"
 )
 

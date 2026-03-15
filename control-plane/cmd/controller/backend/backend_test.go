@@ -10,10 +10,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage/memdb"
-	"github.com/Juice-Labs/Juice-Labs/cmd/controller/storage/postgres"
-	"github.com/Juice-Labs/Juice-Labs/pkg/restapi"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage/memdb"
+	"github.com/fpolica91/juice/control-plane/cmd/controller/storage/postgres"
+	"github.com/fpolica91/juice/control-plane/pkg/restapi"
 )
 
 func openMemdb(t *testing.T) storage.Storage {

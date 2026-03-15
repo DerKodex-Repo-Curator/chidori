@@ -1,4 +1,4 @@
-module github.com/Juice-Labs/Juice-Labs
+module github.com/fpolica91/juice/control-plane
 
 go 1.20
 
