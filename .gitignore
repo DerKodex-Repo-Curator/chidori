@@ -3,3 +3,4 @@ gpu-worker/src/generated/
 *.o
 *.so
 *.exe
+gpu-worker/tests/request.sh
