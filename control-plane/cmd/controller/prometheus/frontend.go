@@ -40,7 +40,7 @@ type Frontend struct {
 
 func getGaugeOpts(name string) prometheus.GaugeOpts {
 	return prometheus.GaugeOpts{
-		Namespace: "Juice",
+		Namespace: "chidori",
 		Subsystem: "Controller",
 		Name:      name,
 	}

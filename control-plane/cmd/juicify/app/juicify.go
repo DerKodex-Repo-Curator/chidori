@@ -38,7 +38,7 @@ var (
 	onQueueTimeout    = flag.String("on-queue-timeout", "fail", "When a queue timeout happens, [fail, continue]")
 	onConnectionError = flag.String("on-connection-error", "fail", "When a connection error happens, [fail, continue]")
 
-	juicePath = flag.String("juice-path", "", "Path to the juice executables if different than current executable path")
+	binPath = flag.String("bin-path", "", "Path to the chidori executables if different than current executable path")
 
 	errInvalidSessionState  = errors.New("session state is invalid")
 	errCancelled            = errors.New("cancelled")
@@ -181,13 +181,13 @@ func Run(group task.Group) error {
 		return errors.Newf("--on-queue-timeout has an invalid valid '%s'", *onConnectionError)
 	}
 
-	if *juicePath == "" {
+	if *binPath == "" {
 		executable, err := os.Executable()
 		if err != nil {
 			return errors.ErrRuntime.Wrap(err)
 		}
 
-		*juicePath = filepath.Dir(executable)
+		*binPath = filepath.Dir(executable)
 	}
 
 	err := validateHost()
@@ -195,7 +195,7 @@ func Run(group task.Group) error {
 		return errors.New("host is not configured properly").Wrap(err)
 	}
 
-	cfgPath := filepath.Join(*juicePath, "juice.cfg")
+	cfgPath := filepath.Join(*binPath, "chidori.cfg")
 
 	var config Configuration
 	configBytes, err := os.ReadFile(cfgPath)
@@ -231,7 +231,7 @@ func Run(group task.Group) error {
 	} else if len(config.Servers) > 0 {
 		server = config.Servers[0]
 	} else {
-		return errors.New("require either juice.cfg to have servers set or --address")
+		return errors.New("require either chidori.cfg to have servers set or --address")
 	}
 
 	if *accessToken != "" {
@@ -313,7 +313,7 @@ func Run(group task.Group) error {
 			return err
 		}
 
-		logger.Info("Running without Juice")
+		logger.Info("Running without Chidori")
 
 		args := flag.Args()
 		cmd = exec.Command(args[0], args[1:]...)
@@ -325,7 +325,7 @@ func Run(group task.Group) error {
 
 		cmd = createCommand(flag.Args())
 		cmd.Env = append(os.Environ(),
-			fmt.Sprintf("JUICE_CFG_OVERRIDE=%s", string(configOverride)),
+			fmt.Sprintf("CHIDORI_CFG_OVERRIDE=%s", string(configOverride)),
 		)
 	}
 

@@ -29,7 +29,7 @@ func TestCancel(t *testing.T) {
 	exitCodeCh := make(chan int)
 	defer close(exitCodeCh)
 
-	connection := newConnection(defaultConnectionData, *juicePath, "")
+	connection := newConnection(defaultConnectionData, *binPath, "")
 	err := connection.Start(taskManager, exitCodeCh)
 	if err == nil {
 		ticker := time.NewTicker(2 * time.Second)

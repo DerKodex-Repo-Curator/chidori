@@ -1,7 +1,0 @@
-export JUICE_HOOKS_PATH=$(cd "$(dirname "$0")" && pwd)
-. $JUICE_HOOKS_PATH/juice-config.sh
-
-export JUICE_CMD=$JUICE_PATH/juice
-export JUICE_DATA=$JUICE_PATH/.data
-export JUICE_SESSIONS=$JUICE_DATA/sessions
-export JUICE_SESSION_ENCRYPTION_KEY=$SPANK_JUICE_SESSION_ENCRYPTION_KEY

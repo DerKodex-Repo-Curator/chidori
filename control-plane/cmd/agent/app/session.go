@@ -24,7 +24,7 @@ type Session struct {
 	Id      string
 	Version string
 
-	juicePath string
+	binPath string
 	gpus      *gpu.SelectedGpuSet
 
 	closed      *utilities.ConcurrentVariable[bool]
@@ -35,11 +35,11 @@ type Session struct {
 	eventListener EventListener
 }
 
-func newSession(ctx context.Context, id string, version string, juicePath string, gpus *gpu.SelectedGpuSet, eventListener EventListener) *Session {
+func newSession(ctx context.Context, id string, version string, binPath string, gpus *gpu.SelectedGpuSet, eventListener EventListener) *Session {
 	return &Session{
 		Id:            id,
 		Version:       version,
-		juicePath:     juicePath,
+		binPath:     binPath,
 		gpus:          gpus,
 		closed:        utilities.NewConcurrentVariableD[bool](false),
 		connections:   utilities.NewConcurrentMap[string, *Connection](),
@@ -135,7 +135,7 @@ func (session *Session) addConnection(connectionData restapi.ConnectionData) (*C
 
 	exitCodeCh := make(chan int)
 
-	connection := newConnection(connectionData, session.juicePath, session.gpus.GetPciBusString())
+	connection := newConnection(connectionData, session.binPath, session.gpus.GetPciBusString())
 	err := connection.Start(session.taskManager, exitCodeCh)
 	if err != nil {
 		return nil, err

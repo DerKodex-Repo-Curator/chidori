@@ -27,7 +27,7 @@ var (
 )
 
 func main() {
-	name := "Juice Agent"
+	name := "Chidori Agent"
 	config := appmain.Config{
 		Name:    name,
 		Version: build.Version,

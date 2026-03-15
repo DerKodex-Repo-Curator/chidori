@@ -88,7 +88,7 @@ func openStorage(ctx context.Context) (storage.Storage, error) {
 }
 
 func main() {
-	name := "Juice Controller"
+	name := "Chidori Controller"
 	config := appmain.Config{
 		Name:    name,
 		Version: build.Version,

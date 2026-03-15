@@ -25,7 +25,7 @@ import (
 type Connection struct {
 	restapi.ConnectionData
 
-	juicePath string
+	binPath string
 	pciBus    string
 
 	cmd       *exec.Cmd
@@ -33,7 +33,7 @@ type Connection struct {
 	writePipe *os.File
 
 	// hijackedConn holds a reference to the hijacked TCP connection after
-	// it has been forwarded to juice-gpu-worker via SCM_RIGHTS. We MUST
+	// it has been forwarded to chidori-worker via SCM_RIGHTS. We MUST
 	// retain this reference to prevent Go's garbage collector from
 	// finalizing the net.Conn and calling close() on the underlying fd.
 	// Even though SCM_RIGHTS creates an independent kernel refcount,
@@ -44,10 +44,10 @@ type Connection struct {
 	hijackedConn net.Conn
 }
 
-func newConnection(connectionData restapi.ConnectionData, juicePath string, pciBus string) *Connection {
+func newConnection(connectionData restapi.ConnectionData, binPath string, pciBus string) *Connection {
 	return &Connection{
 		ConnectionData: connectionData,
-		juicePath:      juicePath,
+		binPath:      binPath,
 		pciBus:         pciBus,
 	}
 }
@@ -68,7 +68,7 @@ func (connection *Connection) Start(group task.Group, exitCode chan int) error {
 			connection.writePipe = ch2Write
 			defer ch2Read.Close()
 
-			logsPath := filepath.Join(connection.juicePath, "logs")
+			logsPath := filepath.Join(connection.binPath, "logs")
 			_, err = os.Stat(logsPath)
 			if err != nil && os.IsNotExist(err) {
 				err = os.MkdirAll(logsPath, fs.ModeDir|fs.ModePerm)
@@ -82,7 +82,7 @@ func (connection *Connection) Start(group task.Group, exitCode chan int) error {
 
 				if err == nil {
 					connection.cmd = exec.CommandContext(group.Ctx(),
-						filepath.Join(connection.juicePath, "juice-gpu-worker"),
+						filepath.Join(connection.binPath, "chidori-worker"),
 						append(
 							[]string{
 								"--id", connection.Id,
@@ -182,7 +182,7 @@ func (connection *Connection) Connect(c net.Conn) error {
 	} else {
 		// Keep a reference to the hijacked connection so that Go's GC does
 		// not finalize it and close the underlying TCP socket fd.  The fd
-		// has been forwarded to juice-gpu-worker via SCM_RIGHTS, but the
+		// has been forwarded to chidori-worker via SCM_RIGHTS, but the
 		// agent's copy must remain open to avoid sending TCP FIN/RST to
 		// the remote client.  It will be closed when the Connection is
 		// torn down (see the goroutine in Start that waits for cmd.Wait).

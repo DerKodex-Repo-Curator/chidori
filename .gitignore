@@ -1,6 +1,6 @@
-gpu-worker/build/
-gpu-worker/src/generated/
+chidori-worker/build/
+chidori-worker/src/generated/
 *.o
 *.so
 *.exe
-gpu-worker/tests/request.sh
+chidori-worker/tests/request.sh

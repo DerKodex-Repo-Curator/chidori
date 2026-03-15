@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	namespace = "juice"
+	namespace = "chidori"
 	subsystem = "agent"
 )
 

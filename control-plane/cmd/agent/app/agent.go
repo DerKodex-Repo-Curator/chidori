@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	juicePath = flag.String("juice-path", "", "")
+	binPath = flag.String("bin-path", "", "")
 
 	address = flag.String("address", "0.0.0.0:43210", "The IP address and port to use for listening for client connections")
 	labels  = flag.String("labels", "", "Comma separated list of key=value pairs")
@@ -45,7 +45,7 @@ type Agent struct {
 	Id string
 
 	Hostname  string
-	JuicePath string
+	BinPath string
 
 	Gpus               *gpu.GpuSet
 	GpuMetricsProvider *cmdgpu.MetricsProvider
@@ -74,7 +74,7 @@ func NewAgent(ctx context.Context, tlsConfig *tls.Config) (*Agent, error) {
 
 	agent := &Agent{
 		Id:          uuid.NewString(),
-		JuicePath:   *juicePath,
+		BinPath:   *binPath,
 		Server:      server,
 		labels:      map[string]string{},
 		taints:      map[string]string{},
@@ -118,13 +118,13 @@ func NewAgent(ctx context.Context, tlsConfig *tls.Config) (*Agent, error) {
 		agent.poolId = *poolId
 	}
 
-	if agent.JuicePath == "" {
+	if agent.BinPath == "" {
 		executable, err := os.Executable()
 		if err != nil {
 			return nil, err
 		}
 
-		agent.JuicePath = filepath.Dir(executable)
+		agent.BinPath = filepath.Dir(executable)
 	}
 
 	hostname, err := os.Hostname()
@@ -172,7 +172,7 @@ func (agent *Agent) getSession(sessionId string) (*Session, error) {
 func (agent *Agent) addSession(sessionId string, version string, gpus *gpu.SelectedGpuSet) {
 	logger.Debugf("Starting Session %s", sessionId)
 
-	session := newSession(agent.taskManager.Ctx(), sessionId, version, agent.JuicePath, gpus, agent)
+	session := newSession(agent.taskManager.Ctx(), sessionId, version, agent.BinPath, gpus, agent)
 	agent.sessions.Set(sessionId, session)
 
 	agent.taskManager.Go(fmt.Sprintf("session %s", sessionId), session)

@@ -25,7 +25,7 @@ func createCommand(args []string) *exec.Cmd {
 }
 
 func runCommand(group task.Group, cmd *exec.Cmd, config Configuration) error {
-	juiceLibraryPath := filepath.Join(*juicePath, "libjuice-cuda.so")
-	cmd.Env = append(cmd.Env, fmt.Sprintf("LD_PRELOAD=%s", juiceLibraryPath))
+	chidoriLibraryPath := filepath.Join(*binPath, "libchidori.so")
+	cmd.Env = append(cmd.Env, fmt.Sprintf("LD_PRELOAD=%s", chidoriLibraryPath))
 	return cmd.Run()
 }
