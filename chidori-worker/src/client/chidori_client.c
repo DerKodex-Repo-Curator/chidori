@@ -3619,23 +3619,24 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
      * The server then passes kernelParams (not extra buffer) to cuLaunchKernel.
      */
 
-    /* Count args — PyTorch kernels typically have 2-10 args.
-     * The args array is NOT null-terminated in general, but PyTorch's
-     * cudaLaunchKernel wrapper does null-terminate it in practice.
-     * Cap at 10 to be safe. */
+    /*
+     * Count kernel args. The args[] array is NOT null-terminated.
+     * PyTorch packs arg values contiguously on the stack, and args[i]
+     * points into that region. Valid arg pointers are close together
+     * (within ~4KB). When we see a pointer far from args[0], we've
+     * passed the end of the real args into garbage memory.
+     */
     int num_args = 0;
-    if (args != NULL) {
-        for (int i = 0; i < 10; i++) {
+    if (args != NULL && args[0] != NULL) {
+        uintptr_t base = (uintptr_t)args[0];
+        num_args = 1;
+        for (int i = 1; i < 16; i++) {
             if (args[i] == NULL) break;
+            uintptr_t p = (uintptr_t)args[i];
+            /* Check if pointer is within 4KB of the base — same stack frame */
+            uintptr_t diff = (p > base) ? (p - base) : (base - p);
+            if (diff > 4096) break; /* left the arg region */
             num_args++;
-            if (g_verbose)
-                fprintf(stderr, "[chidori-launch] arg[%d] ptr=%p val=", i, args[i]);
-            /* Try to peek at the value safely */
-            if (g_verbose) {
-                uint64_t v = 0;
-                memcpy(&v, args[i], sizeof(v));
-                fprintf(stderr, "0x%llx\n", (unsigned long long)v);
-            }
         }
     }
     /* Override param_size to actual packed size */
