@@ -284,8 +284,17 @@ static int juice_connect(void) {
  * Send an RPC and receive the response.
  * Thread-safe via mutex (simple approach; could use per-thread connections later).
  */
+static int g_verbose = -1; /* -1 = unchecked */
+
 static CUresult juice_rpc(uint16_t func_id, const void *payload, size_t payload_len,
                           void *out_payload, size_t *out_payload_len) {
+    if (g_verbose == -1) {
+        const char *v = getenv("JUICE_VERBOSE");
+        g_verbose = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (g_verbose)
+        fprintf(stderr, "[juice-rpc] func=0x%04x payload=%zu\n", func_id, payload_len);
+
     pthread_mutex_lock(&g_lock);
 
     if (g_server_fd < 0) {
@@ -358,6 +367,9 @@ static CUresult juice_rpc(uint16_t func_id, const void *payload, size_t payload_
     }
 
     pthread_mutex_unlock(&g_lock);
+    if (g_verbose)
+        fprintf(stderr, "[juice-rpc] func=0x%04x result=%d resp_payload=%zu\n",
+                func_id, resp.result, resp_payload_len);
     return (CUresult)resp.result;
 }
 
@@ -754,23 +766,34 @@ typedef int cudaError_t;
 /* Track last error locally */
 static cudaError_t g_last_error = 0;
 
+static int g_device_count_cache = -1;
+
 cudaError_t cudaGetDeviceCount(int *count) {
+    if (g_device_count_cache >= 0) {
+        *count = g_device_count_cache;
+        return cudaSuccess;
+    }
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_GET_DEVICE_COUNT, NULL, 0, count, &len);
+    if (r == cudaSuccess)
+        g_device_count_cache = *count;
     g_last_error = r;
     return r;
 }
 
+static int g_current_device = 0; /* Cache current device locally */
+
 cudaError_t cudaGetDevice(int *device) {
-    size_t len = sizeof(int32_t);
-    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_GET_DEVICE, NULL, 0, device, &len);
-    g_last_error = r;
-    return r;
+    /* Return cached value — avoids RPC for this very hot path */
+    *device = g_current_device;
+    return cudaSuccess;
 }
 
 cudaError_t cudaSetDevice(int device) {
     int32_t dev = device;
     cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_SET_DEVICE, &dev, sizeof(dev), NULL, NULL);
+    if (r == cudaSuccess)
+        g_current_device = device;
     g_last_error = r;
     return r;
 }
