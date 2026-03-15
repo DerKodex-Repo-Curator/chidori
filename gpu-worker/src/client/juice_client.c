@@ -1921,6 +1921,2586 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
 }
 
 /*
+ * ============================================================================
+ * cuDNN API Interceptions
+ *
+ * cuDNN uses opaque descriptor handles (all transmitted as uint64_t) and
+ * host-side alpha/beta scalars (same pattern as cuBLAS).
+ * cudnnStatus_t is an int enum; we use int as the wire type.
+ * ============================================================================
+ */
+
+typedef int cudnnStatus_t;
+typedef void *cudnnHandle_t;
+typedef void *cudnnTensorDescriptor_t;
+typedef void *cudnnFilterDescriptor_t;
+typedef void *cudnnConvolutionDescriptor_t;
+typedef void *cudnnActivationDescriptor_t;
+typedef void *cudnnPoolingDescriptor_t;
+typedef void *cudnnDropoutDescriptor_t;
+typedef void *cudnnRNNDescriptor_t;
+
+typedef int cudnnDataType_t;
+typedef int cudnnTensorFormat_t;
+typedef int cudnnConvolutionMode_t;
+typedef int cudnnConvolutionFwdAlgo_t;
+typedef int cudnnConvolutionBwdDataAlgo_t;
+typedef int cudnnConvolutionFwdAlgoPerf_t;
+typedef int cudnnActivationMode_t;
+typedef int cudnnNanPropagation_t;
+typedef int cudnnPoolingMode_t;
+typedef int cudnnSoftmaxAlgorithm_t;
+typedef int cudnnSoftmaxMode_t;
+typedef int cudnnBatchNormMode_t;
+typedef int cudnnMathType_t;
+typedef int cudnnConvolutionBwdFilterAlgo_t;
+
+#define CUDNN_STATUS_SUCCESS             0
+#define CUDNN_STATUS_NOT_INITIALIZED     1
+#define CUDNN_STATUS_ALLOC_FAILED        2
+#define CUDNN_STATUS_BAD_PARAM           3
+#define CUDNN_STATUS_NOT_SUPPORTED       9
+
+/* ---- Handle lifecycle ---- */
+
+cudnnStatus_t cudnnCreate(cudnnHandle_t *handle) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE, NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *handle = (cudnnHandle_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnDestroy(cudnnHandle_t handle) {
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY, &h, sizeof(h), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSetStream(cudnnHandle_t handle, CUstream stream) {
+    struct { uint64_t handle; uint64_t stream; } req;
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.stream = (uint64_t)(uintptr_t)stream;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_STREAM, &req, sizeof(req), NULL, NULL);
+}
+
+size_t cudnnGetVersion(void) {
+    uint64_t version = 0;
+    size_t len = sizeof(uint64_t);
+    juice_rpc(JUICE_CUDNN_GET_VERSION, NULL, 0, &version, &len);
+    return (size_t)version;
+}
+
+/* ---- Tensor Descriptor ---- */
+
+cudnnStatus_t cudnnCreateTensorDescriptor(cudnnTensorDescriptor_t *tensorDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_TENSOR_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *tensorDesc = (cudnnTensorDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnSetTensor4dDescriptor(cudnnTensorDescriptor_t tensorDesc,
+    cudnnTensorFormat_t format, cudnnDataType_t dataType,
+    int n, int c, int h, int w) {
+
+    struct __attribute__((packed)) {
+        uint64_t desc;
+        int32_t  format;
+        int32_t  dataType;
+        int32_t  n, c, h, w;
+    } req;
+
+    req.desc = (uint64_t)(uintptr_t)tensorDesc;
+    req.format = (int32_t)format;
+    req.dataType = (int32_t)dataType;
+    req.n = n; req.c = c; req.h = h; req.w = w;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_TENSOR_4D_DESCRIPTOR,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSetTensorNdDescriptor(cudnnTensorDescriptor_t tensorDesc,
+    cudnnDataType_t dataType, int nbDims, const int *dimA, const int *strideA) {
+
+    /*
+     * Wire format:
+     *   desc(8) + dataType(4) + nbDims(4) + dims(4*nbDims) + strides(4*nbDims)
+     */
+    size_t payload_len = 16 + (size_t)nbDims * 8;
+    void *payload = malloc(payload_len);
+    if (!payload) return CUDNN_STATUS_ALLOC_FAILED;
+
+    char *p = (char *)payload;
+    uint64_t desc = (uint64_t)(uintptr_t)tensorDesc;
+    int32_t dt = (int32_t)dataType;
+    int32_t nd = (int32_t)nbDims;
+    memcpy(p, &desc, 8); p += 8;
+    memcpy(p, &dt, 4); p += 4;
+    memcpy(p, &nd, 4); p += 4;
+    for (int i = 0; i < nbDims; i++) {
+        int32_t d = dimA[i]; memcpy(p, &d, 4); p += 4;
+    }
+    for (int i = 0; i < nbDims; i++) {
+        int32_t s = strideA[i]; memcpy(p, &s, 4); p += 4;
+    }
+
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_TENSOR_ND_DESCRIPTOR,
+                                                payload, payload_len, NULL, NULL);
+    free(payload);
+    return r;
+}
+
+cudnnStatus_t cudnnGetTensor4dDescriptor(cudnnTensorDescriptor_t tensorDesc,
+    cudnnDataType_t *dataType, int *n, int *c, int *h, int *w,
+    int *nStride, int *cStride, int *hStride, int *wStride) {
+
+    uint64_t desc = (uint64_t)(uintptr_t)tensorDesc;
+    struct {
+        int32_t dataType;
+        int32_t n, c, h, w;
+        int32_t nStride, cStride, hStride, wStride;
+    } out;
+    size_t len = sizeof(out);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_GET_TENSOR_4D_DESCRIPTOR,
+                                                &desc, sizeof(desc), &out, &len);
+    if (r == CUDNN_STATUS_SUCCESS) {
+        if (dataType) *dataType = (cudnnDataType_t)out.dataType;
+        if (n) *n = out.n; if (c) *c = out.c;
+        if (h) *h = out.h; if (w) *w = out.w;
+        if (nStride) *nStride = out.nStride;
+        if (cStride) *cStride = out.cStride;
+        if (hStride) *hStride = out.hStride;
+        if (wStride) *wStride = out.wStride;
+    }
+    return r;
+}
+
+cudnnStatus_t cudnnDestroyTensorDescriptor(cudnnTensorDescriptor_t tensorDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)tensorDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_TENSOR_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+/* ---- Filter Descriptor ---- */
+
+cudnnStatus_t cudnnCreateFilterDescriptor(cudnnFilterDescriptor_t *filterDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_FILTER_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *filterDesc = (cudnnFilterDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnSetFilter4dDescriptor(cudnnFilterDescriptor_t filterDesc,
+    cudnnDataType_t dataType, cudnnTensorFormat_t format,
+    int k, int c, int h, int w) {
+
+    struct __attribute__((packed)) {
+        uint64_t desc;
+        int32_t  dataType;
+        int32_t  format;
+        int32_t  k, c, h, w;
+    } req;
+
+    req.desc = (uint64_t)(uintptr_t)filterDesc;
+    req.dataType = (int32_t)dataType;
+    req.format = (int32_t)format;
+    req.k = k; req.c = c; req.h = h; req.w = w;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_FILTER_4D_DESCRIPTOR,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSetFilterNdDescriptor(cudnnFilterDescriptor_t filterDesc,
+    cudnnDataType_t dataType, cudnnTensorFormat_t format,
+    int nbDims, const int *filterDimA) {
+
+    size_t payload_len = 16 + (size_t)nbDims * 4;
+    void *payload = malloc(payload_len);
+    if (!payload) return CUDNN_STATUS_ALLOC_FAILED;
+
+    char *p = (char *)payload;
+    uint64_t desc = (uint64_t)(uintptr_t)filterDesc;
+    int32_t dt = (int32_t)dataType;
+    int32_t fmt = (int32_t)format;
+    int32_t nd = (int32_t)nbDims;
+    memcpy(p, &desc, 8); p += 8;
+    memcpy(p, &dt, 4); p += 4;
+    memcpy(p, &fmt, 4); p += 4;
+    /* nbDims is encoded implicitly by payload size, but send it explicitly */
+    /* We need to adjust: desc(8) + dataType(4) + format(4) + nbDims(4) + dims(4*n) */
+    /* Re-do: */
+    free(payload);
+    payload_len = 20 + (size_t)nbDims * 4;
+    payload = malloc(payload_len);
+    if (!payload) return CUDNN_STATUS_ALLOC_FAILED;
+    p = (char *)payload;
+    memcpy(p, &desc, 8); p += 8;
+    memcpy(p, &dt, 4); p += 4;
+    memcpy(p, &fmt, 4); p += 4;
+    memcpy(p, &nd, 4); p += 4;
+    for (int i = 0; i < nbDims; i++) {
+        int32_t d = filterDimA[i]; memcpy(p, &d, 4); p += 4;
+    }
+
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_FILTER_ND_DESCRIPTOR,
+                                                payload, payload_len, NULL, NULL);
+    free(payload);
+    return r;
+}
+
+cudnnStatus_t cudnnDestroyFilterDescriptor(cudnnFilterDescriptor_t filterDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)filterDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_FILTER_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+/* ---- Convolution Descriptor ---- */
+
+cudnnStatus_t cudnnCreateConvolutionDescriptor(cudnnConvolutionDescriptor_t *convDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_CONVOLUTION_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnSetConvolution2dDescriptor(cudnnConvolutionDescriptor_t convDesc,
+    int pad_h, int pad_w, int u, int v, int dilation_h, int dilation_w,
+    cudnnConvolutionMode_t mode, cudnnDataType_t computeType) {
+
+    struct __attribute__((packed)) {
+        uint64_t desc;
+        int32_t  pad_h, pad_w;
+        int32_t  u, v;
+        int32_t  dilation_h, dilation_w;
+        int32_t  mode;
+        int32_t  computeType;
+    } req;
+
+    req.desc = (uint64_t)(uintptr_t)convDesc;
+    req.pad_h = pad_h; req.pad_w = pad_w;
+    req.u = u; req.v = v;
+    req.dilation_h = dilation_h; req.dilation_w = dilation_w;
+    req.mode = (int32_t)mode;
+    req.computeType = (int32_t)computeType;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_CONVOLUTION_2D_DESCRIPTOR,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSetConvolutionNdDescriptor(cudnnConvolutionDescriptor_t convDesc,
+    int arrayLength, const int *padA, const int *filterStrideA,
+    const int *dilationA, cudnnConvolutionMode_t mode,
+    cudnnDataType_t computeType) {
+
+    /* desc(8) + arrayLength(4) + mode(4) + computeType(4) + pads(4*n) + strides(4*n) + dilations(4*n) */
+    size_t payload_len = 20 + (size_t)arrayLength * 12;
+    void *payload = malloc(payload_len);
+    if (!payload) return CUDNN_STATUS_ALLOC_FAILED;
+
+    char *p = (char *)payload;
+    uint64_t desc = (uint64_t)(uintptr_t)convDesc;
+    int32_t al = (int32_t)arrayLength;
+    int32_t m = (int32_t)mode;
+    int32_t ct = (int32_t)computeType;
+    memcpy(p, &desc, 8); p += 8;
+    memcpy(p, &al, 4); p += 4;
+    memcpy(p, &m, 4); p += 4;
+    memcpy(p, &ct, 4); p += 4;
+    for (int i = 0; i < arrayLength; i++) {
+        int32_t v = padA[i]; memcpy(p, &v, 4); p += 4;
+    }
+    for (int i = 0; i < arrayLength; i++) {
+        int32_t v = filterStrideA[i]; memcpy(p, &v, 4); p += 4;
+    }
+    for (int i = 0; i < arrayLength; i++) {
+        int32_t v = dilationA[i]; memcpy(p, &v, 4); p += 4;
+    }
+
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_CONVOLUTION_ND_DESCRIPTOR,
+                                                payload, payload_len, NULL, NULL);
+    free(payload);
+    return r;
+}
+
+cudnnStatus_t cudnnDestroyConvolutionDescriptor(cudnnConvolutionDescriptor_t convDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)convDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_CONVOLUTION_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc,
+    cudnnMathType_t mathType) {
+    struct { uint64_t desc; int32_t mathType; } req;
+    req.desc = (uint64_t)(uintptr_t)convDesc;
+    req.mathType = (int32_t)mathType;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_CONVOLUTION_MATH_TYPE,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDesc,
+    int groupCount) {
+    struct { uint64_t desc; int32_t groupCount; } req;
+    req.desc = (uint64_t)(uintptr_t)convDesc;
+    req.groupCount = groupCount;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_CONVOLUTION_GROUP_COUNT,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Convolution Forward Algorithm ---- */
+
+cudnnStatus_t cudnnGetConvolutionForwardAlgorithm_v7(cudnnHandle_t handle,
+    cudnnTensorDescriptor_t xDesc, cudnnFilterDescriptor_t wDesc,
+    cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t yDesc,
+    int requestedAlgoCount, int *returnedAlgoCount,
+    void *perfResults) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t xDesc;
+        uint64_t wDesc;
+        uint64_t convDesc;
+        uint64_t yDesc;
+        int32_t  requestedAlgoCount;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.wDesc = (uint64_t)(uintptr_t)wDesc;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.requestedAlgoCount = requestedAlgoCount;
+
+    /*
+     * Response: returnedAlgoCount(4) + perfResults array.
+     * cudnnConvolutionFwdAlgoPerf_t is ~56 bytes each. We receive up to
+     * requestedAlgoCount entries.
+     */
+    size_t out_len = 4 + (size_t)requestedAlgoCount * 56;
+    void *out = malloc(out_len);
+    if (!out) return CUDNN_STATUS_ALLOC_FAILED;
+
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_GET_CONVOLUTION_FORWARD_ALGORITHM,
+                                                &req, sizeof(req), out, &out_len);
+    if (r == CUDNN_STATUS_SUCCESS && out_len >= 4) {
+        int32_t count;
+        memcpy(&count, out, 4);
+        if (returnedAlgoCount) *returnedAlgoCount = count;
+        if (perfResults && out_len > 4)
+            memcpy(perfResults, (char *)out + 4, out_len - 4);
+    }
+    free(out);
+    return r;
+}
+
+/* ---- Convolution Workspace Size ---- */
+
+cudnnStatus_t cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle_t handle,
+    cudnnTensorDescriptor_t xDesc, cudnnFilterDescriptor_t wDesc,
+    cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t yDesc,
+    cudnnConvolutionFwdAlgo_t algo, size_t *sizeInBytes) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t xDesc;
+        uint64_t wDesc;
+        uint64_t convDesc;
+        uint64_t yDesc;
+        int32_t  algo;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.wDesc = (uint64_t)(uintptr_t)wDesc;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.algo = (int32_t)algo;
+
+    uint64_t sz = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(
+        JUICE_CUDNN_GET_CONVOLUTION_FORWARD_WORKSPACE_SIZE,
+        &req, sizeof(req), &sz, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *sizeInBytes = (size_t)sz;
+    return r;
+}
+
+cudnnStatus_t cudnnGetConvolutionBackwardDataWorkspaceSize(cudnnHandle_t handle,
+    cudnnFilterDescriptor_t wDesc, cudnnTensorDescriptor_t dyDesc,
+    cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t dxDesc,
+    cudnnConvolutionBwdDataAlgo_t algo, size_t *sizeInBytes) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t wDesc;
+        uint64_t dyDesc;
+        uint64_t convDesc;
+        uint64_t dxDesc;
+        int32_t  algo;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.wDesc = (uint64_t)(uintptr_t)wDesc;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
+    req.algo = (int32_t)algo;
+
+    uint64_t sz = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(
+        JUICE_CUDNN_GET_CONVOLUTION_BACKWARD_DATA_WORKSPACE_SIZE,
+        &req, sizeof(req), &sz, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *sizeInBytes = (size_t)sz;
+    return r;
+}
+
+cudnnStatus_t cudnnGetConvolutionBackwardFilterWorkspaceSize(cudnnHandle_t handle,
+    cudnnTensorDescriptor_t xDesc, cudnnTensorDescriptor_t dyDesc,
+    cudnnConvolutionDescriptor_t convDesc, cudnnFilterDescriptor_t gradDesc,
+    cudnnConvolutionBwdFilterAlgo_t algo, size_t *sizeInBytes) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t xDesc;
+        uint64_t dyDesc;
+        uint64_t convDesc;
+        uint64_t gradDesc;
+        int32_t  algo;
+    } req;
+
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.gradDesc = (uint64_t)(uintptr_t)gradDesc;
+    req.algo = (int32_t)algo;
+
+    uint64_t sz = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(
+        JUICE_CUDNN_GET_CONVOLUTION_BACKWARD_FILTER_WORKSPACE_SIZE,
+        &req, sizeof(req), &sz, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *sizeInBytes = (size_t)sz;
+    return r;
+}
+
+/* ---- Convolution Forward ---- */
+
+cudnnStatus_t cudnnConvolutionForward(cudnnHandle_t handle,
+    const void *alpha,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    cudnnFilterDescriptor_t wDesc, const void *w,
+    cudnnConvolutionDescriptor_t convDesc,
+    cudnnConvolutionFwdAlgo_t algo,
+    void *workSpace, size_t workSpaceSizeInBytes,
+    const void *beta,
+    cudnnTensorDescriptor_t yDesc, void *y) {
+
+    /*
+     * Wire format:
+     *   handle(8) + alpha(8) + xDesc(8) + x(8) + wDesc(8) + w(8)
+     *   + convDesc(8) + algo(4) + workspace(8) + workspaceSize(8)
+     *   + beta(8) + yDesc(8) + y(8) = 100 bytes
+     *
+     * alpha/beta sent as 8 bytes (double-sized buffer, covers float and double).
+     */
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint8_t  alpha[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint64_t wDesc;
+        uint64_t w;
+        uint64_t convDesc;
+        int32_t  algo;
+        uint64_t workSpace;
+        uint64_t workSpaceSizeInBytes;
+        uint8_t  beta[8];
+        uint64_t yDesc;
+        uint64_t y;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    memcpy(req.alpha, alpha, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.wDesc = (uint64_t)(uintptr_t)wDesc;
+    req.w = (uint64_t)(uintptr_t)w;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.algo = (int32_t)algo;
+    req.workSpace = (uint64_t)(uintptr_t)workSpace;
+    req.workSpaceSizeInBytes = (uint64_t)workSpaceSizeInBytes;
+    memcpy(req.beta, beta, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CONVOLUTION_FORWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Convolution Backward Data ---- */
+
+cudnnStatus_t cudnnConvolutionBackwardData(cudnnHandle_t handle,
+    const void *alpha,
+    cudnnFilterDescriptor_t wDesc, const void *w,
+    cudnnTensorDescriptor_t dyDesc, const void *dy,
+    cudnnConvolutionDescriptor_t convDesc,
+    cudnnConvolutionBwdDataAlgo_t algo,
+    void *workSpace, size_t workSpaceSizeInBytes,
+    const void *beta,
+    cudnnTensorDescriptor_t dxDesc, void *dx) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint8_t  alpha[8];
+        uint64_t wDesc;
+        uint64_t w;
+        uint64_t dyDesc;
+        uint64_t dy;
+        uint64_t convDesc;
+        int32_t  algo;
+        uint64_t workSpace;
+        uint64_t workSpaceSizeInBytes;
+        uint8_t  beta[8];
+        uint64_t dxDesc;
+        uint64_t dx;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    memcpy(req.alpha, alpha, 8);
+    req.wDesc = (uint64_t)(uintptr_t)wDesc;
+    req.w = (uint64_t)(uintptr_t)w;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.dy = (uint64_t)(uintptr_t)dy;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.algo = (int32_t)algo;
+    req.workSpace = (uint64_t)(uintptr_t)workSpace;
+    req.workSpaceSizeInBytes = (uint64_t)workSpaceSizeInBytes;
+    memcpy(req.beta, beta, 8);
+    req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
+    req.dx = (uint64_t)(uintptr_t)dx;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CONVOLUTION_BACKWARD_DATA,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Convolution Backward Filter ---- */
+
+cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t handle,
+    const void *alpha,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    cudnnTensorDescriptor_t dyDesc, const void *dy,
+    cudnnConvolutionDescriptor_t convDesc,
+    cudnnConvolutionBwdFilterAlgo_t algo,
+    void *workSpace, size_t workSpaceSizeInBytes,
+    const void *beta,
+    cudnnFilterDescriptor_t dwDesc, void *dw) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint8_t  alpha[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint64_t dyDesc;
+        uint64_t dy;
+        uint64_t convDesc;
+        int32_t  algo;
+        uint64_t workSpace;
+        uint64_t workSpaceSizeInBytes;
+        uint8_t  beta[8];
+        uint64_t dwDesc;
+        uint64_t dw;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    memcpy(req.alpha, alpha, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.dy = (uint64_t)(uintptr_t)dy;
+    req.convDesc = (uint64_t)(uintptr_t)convDesc;
+    req.algo = (int32_t)algo;
+    req.workSpace = (uint64_t)(uintptr_t)workSpace;
+    req.workSpaceSizeInBytes = (uint64_t)workSpaceSizeInBytes;
+    memcpy(req.beta, beta, 8);
+    req.dwDesc = (uint64_t)(uintptr_t)dwDesc;
+    req.dw = (uint64_t)(uintptr_t)dw;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CONVOLUTION_BACKWARD_FILTER,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Activation Descriptor ---- */
+
+cudnnStatus_t cudnnCreateActivationDescriptor(cudnnActivationDescriptor_t *activationDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_ACTIVATION_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *activationDesc = (cudnnActivationDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnSetActivationDescriptor(cudnnActivationDescriptor_t activationDesc,
+    cudnnActivationMode_t mode, cudnnNanPropagation_t reluNanOpt,
+    double coef) {
+
+    struct __attribute__((packed)) {
+        uint64_t desc;
+        int32_t  mode;
+        int32_t  reluNanOpt;
+        double   coef;
+    } req;
+
+    req.desc = (uint64_t)(uintptr_t)activationDesc;
+    req.mode = (int32_t)mode;
+    req.reluNanOpt = (int32_t)reluNanOpt;
+    req.coef = coef;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_ACTIVATION_DESCRIPTOR,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnDestroyActivationDescriptor(cudnnActivationDescriptor_t activationDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)activationDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_ACTIVATION_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
+    cudnnActivationDescriptor_t activationDesc,
+    const void *alpha,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    const void *beta,
+    cudnnTensorDescriptor_t yDesc, void *y) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t activationDesc;
+        uint8_t  alpha[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint8_t  beta[8];
+        uint64_t yDesc;
+        uint64_t y;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.activationDesc = (uint64_t)(uintptr_t)activationDesc;
+    memcpy(req.alpha, alpha, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    memcpy(req.beta, beta, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_ACTIVATION_FORWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnActivationBackward(cudnnHandle_t handle,
+    cudnnActivationDescriptor_t activationDesc,
+    const void *alpha,
+    cudnnTensorDescriptor_t yDesc, const void *y,
+    cudnnTensorDescriptor_t dyDesc, const void *dy,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    const void *beta,
+    cudnnTensorDescriptor_t dxDesc, void *dx) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t activationDesc;
+        uint8_t  alpha[8];
+        uint64_t yDesc;
+        uint64_t y;
+        uint64_t dyDesc;
+        uint64_t dy;
+        uint64_t xDesc;
+        uint64_t x;
+        uint8_t  beta[8];
+        uint64_t dxDesc;
+        uint64_t dx;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.activationDesc = (uint64_t)(uintptr_t)activationDesc;
+    memcpy(req.alpha, alpha, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.dy = (uint64_t)(uintptr_t)dy;
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    memcpy(req.beta, beta, 8);
+    req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
+    req.dx = (uint64_t)(uintptr_t)dx;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_ACTIVATION_BACKWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Pooling Descriptor ---- */
+
+cudnnStatus_t cudnnCreatePoolingDescriptor(cudnnPoolingDescriptor_t *poolingDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_POOLING_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *poolingDesc = (cudnnPoolingDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnSetPooling2dDescriptor(cudnnPoolingDescriptor_t poolingDesc,
+    cudnnPoolingMode_t mode, cudnnNanPropagation_t maxpoolingNanOpt,
+    int windowHeight, int windowWidth,
+    int verticalPadding, int horizontalPadding,
+    int verticalStride, int horizontalStride) {
+
+    struct __attribute__((packed)) {
+        uint64_t desc;
+        int32_t  mode;
+        int32_t  maxpoolingNanOpt;
+        int32_t  windowHeight, windowWidth;
+        int32_t  verticalPadding, horizontalPadding;
+        int32_t  verticalStride, horizontalStride;
+    } req;
+
+    req.desc = (uint64_t)(uintptr_t)poolingDesc;
+    req.mode = (int32_t)mode;
+    req.maxpoolingNanOpt = (int32_t)maxpoolingNanOpt;
+    req.windowHeight = windowHeight;
+    req.windowWidth = windowWidth;
+    req.verticalPadding = verticalPadding;
+    req.horizontalPadding = horizontalPadding;
+    req.verticalStride = verticalStride;
+    req.horizontalStride = horizontalStride;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_POOLING_2D_DESCRIPTOR,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnDestroyPoolingDescriptor(cudnnPoolingDescriptor_t poolingDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)poolingDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_POOLING_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+cudnnStatus_t cudnnPoolingForward(cudnnHandle_t handle,
+    cudnnPoolingDescriptor_t poolingDesc,
+    const void *alpha,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    const void *beta,
+    cudnnTensorDescriptor_t yDesc, void *y) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t poolingDesc;
+        uint8_t  alpha[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint8_t  beta[8];
+        uint64_t yDesc;
+        uint64_t y;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.poolingDesc = (uint64_t)(uintptr_t)poolingDesc;
+    memcpy(req.alpha, alpha, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    memcpy(req.beta, beta, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_POOLING_FORWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t handle,
+    cudnnPoolingDescriptor_t poolingDesc,
+    const void *alpha,
+    cudnnTensorDescriptor_t yDesc, const void *y,
+    cudnnTensorDescriptor_t dyDesc, const void *dy,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    const void *beta,
+    cudnnTensorDescriptor_t dxDesc, void *dx) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        uint64_t poolingDesc;
+        uint8_t  alpha[8];
+        uint64_t yDesc;
+        uint64_t y;
+        uint64_t dyDesc;
+        uint64_t dy;
+        uint64_t xDesc;
+        uint64_t x;
+        uint8_t  beta[8];
+        uint64_t dxDesc;
+        uint64_t dx;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.poolingDesc = (uint64_t)(uintptr_t)poolingDesc;
+    memcpy(req.alpha, alpha, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.dy = (uint64_t)(uintptr_t)dy;
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    memcpy(req.beta, beta, 8);
+    req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
+    req.dx = (uint64_t)(uintptr_t)dx;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_POOLING_BACKWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Batch Normalization ---- */
+
+cudnnStatus_t cudnnBatchNormalizationForwardTraining(cudnnHandle_t handle,
+    cudnnBatchNormMode_t mode,
+    const void *alpha, const void *beta,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    cudnnTensorDescriptor_t yDesc, void *y,
+    cudnnTensorDescriptor_t bnScaleBiasMeanVarDesc,
+    const void *bnScale, const void *bnBias,
+    double exponentialAverageFactor,
+    void *resultRunningMean, void *resultRunningVariance,
+    double epsilon,
+    void *resultSaveMean, void *resultSaveInvVariance) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  mode;
+        uint8_t  alpha[8];
+        uint8_t  beta[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint64_t yDesc;
+        uint64_t y;
+        uint64_t bnScaleBiasMeanVarDesc;
+        uint64_t bnScale;
+        uint64_t bnBias;
+        double   exponentialAverageFactor;
+        uint64_t resultRunningMean;
+        uint64_t resultRunningVariance;
+        double   epsilon;
+        uint64_t resultSaveMean;
+        uint64_t resultSaveInvVariance;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.mode = (int32_t)mode;
+    memcpy(req.alpha, alpha, 8);
+    memcpy(req.beta, beta, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.bnScaleBiasMeanVarDesc = (uint64_t)(uintptr_t)bnScaleBiasMeanVarDesc;
+    req.bnScale = (uint64_t)(uintptr_t)bnScale;
+    req.bnBias = (uint64_t)(uintptr_t)bnBias;
+    req.exponentialAverageFactor = exponentialAverageFactor;
+    req.resultRunningMean = (uint64_t)(uintptr_t)resultRunningMean;
+    req.resultRunningVariance = (uint64_t)(uintptr_t)resultRunningVariance;
+    req.epsilon = epsilon;
+    req.resultSaveMean = (uint64_t)(uintptr_t)resultSaveMean;
+    req.resultSaveInvVariance = (uint64_t)(uintptr_t)resultSaveInvVariance;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_BATCH_NORM_FORWARD_TRAINING,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnBatchNormalizationForwardInference(cudnnHandle_t handle,
+    cudnnBatchNormMode_t mode,
+    const void *alpha, const void *beta,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    cudnnTensorDescriptor_t yDesc, void *y,
+    cudnnTensorDescriptor_t bnScaleBiasMeanVarDesc,
+    const void *bnScale, const void *bnBias,
+    const void *estimatedMean, const void *estimatedVariance,
+    double epsilon) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  mode;
+        uint8_t  alpha[8];
+        uint8_t  beta[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint64_t yDesc;
+        uint64_t y;
+        uint64_t bnScaleBiasMeanVarDesc;
+        uint64_t bnScale;
+        uint64_t bnBias;
+        uint64_t estimatedMean;
+        uint64_t estimatedVariance;
+        double   epsilon;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.mode = (int32_t)mode;
+    memcpy(req.alpha, alpha, 8);
+    memcpy(req.beta, beta, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.bnScaleBiasMeanVarDesc = (uint64_t)(uintptr_t)bnScaleBiasMeanVarDesc;
+    req.bnScale = (uint64_t)(uintptr_t)bnScale;
+    req.bnBias = (uint64_t)(uintptr_t)bnBias;
+    req.estimatedMean = (uint64_t)(uintptr_t)estimatedMean;
+    req.estimatedVariance = (uint64_t)(uintptr_t)estimatedVariance;
+    req.epsilon = epsilon;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_BATCH_NORM_FORWARD_INFERENCE,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnBatchNormalizationBackward(cudnnHandle_t handle,
+    cudnnBatchNormMode_t mode,
+    const void *alphaDataDiff, const void *betaDataDiff,
+    const void *alphaParamDiff, const void *betaParamDiff,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    cudnnTensorDescriptor_t dyDesc, const void *dy,
+    cudnnTensorDescriptor_t dxDesc, void *dx,
+    cudnnTensorDescriptor_t dBnScaleBiasDesc,
+    const void *bnScale,
+    void *dBnScaleResult, void *dBnBiasResult,
+    double epsilon,
+    const void *savedMean, const void *savedInvVariance) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  mode;
+        uint8_t  alphaDataDiff[8];
+        uint8_t  betaDataDiff[8];
+        uint8_t  alphaParamDiff[8];
+        uint8_t  betaParamDiff[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint64_t dyDesc;
+        uint64_t dy;
+        uint64_t dxDesc;
+        uint64_t dx;
+        uint64_t dBnScaleBiasDesc;
+        uint64_t bnScale;
+        uint64_t dBnScaleResult;
+        uint64_t dBnBiasResult;
+        double   epsilon;
+        uint64_t savedMean;
+        uint64_t savedInvVariance;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.mode = (int32_t)mode;
+    memcpy(req.alphaDataDiff, alphaDataDiff, 8);
+    memcpy(req.betaDataDiff, betaDataDiff, 8);
+    memcpy(req.alphaParamDiff, alphaParamDiff, 8);
+    memcpy(req.betaParamDiff, betaParamDiff, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
+    req.dx = (uint64_t)(uintptr_t)dx;
+    req.dBnScaleBiasDesc = (uint64_t)(uintptr_t)dBnScaleBiasDesc;
+    req.bnScale = (uint64_t)(uintptr_t)bnScale;
+    req.dBnScaleResult = (uint64_t)(uintptr_t)dBnScaleResult;
+    req.dBnBiasResult = (uint64_t)(uintptr_t)dBnBiasResult;
+    req.epsilon = epsilon;
+    req.savedMean = (uint64_t)(uintptr_t)savedMean;
+    req.savedInvVariance = (uint64_t)(uintptr_t)savedInvVariance;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_BATCH_NORM_BACKWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Softmax ---- */
+
+cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t handle,
+    cudnnSoftmaxAlgorithm_t algo, cudnnSoftmaxMode_t mode,
+    const void *alpha,
+    cudnnTensorDescriptor_t xDesc, const void *x,
+    const void *beta,
+    cudnnTensorDescriptor_t yDesc, void *y) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  algo;
+        int32_t  mode;
+        uint8_t  alpha[8];
+        uint64_t xDesc;
+        uint64_t x;
+        uint8_t  beta[8];
+        uint64_t yDesc;
+        uint64_t y;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.algo = (int32_t)algo;
+    req.mode = (int32_t)mode;
+    memcpy(req.alpha, alpha, 8);
+    req.xDesc = (uint64_t)(uintptr_t)xDesc;
+    req.x = (uint64_t)(uintptr_t)x;
+    memcpy(req.beta, beta, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SOFTMAX_FORWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t handle,
+    cudnnSoftmaxAlgorithm_t algo, cudnnSoftmaxMode_t mode,
+    const void *alpha,
+    cudnnTensorDescriptor_t yDesc, const void *y,
+    cudnnTensorDescriptor_t dyDesc, const void *dy,
+    const void *beta,
+    cudnnTensorDescriptor_t dxDesc, void *dx) {
+
+    struct __attribute__((packed)) {
+        uint64_t handle;
+        int32_t  algo;
+        int32_t  mode;
+        uint8_t  alpha[8];
+        uint64_t yDesc;
+        uint64_t y;
+        uint64_t dyDesc;
+        uint64_t dy;
+        uint8_t  beta[8];
+        uint64_t dxDesc;
+        uint64_t dx;
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.algo = (int32_t)algo;
+    req.mode = (int32_t)mode;
+    memcpy(req.alpha, alpha, 8);
+    req.yDesc = (uint64_t)(uintptr_t)yDesc;
+    req.y = (uint64_t)(uintptr_t)y;
+    req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
+    req.dy = (uint64_t)(uintptr_t)dy;
+    memcpy(req.beta, beta, 8);
+    req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
+    req.dx = (uint64_t)(uintptr_t)dx;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SOFTMAX_BACKWARD,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+/* ---- Dropout ---- */
+
+cudnnStatus_t cudnnCreateDropoutDescriptor(cudnnDropoutDescriptor_t *dropoutDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_DROPOUT_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *dropoutDesc = (cudnnDropoutDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t dropoutDesc,
+    cudnnHandle_t handle, float dropout,
+    void *states, size_t stateSizeInBytes, unsigned long long seed) {
+
+    struct __attribute__((packed)) {
+        uint64_t desc;
+        uint64_t handle;
+        float    dropout;
+        uint64_t states;
+        uint64_t stateSizeInBytes;
+        uint64_t seed;
+    } req;
+
+    req.desc = (uint64_t)(uintptr_t)dropoutDesc;
+    req.handle = (uint64_t)(uintptr_t)handle;
+    req.dropout = dropout;
+    req.states = (uint64_t)(uintptr_t)states;
+    req.stateSizeInBytes = (uint64_t)stateSizeInBytes;
+    req.seed = (uint64_t)seed;
+
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_SET_DROPOUT_DESCRIPTOR,
+                                     &req, sizeof(req), NULL, NULL);
+}
+
+cudnnStatus_t cudnnDestroyDropoutDescriptor(cudnnDropoutDescriptor_t dropoutDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)dropoutDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_DROPOUT_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+/* ---- RNN Descriptor (stub lifecycle) ---- */
+
+cudnnStatus_t cudnnCreateRNNDescriptor(cudnnRNNDescriptor_t *rnnDesc) {
+    uint64_t h = 0;
+    size_t len = sizeof(uint64_t);
+    cudnnStatus_t r = (cudnnStatus_t)juice_rpc(JUICE_CUDNN_CREATE_RNN_DESCRIPTOR,
+                                                NULL, 0, &h, &len);
+    if (r == CUDNN_STATUS_SUCCESS)
+        *rnnDesc = (cudnnRNNDescriptor_t)(uintptr_t)h;
+    return r;
+}
+
+cudnnStatus_t cudnnDestroyRNNDescriptor(cudnnRNNDescriptor_t rnnDesc) {
+    uint64_t h = (uint64_t)(uintptr_t)rnnDesc;
+    return (cudnnStatus_t)juice_rpc(JUICE_CUDNN_DESTROY_RNN_DESCRIPTOR,
+                                     &h, sizeof(h), NULL, NULL);
+}
+
+/*
+ * ============================================================================
+ * PyTorch Compatibility Stubs — CUDA Runtime API
+ *
+ * These stubs provide symbols that PyTorch (and its dependencies) reference
+ * at load time. On a GPU-less client with LD_PRELOAD, these must exist or
+ * the process will crash with "undefined symbol" errors.
+ *
+ * Most are trivial stubs returning success. Critical ones (pinned memory,
+ * streams, events) do local work or forward to the server.
+ * ============================================================================
+ */
+
+/* ---- Error Handling ---- */
+
+const char *cudaGetErrorString(cudaError_t error) {
+    switch (error) {
+    case 0:  return "no error";
+    case 1:  return "invalid argument";
+    case 2:  return "out of memory";
+    case 3:  return "not initialized";
+    case 4:  return "deinitialized";
+    case 35: return "insufficient driver";
+    case 46: return "device not found";
+    case 71: return "launch failed";
+    case 77: return "peer access not enabled";
+    case 100: return "no CUDA-capable device";
+    case 101: return "invalid device";
+    case 700: return "illegal address";
+    case 999: return "unknown error";
+    default: return "unrecognized error code";
+    }
+}
+
+const char *cudaGetErrorName(cudaError_t error) {
+    switch (error) {
+    case 0:  return "cudaSuccess";
+    case 1:  return "cudaErrorInvalidValue";
+    case 2:  return "cudaErrorMemoryAllocation";
+    case 3:  return "cudaErrorInitializationError";
+    case 4:  return "cudaErrorCudartUnloading";
+    case 35: return "cudaErrorInsufficientDriver";
+    case 46: return "cudaErrorDevicesUnavailable";
+    case 71: return "cudaErrorLaunchFailure";
+    case 77: return "cudaErrorPeerAccessNotEnabled";
+    case 100: return "cudaErrorNoDevice";
+    case 101: return "cudaErrorInvalidDevice";
+    case 700: return "cudaErrorIllegalAddress";
+    case 999: return "cudaErrorUnknown";
+    default: return "cudaErrorUnknown";
+    }
+}
+
+/* ---- Pinned (Host) Memory ---- */
+
+cudaError_t cudaMallocHost(void **ptr, size_t size) {
+    *ptr = malloc(size);
+    g_last_error = *ptr ? cudaSuccess : 2; /* cudaErrorMemoryAllocation */
+    return g_last_error;
+}
+
+cudaError_t cudaFreeHost(void *ptr) {
+    free(ptr);
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaHostAlloc(void **pHost, size_t size, unsigned int flags) {
+    (void)flags;
+    *pHost = malloc(size);
+    g_last_error = *pHost ? cudaSuccess : 2;
+    return g_last_error;
+}
+
+cudaError_t cudaHostGetDevicePointer(void **pDevice, void *pHost, unsigned int flags) {
+    (void)flags;
+    *pDevice = pHost;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags) {
+    (void)ptr; (void)size; (void)flags;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaHostUnregister(void *ptr) {
+    (void)ptr;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Async Memory (CUDA 11.2+) ---- */
+
+cudaError_t cudaMallocAsync(void **devPtr, size_t size, void *stream) {
+    (void)stream;
+    return cudaMalloc(devPtr, size);
+}
+
+cudaError_t cudaFreeAsync(void *devPtr, void *stream) {
+    (void)stream;
+    return cudaFree(devPtr);
+}
+
+/* ---- 2D Memory ---- */
+
+cudaError_t cudaMemcpy2D(void *dst, size_t dpitch,
+                         const void *src, size_t spitch,
+                         size_t width, size_t height, int kind) {
+    for (size_t row = 0; row < height; row++) {
+        cudaError_t r = cudaMemcpy(
+            (char *)dst + row * dpitch,
+            (const char *)src + row * spitch,
+            width, kind);
+        if (r != cudaSuccess) return r;
+    }
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch,
+                              const void *src, size_t spitch,
+                              size_t width, size_t height, int kind,
+                              void *stream) {
+    for (size_t row = 0; row < height; row++) {
+        cudaError_t r = cudaMemcpyAsync(
+            (char *)dst + row * dpitch,
+            (const char *)src + row * spitch,
+            width, kind, stream);
+        if (r != cudaSuccess) return r;
+    }
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Peer Memory ---- */
+
+cudaError_t cudaMemcpyPeer(void *dst, int dstDevice,
+                           const void *src, int srcDevice, size_t count) {
+    (void)dstDevice; (void)srcDevice;
+    return cudaMemcpy(dst, src, count, cudaMemcpyDeviceToDevice);
+}
+
+cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice,
+                                const void *src, int srcDevice,
+                                size_t count, void *stream) {
+    (void)dstDevice; (void)srcDevice;
+    return cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToDevice, stream);
+}
+
+/* ---- Async Memset ---- */
+
+cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, void *stream) {
+    (void)stream;
+    return cudaMemset(devPtr, value, count);
+}
+
+/* ---- Device Management (additional) ---- */
+
+cudaError_t cudaGetDeviceProperties_v2(void *prop, int device) {
+    return cudaGetDeviceProperties(prop, device);
+}
+
+cudaError_t cudaDeviceGetDefaultMemPool(void **memPool, int device) {
+    (void)device;
+    static int fake_pool;
+    *memPool = (void *)&fake_pool;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceSetMemPool(int device, void *memPool) {
+    (void)device; (void)memPool;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetMemPool(void **memPool, int device) {
+    return cudaDeviceGetDefaultMemPool(memPool, device);
+}
+
+/* cudaLimit enum values */
+#define cudaLimitStackSize           0x00
+#define cudaLimitPrintfFifoSize      0x01
+#define cudaLimitMallocHeapSize      0x02
+
+cudaError_t cudaDeviceSetLimit(int limit, size_t value) {
+    (void)limit; (void)value;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetLimit(size_t *pValue, int limit) {
+    switch (limit) {
+    case cudaLimitStackSize:       *pValue = 1024; break;
+    case cudaLimitPrintfFifoSize:  *pValue = 1048576; break;
+    case cudaLimitMallocHeapSize:  *pValue = 8388608; break;
+    default:                       *pValue = 0; break;
+    }
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetStreamPriorityRange(int *leastPriority, int *greatestPriority) {
+    if (leastPriority) *leastPriority = 0;
+    if (greatestPriority) *greatestPriority = -1;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetP2PAttribute(int *value, int attr, int srcDevice, int dstDevice) {
+    (void)attr; (void)srcDevice; (void)dstDevice;
+    if (value) *value = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetByPCIBusId(int *device, const char *pciBusId) {
+    (void)pciBusId;
+    if (device) *device = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetPCIBusId(char *pciBusId, int len, int device) {
+    (void)device;
+    if (pciBusId && len > 0) snprintf(pciBusId, (size_t)len, "0000:00:00.0");
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags) {
+    (void)peerDevice; (void)flags;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceDisablePeerAccess(int peerDevice) {
+    (void)peerDevice;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- IPC ---- */
+
+cudaError_t cudaIpcGetMemHandle(void *handle, void *devPtr) {
+    (void)devPtr;
+    if (handle) memset(handle, 0, 64);
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaIpcOpenMemHandle(void **devPtr, void *handle, unsigned int flags) {
+    (void)handle; (void)flags;
+    *devPtr = NULL;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaIpcCloseMemHandle(void *devPtr) {
+    (void)devPtr;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaIpcGetEventHandle(void *handle, void *event) {
+    (void)event;
+    if (handle) memset(handle, 0, 64);
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaIpcOpenEventHandle(void **event, void *handle) {
+    (void)handle;
+    *event = NULL;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Stream Management (additional) ---- */
+
+cudaError_t cudaStreamCreateWithFlags(void **pStream, unsigned int flags) {
+    (void)flags;
+    return cudaStreamCreate(pStream);
+}
+
+cudaError_t cudaStreamCreateWithPriority(void **pStream, unsigned int flags, int priority) {
+    (void)flags; (void)priority;
+    return cudaStreamCreate(pStream);
+}
+
+cudaError_t cudaStreamGetFlags(void *stream, unsigned int *flags) {
+    (void)stream;
+    if (flags) *flags = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamGetPriority(void *stream, int *priority) {
+    (void)stream;
+    if (priority) *priority = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamQuery(void *stream) {
+    (void)stream;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
+    (void)stream; (void)event; (void)flags;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamAddCallback(void *stream, void *callback, void *userData, unsigned int flags) {
+    (void)stream; (void)callback; (void)userData; (void)flags;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamIsCapturing(void *stream, int *pCaptureStatus) {
+    (void)stream;
+    if (pCaptureStatus) *pCaptureStatus = 0; /* cudaStreamCaptureStatusNone */
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamGetCaptureInfo(void *stream, int *captureStatus, unsigned long long *id) {
+    (void)stream;
+    if (captureStatus) *captureStatus = 0;
+    if (id) *id = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaThreadExchangeStreamCaptureMode(int *mode) {
+    (void)mode;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Event Management (additional) ---- */
+
+cudaError_t cudaEventCreateWithFlags(void **pEvent, unsigned int flags) {
+    (void)flags;
+    return cudaEventCreate(pEvent);
+}
+
+cudaError_t cudaEventElapsedTime(float *ms, void *start, void *end) {
+    struct { uint64_t start; uint64_t end; } req;
+    req.start = (uint64_t)(uintptr_t)start;
+    req.end = (uint64_t)(uintptr_t)end;
+    size_t len = sizeof(float);
+    cudaError_t r = (cudaError_t)juice_rpc(JUICE_CUDA_EVENT_ELAPSED_TIME, &req, sizeof(req), ms, &len);
+    g_last_error = r;
+    return r;
+}
+
+cudaError_t cudaEventQuery(void *event) {
+    (void)event;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Execution (Runtime API) ---- */
+
+cudaError_t cudaLaunchKernel(const void *func, void *gridDim, void *blockDim,
+                             void **args, size_t sharedMem, void *stream) {
+    (void)func; (void)gridDim; (void)blockDim;
+    (void)args; (void)sharedMem; (void)stream;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaFuncSetAttribute(const void *func, int attr, int value) {
+    (void)func; (void)attr; (void)value;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaFuncSetCacheConfig(const void *func, int cacheConfig) {
+    (void)func; (void)cacheConfig;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaFuncSetSharedMemConfig(const void *func, int config) {
+    (void)func; (void)config;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks,
+    const void *func, int blockSize, size_t dynamicSMemSize) {
+    (void)func; (void)blockSize; (void)dynamicSMemSize;
+    if (numBlocks) *numBlocks = 16;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    int *numBlocks, const void *func, int blockSize,
+    size_t dynamicSMemSize, unsigned int flags) {
+    (void)flags;
+    return cudaOccupancyMaxActiveBlocksPerMultiprocessor(numBlocks, func, blockSize, dynamicSMemSize);
+}
+
+/* ---- Cache / Shared Memory Config ---- */
+
+cudaError_t cudaDeviceSetCacheConfig(int cacheConfig) {
+    (void)cacheConfig;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetCacheConfig(int *pCacheConfig) {
+    if (pCacheConfig) *pCacheConfig = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceSetSharedMemConfig(int config) {
+    (void)config;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetSharedMemConfig(int *pConfig) {
+    if (pConfig) *pConfig = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Pointer Attributes ---- */
+
+cudaError_t cudaPointerGetAttributes(void *attributes, const void *ptr) {
+    (void)ptr;
+    if (attributes) memset(attributes, 0, 64);
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Managed Memory ---- */
+
+cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
+    (void)flags;
+    return cudaMalloc(devPtr, size);
+}
+
+/* ---- Memory Pool Operations (CUDA 11.2+) ---- */
+
+cudaError_t cudaMemPoolTrimTo(void *memPool, size_t minBytesToKeep) {
+    (void)memPool; (void)minBytesToKeep;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolSetAttribute(void *memPool, int attr, void *value) {
+    (void)memPool; (void)attr; (void)value;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolGetAttribute(void *memPool, int attr, void *value) {
+    (void)memPool; (void)attr;
+    if (value) memset(value, 0, 8);
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolSetAccess(void *memPool, const void *descList, size_t count) {
+    (void)memPool; (void)descList; (void)count;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolGetAccess(int *flags, void *memPool, void *location) {
+    (void)memPool; (void)location;
+    if (flags) *flags = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- CUDA Graphs (stubs) ---- */
+
+cudaError_t cudaGraphCreate(void **pGraph, unsigned int flags) {
+    (void)flags;
+    static int fake_graph;
+    *pGraph = (void *)&fake_graph;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphDestroy(void *graph) {
+    (void)graph;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphExecDestroy(void *graphExec) {
+    (void)graphExec;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphInstantiate(void **pGraphExec, void *graph,
+                                  void *pErrorNode, char *pLogBuffer,
+                                  size_t bufferSize) {
+    (void)graph; (void)pErrorNode; (void)pLogBuffer; (void)bufferSize;
+    static int fake_exec;
+    *pGraphExec = (void *)&fake_exec;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphLaunch(void *graphExec, void *stream) {
+    (void)graphExec; (void)stream;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamBeginCapture(void *stream, int mode) {
+    (void)stream; (void)mode;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamEndCapture(void *stream, void **pGraph) {
+    (void)stream;
+    static int fake_graph;
+    if (pGraph) *pGraph = (void *)&fake_graph;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Texture / Surface (stubs PyTorch may reference) ---- */
+
+cudaError_t cudaCreateTextureObject(unsigned long long *pTexObject,
+                                     const void *pResDesc, const void *pTexDesc,
+                                     const void *pResViewDesc) {
+    (void)pResDesc; (void)pTexDesc; (void)pResViewDesc;
+    if (pTexObject) *pTexObject = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDestroyTextureObject(unsigned long long texObject) {
+    (void)texObject;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/* ---- Misc Runtime API ---- */
+
+cudaError_t cudaSetDeviceFlags(unsigned int flags) {
+    (void)flags;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDeviceFlags(unsigned int *flags) {
+    if (flags) *flags = 0;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+/*
+ * __cudaRegisterFatBinary / __cudaUnregisterFatBinary / __cudaRegisterFunction
+ *
+ * Called by CUDA Runtime code generated by nvcc. On a GPU-less client using
+ * LD_PRELOAD, compiled .cu files may still reference these. Return dummies.
+ */
+void **__cudaRegisterFatBinary(void *fatCubin) {
+    (void)fatCubin;
+    static void *dummy = NULL;
+    return &dummy;
+}
+
+void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
+    (void)fatCubinHandle;
+}
+
+void __cudaUnregisterFatBinary(void **fatCubinHandle) {
+    (void)fatCubinHandle;
+}
+
+void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
+                            char *deviceFun, const char *deviceName,
+                            int thread_limit, void *tid, void *bid,
+                            void *bDim, void *gDim, int *wSize) {
+    (void)fatCubinHandle; (void)hostFun; (void)deviceFun; (void)deviceName;
+    (void)thread_limit; (void)tid; (void)bid; (void)bDim; (void)gDim; (void)wSize;
+}
+
+void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
+                       char *deviceAddress, const char *deviceName,
+                       int ext, size_t size, int constant, int global) {
+    (void)fatCubinHandle; (void)hostVar; (void)deviceAddress; (void)deviceName;
+    (void)ext; (void)size; (void)constant; (void)global;
+}
+
+void __cudaRegisterManagedVar(void **fatCubinHandle, void **hostVarPtrAddress,
+                              char *deviceAddress, const char *deviceName,
+                              int ext, size_t size, int constant, int global) {
+    (void)fatCubinHandle; (void)hostVarPtrAddress; (void)deviceAddress;
+    (void)deviceName; (void)ext; (void)size; (void)constant; (void)global;
+}
+
+void __cudaRegisterTexture(void **fatCubinHandle, const void *hostVar,
+                           const void **deviceAddress, const char *deviceName,
+                           int dim, int norm, int ext) {
+    (void)fatCubinHandle; (void)hostVar; (void)deviceAddress; (void)deviceName;
+    (void)dim; (void)norm; (void)ext;
+}
+
+void __cudaRegisterSurface(void **fatCubinHandle, const void *hostVar,
+                           const void **deviceAddress, const char *deviceName,
+                           int dim, int ext) {
+    (void)fatCubinHandle; (void)hostVar; (void)deviceAddress; (void)deviceName;
+    (void)dim; (void)ext;
+}
+
+char __cudaInitModule(void **fatCubinHandle) {
+    (void)fatCubinHandle;
+    return 0;
+}
+
+/*
+ * ============================================================================
+ * PyTorch Compatibility Stubs — CUDA Driver API (additional)
+ * ============================================================================
+ */
+
+/* ---- Error Handling (Driver API) ---- */
+
+CUresult cuGetErrorString(CUresult error, const char **pStr) {
+    if (pStr) *pStr = cudaGetErrorString((cudaError_t)error);
+    return CUDA_SUCCESS;
+}
+
+CUresult cuGetErrorName(CUresult error, const char **pStr) {
+    if (pStr) *pStr = cudaGetErrorName((cudaError_t)error);
+    return CUDA_SUCCESS;
+}
+
+/* ---- Module (additional) ---- */
+
+CUresult cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin) {
+    return cuModuleLoadData(module, fatCubin);
+}
+
+CUresult cuModuleLoadDataEx(CUmodule *module, const void *image,
+                            unsigned int numOptions, void *options, void **optionValues) {
+    (void)numOptions; (void)options; (void)optionValues;
+    return cuModuleLoadData(module, image);
+}
+
+CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes,
+                               CUmodule hmod, const char *name) {
+    (void)hmod; (void)name;
+    if (dptr) *dptr = 0;
+    if (bytes) *bytes = 0;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Pointer Attributes (Driver API) ---- */
+
+CUresult cuPointerGetAttribute(void *data, int attribute, CUdeviceptr ptr) {
+    (void)ptr;
+    if (data) memset(data, 0, 8);
+    if (attribute == 2 /* CU_POINTER_ATTRIBUTE_MEMORY_TYPE */) {
+        int type = 2; /* CU_MEMORYTYPE_DEVICE */
+        memcpy(data, &type, sizeof(int));
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult cuPointerGetAttributes(unsigned int numAttributes, int *attributes,
+                                 void **data, CUdeviceptr ptr) {
+    (void)ptr;
+    for (unsigned int i = 0; i < numAttributes; i++) {
+        if (data[i]) memset(data[i], 0, 8);
+    }
+    return CUDA_SUCCESS;
+}
+
+/* ---- Virtual Memory (CUDA 10.2+) ---- */
+
+CUresult cuMemAddressReserve(CUdeviceptr *ptr, size_t size, size_t alignment,
+                              CUdeviceptr addr, unsigned long long flags) {
+    (void)alignment; (void)addr; (void)flags; (void)size;
+    if (ptr) *ptr = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+    (void)ptr; (void)size;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemCreate(void **handle, size_t size, void *prop, unsigned long long flags) {
+    (void)size; (void)prop; (void)flags;
+    static int fake_alloc;
+    if (handle) *handle = (void *)&fake_alloc;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemRelease(void *handle) {
+    (void)handle;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+                   void *handle, unsigned long long flags) {
+    (void)ptr; (void)size; (void)offset; (void)handle; (void)flags;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
+    (void)ptr; (void)size;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const void *desc, size_t count) {
+    (void)ptr; (void)size; (void)desc; (void)count;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemGetAccess(unsigned long long *flags, const void *location, CUdeviceptr ptr) {
+    (void)location; (void)ptr;
+    if (flags) *flags = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemGetAllocationGranularity(size_t *granularity, const void *prop, int option) {
+    (void)prop; (void)option;
+    if (granularity) *granularity = 65536;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemGetAllocationPropertiesFromHandle(void *prop, void *handle) {
+    (void)handle;
+    if (prop) memset(prop, 0, 64);
+    return CUDA_SUCCESS;
+}
+
+/* ---- Stream Capture / CUDA Graphs (Driver API) ---- */
+
+CUresult cuStreamBeginCapture_v2(CUstream hStream, int mode) {
+    (void)hStream; (void)mode;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuStreamEndCapture(CUstream hStream, void **phGraph) {
+    (void)hStream;
+    static int fake_graph;
+    if (phGraph) *phGraph = (void *)&fake_graph;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuStreamIsCapturing(CUstream hStream, int *captureStatus) {
+    (void)hStream;
+    if (captureStatus) *captureStatus = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
+    (void)hGraphExec; (void)hStream;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuGraphInstantiate_v2(void **phGraphExec, void *hGraph,
+                                void **phErrorNode, char *logBuffer,
+                                size_t bufferSize) {
+    (void)hGraph; (void)phErrorNode; (void)logBuffer; (void)bufferSize;
+    static int fake_exec;
+    if (phGraphExec) *phGraphExec = (void *)&fake_exec;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuGraphExecDestroy(void *hGraphExec) {
+    (void)hGraphExec;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuGraphDestroy(void *hGraph) {
+    (void)hGraph;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Stream (Driver API additional) ---- */
+
+CUresult cuStreamCreateWithPriority(CUstream *phStream, unsigned int flags, int priority) {
+    (void)flags; (void)priority;
+    return cuStreamCreate(phStream, 0);
+}
+
+CUresult cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
+    (void)hStream;
+    if (flags) *flags = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuStreamGetPriority(CUstream hStream, int *priority) {
+    (void)hStream;
+    if (priority) *priority = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int flags) {
+    (void)hStream; (void)hEvent; (void)flags;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuStreamQuery(CUstream hStream) {
+    (void)hStream;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuStreamAddCallback(CUstream hStream, void *callback, void *userData, unsigned int flags) {
+    (void)hStream; (void)callback; (void)userData; (void)flags;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Event (Driver API additional) ---- */
+
+CUresult cuEventQuery(CUevent hEvent) {
+    (void)hEvent;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Context (additional) ---- */
+
+CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
+    return cuCtxSetCurrent(ctx);
+}
+
+CUresult cuCtxPopCurrent_v2(CUcontext *pctx) {
+    return cuCtxGetCurrent(pctx);
+}
+
+CUresult cuCtxGetDevice(CUdevice *device) {
+    size_t len = sizeof(int32_t);
+    return juice_rpc(JUICE_CU_CTX_GET_DEVICE, NULL, 0, device, &len);
+}
+
+CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags, int *active) {
+    (void)dev;
+    if (flags) *flags = 0;
+    if (active) *active = 1;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags) {
+    (void)dev; (void)flags;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
+    (void)dev;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int *version) {
+    (void)ctx;
+    if (version) *version = 3020;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPriority) {
+    if (leastPriority) *leastPriority = 0;
+    if (greatestPriority) *greatestPriority = -1;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Device (Driver API additional) ---- */
+
+CUresult cuDeviceGetUuid(void *uuid, CUdevice dev) {
+    (void)dev;
+    if (uuid) memset(uuid, 0, 16);
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetUuid_v2(void *uuid, CUdevice dev) {
+    return cuDeviceGetUuid(uuid, dev);
+}
+
+CUresult cuDeviceGetDefaultMemPool(void **pool, CUdevice dev) {
+    (void)dev;
+    static int fake_pool;
+    if (pool) *pool = (void *)&fake_pool;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceSetMemPool(CUdevice dev, void *pool) {
+    (void)dev; (void)pool;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetMemPool(void **pool, CUdevice dev) {
+    return cuDeviceGetDefaultMemPool(pool, dev);
+}
+
+CUresult cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev, CUdevice peerDev) {
+    (void)dev; (void)peerDev;
+    if (canAccessPeer) *canAccessPeer = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetP2PAttribute(int *value, int attrib, CUdevice srcDevice, CUdevice dstDevice) {
+    (void)attrib; (void)srcDevice; (void)dstDevice;
+    if (value) *value = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId) {
+    (void)pciBusId;
+    if (dev) *dev = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
+    (void)dev;
+    if (pciBusId && len > 0) snprintf(pciBusId, (size_t)len, "0000:00:00.0");
+    return CUDA_SUCCESS;
+}
+
+/* ---- Occupancy (Driver API) ---- */
+
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks,
+    CUfunction func, int blockSize, size_t dynamicSMemSize) {
+    (void)func; (void)blockSize; (void)dynamicSMemSize;
+    if (numBlocks) *numBlocks = 16;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    int *numBlocks, CUfunction func, int blockSize,
+    size_t dynamicSMemSize, unsigned int flags) {
+    (void)flags;
+    return cuOccupancyMaxActiveBlocksPerMultiprocessor(numBlocks, func, blockSize, dynamicSMemSize);
+}
+
+CUresult cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize,
+    CUfunction func, void *blockSizeToDynSMemSize,
+    size_t dynamicSMemSize, int blockSizeLimit) {
+    (void)func; (void)blockSizeToDynSMemSize; (void)dynamicSMemSize; (void)blockSizeLimit;
+    if (minGridSize) *minGridSize = 1;
+    if (blockSize) *blockSize = 256;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Func (Driver API additional) ---- */
+
+CUresult cuFuncSetCacheConfig(CUfunction hfunc, int config) {
+    (void)hfunc; (void)config;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuFuncSetSharedMemConfig(CUfunction hfunc, int config) {
+    (void)hfunc; (void)config;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value) {
+    (void)hfunc; (void)attrib; (void)value;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Peer Context (Driver API) ---- */
+
+CUresult cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int flags) {
+    (void)peerContext; (void)flags;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuCtxDisablePeerAccess(CUcontext peerContext) {
+    (void)peerContext;
+    return CUDA_SUCCESS;
+}
+
+/* ---- Memory (Driver API additional) ---- */
+
+CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
+    (void)flags;
+    return cuMemAlloc_v2(dptr, bytesize);
+}
+
+CUresult cuMemHostAlloc(void **pp, size_t bytesize, unsigned int flags) {
+    (void)flags;
+    *pp = malloc(bytesize);
+    return *pp ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult cuMemFreeHost(void *p) {
+    free(p);
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr *pdptr, void *p, unsigned int flags) {
+    (void)flags;
+    if (pdptr) *pdptr = (CUdeviceptr)(uintptr_t)p;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemHostRegister_v2(void *p, size_t bytesize, unsigned int flags) {
+    (void)p; (void)bytesize; (void)flags;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemHostUnregister(void *p) {
+    (void)p;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemcpy_v2(CUdeviceptr dst, CUdeviceptr src, size_t byteCount) {
+    struct { uint64_t dst; uint64_t src; uint64_t size; } req;
+    req.dst = (uint64_t)dst;
+    req.src = (uint64_t)src;
+    req.size = (uint64_t)byteCount;
+    return juice_rpc(JUICE_CU_MEMCPY, &req, sizeof(req), NULL, NULL);
+}
+
+CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream) {
+    (void)hStream;
+    return cuMemcpy_v2(dst, src, byteCount);
+}
+
+CUresult cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
+                       CUdeviceptr srcDevice, CUcontext srcContext,
+                       size_t byteCount) {
+    (void)dstContext; (void)srcContext;
+    return cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
+}
+
+CUresult cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
+                            CUdeviceptr srcDevice, CUcontext srcContext,
+                            size_t byteCount, CUstream hStream) {
+    (void)dstContext; (void)srcContext; (void)hStream;
+    return cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
+}
+
+CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
+    struct __attribute__((packed)) {
+        uint64_t ptr; int32_t value; uint64_t count;
+    } req;
+    req.ptr = (uint64_t)dstDevice; req.value = (int32_t)uc; req.count = N;
+    return juice_rpc(JUICE_CU_MEMSET_D8, &req, sizeof(req), NULL, NULL);
+}
+
+CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream) {
+    (void)hStream;
+    return cuMemsetD8_v2(dstDevice, uc, N);
+}
+
+CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
+    struct __attribute__((packed)) {
+        uint64_t ptr; int32_t value; uint64_t count;
+    } req;
+    req.ptr = (uint64_t)dstDevice; req.value = (int32_t)ui; req.count = N;
+    return juice_rpc(JUICE_CU_MEMSET_D32, &req, sizeof(req), NULL, NULL);
+}
+
+CUresult cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream hStream) {
+    (void)hStream;
+    return cuMemsetD32_v2(dstDevice, ui, N);
+}
+
+/* ---- IPC (Driver API) ---- */
+
+CUresult cuIpcGetMemHandle(void *pHandle, CUdeviceptr dptr) {
+    (void)dptr;
+    if (pHandle) memset(pHandle, 0, 64);
+    return CUDA_SUCCESS;
+}
+
+CUresult cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, void *handle, unsigned int flags) {
+    (void)handle; (void)flags;
+    if (pdptr) *pdptr = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuIpcCloseMemHandle(CUdeviceptr dptr) {
+    (void)dptr;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuIpcGetEventHandle(void *pHandle, CUevent event) {
+    (void)event;
+    if (pHandle) memset(pHandle, 0, 64);
+    return CUDA_SUCCESS;
+}
+
+CUresult cuIpcOpenEventHandle(CUevent *phEvent, void *handle) {
+    (void)handle;
+    if (phEvent) *phEvent = NULL;
+    return CUDA_SUCCESS;
+}
+
+/*
+ * ============================================================================
+ * cuBLAS Compatibility Stubs (additional)
+ * ============================================================================
+ */
+
+const char *cublasGetStatusString(cublasStatus_t status) {
+    switch (status) {
+    case 0:  return "CUBLAS_STATUS_SUCCESS";
+    case 1:  return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case 3:  return "CUBLAS_STATUS_ALLOC_FAILED";
+    case 7:  return "CUBLAS_STATUS_INVALID_VALUE";
+    case 8:  return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case 11: return "CUBLAS_STATUS_MAPPING_ERROR";
+    case 13: return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case 14: return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case 15: return "CUBLAS_STATUS_NOT_SUPPORTED";
+    default: return "CUBLAS_STATUS_UNKNOWN";
+    }
+}
+
+cublasStatus_t cublasGetProperty(int type, int *value) {
+    (void)type;
+    if (value) *value = 0;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t handle, void *workspace, size_t workspaceSizeInBytes) {
+    (void)handle; (void)workspace; (void)workspaceSizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasSetPointerMode_v2(cublasHandle_t handle, int mode) {
+    (void)handle; (void)mode;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasGetPointerMode_v2(cublasHandle_t handle, int *mode) {
+    (void)handle;
+    if (mode) *mode = 0; /* CUBLAS_POINTER_MODE_HOST */
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasSetAtomicsMode(cublasHandle_t handle, int mode) {
+    (void)handle; (void)mode;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasGetAtomicsMode(cublasHandle_t handle, int *mode) {
+    (void)handle;
+    if (mode) *mode = 0;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLoggerConfigure(int logIsOn, int logToStdOut,
+                                      int logToStdErr, const char *logFileName) {
+    (void)logIsOn; (void)logToStdOut; (void)logToStdErr; (void)logFileName;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle,
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    const void *alpha,
+    const void * const *Aarray, int Atype, int lda,
+    const void * const *Barray, int Btype, int ldb,
+    const void *beta,
+    void * const *Carray, int Ctype, int ldc,
+    int batchCount, int computeType, int algo) {
+
+    for (int i = 0; i < batchCount; i++) {
+        cublasStatus_t r = cublasGemmEx(handle, transa, transb, m, n, k,
+                                         alpha,
+                                         Aarray[i], Atype, lda,
+                                         Barray[i], Btype, ldb,
+                                         beta,
+                                         Carray[i], Ctype, ldc,
+                                         computeType, algo);
+        if (r != CUBLAS_STATUS_SUCCESS) return r;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+/*
+ * cuBLASLt stubs — PyTorch links against cuBLASLt for optimized GEMM scheduling.
+ */
+typedef void *cublasLtHandle_t;
+
+cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
+    static int fake_lt;
+    if (lightHandle) *lightHandle = (cublasLtHandle_t)&fake_lt;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
+    (void)lightHandle;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
+    void *computeDesc, const void *alpha,
+    const void *A, void *Adesc, const void *B, void *Bdesc,
+    const void *beta, const void *C, void *Cdesc,
+    void *D, void *Ddesc, const void *algo,
+    void *workspace, size_t workspaceSizeInBytes, void *stream) {
+    (void)lightHandle; (void)computeDesc; (void)alpha;
+    (void)A; (void)Adesc; (void)B; (void)Bdesc;
+    (void)beta; (void)C; (void)Cdesc; (void)D; (void)Ddesc;
+    (void)algo; (void)workspace; (void)workspaceSizeInBytes; (void)stream;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
+    (void)computeType; (void)scaleType;
+    static int fake_desc;
+    if (matmulDesc) *matmulDesc = (void *)&fake_desc;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
+    (void)matmulDesc;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
+                                                const void *buf, size_t sizeInBytes) {
+    (void)matmulDesc; (void)attr; (void)buf; (void)sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
+                                                void *buf, size_t sizeInBytes,
+                                                size_t *sizeWritten) {
+    (void)matmulDesc; (void)attr;
+    if (buf) memset(buf, 0, sizeInBytes);
+    if (sizeWritten) *sizeWritten = sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
+                                            uint64_t rows, uint64_t cols, int64_t ld) {
+    (void)type; (void)rows; (void)cols; (void)ld;
+    static int fake_layout;
+    if (matLayout) *matLayout = (void *)&fake_layout;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
+    (void)matLayout;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
+                                                  const void *buf, size_t sizeInBytes) {
+    (void)matLayout; (void)attr; (void)buf; (void)sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
+                                                  void *buf, size_t sizeInBytes,
+                                                  size_t *sizeWritten) {
+    (void)matLayout; (void)attr;
+    if (buf) memset(buf, 0, sizeInBytes);
+    if (sizeWritten) *sizeWritten = sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulPreferenceCreate(void **pref) {
+    static int fake_pref;
+    if (pref) *pref = (void *)&fake_pref;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulPreferenceDestroy(void *pref) {
+    (void)pref;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulPreferenceSetAttribute(void *pref, int attr,
+                                                      const void *buf, size_t sizeInBytes) {
+    (void)pref; (void)attr; (void)buf; (void)sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
+    void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
+    void *preference, int requestedAlgoCount, void *heuristicResultsArray,
+    int *returnAlgoCount) {
+    (void)lightHandle; (void)operationDesc; (void)Adesc; (void)Bdesc;
+    (void)Cdesc; (void)Ddesc; (void)preference; (void)requestedAlgoCount;
+    (void)heuristicResultsArray;
+    if (returnAlgoCount) *returnAlgoCount = 0;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+/*
+ * ============================================================================
+ * cuDNN Compatibility Stubs (additional — beyond the RPC implementations above)
+ * ============================================================================
+ */
+
+const char *cudnnGetErrorString(cudnnStatus_t status) {
+    switch (status) {
+    case 0: return "CUDNN_STATUS_SUCCESS";
+    case 1: return "CUDNN_STATUS_NOT_INITIALIZED";
+    case 2: return "CUDNN_STATUS_ALLOC_FAILED";
+    case 3: return "CUDNN_STATUS_BAD_PARAM";
+    case 9: return "CUDNN_STATUS_NOT_SUPPORTED";
+    default: return "CUDNN_STATUS_INTERNAL_ERROR";
+    }
+}
+
+size_t cudnnGetCudartVersion(void) {
+    return 12000;
+}
+
+cudnnStatus_t cudnnGetProperty(int type, int *value) {
+    switch (type) {
+    case 0: if (value) *value = 8; break;  /* major */
+    case 1: if (value) *value = 9; break;  /* minor */
+    case 2: if (value) *value = 4; break;  /* patch */
+    default: if (value) *value = 0; break;
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnGetStream(cudnnHandle_t handle, void **streamId) {
+    (void)handle;
+    if (streamId) *streamId = NULL;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+/*
+ * ============================================================================
+ * NVRTC Stubs — PyTorch uses NVRTC for runtime compilation
+ * ============================================================================
+ */
+
+typedef int nvrtcResult;
+#define NVRTC_SUCCESS 0
+
+const char *nvrtcGetErrorString(nvrtcResult result) {
+    (void)result;
+    return "NVRTC success";
+}
+
+nvrtcResult nvrtcVersion(int *major, int *minor) {
+    if (major) *major = 12;
+    if (minor) *minor = 0;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcCreateProgram(void **prog, const char *src,
+                                const char *name, int numHeaders,
+                                const char * const *headers,
+                                const char * const *includeNames) {
+    (void)src; (void)name; (void)numHeaders; (void)headers; (void)includeNames;
+    static int fake_prog;
+    if (prog) *prog = (void *)&fake_prog;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcDestroyProgram(void **prog) {
+    (void)prog;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcCompileProgram(void *prog, int numOptions, const char * const *options) {
+    (void)prog; (void)numOptions; (void)options;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetPTXSize(void *prog, size_t *ptxSizeRet) {
+    (void)prog;
+    if (ptxSizeRet) *ptxSizeRet = 1;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetPTX(void *prog, char *ptx) {
+    (void)prog;
+    if (ptx) ptx[0] = '\0';
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetCUBINSize(void *prog, size_t *cubinSizeRet) {
+    (void)prog;
+    if (cubinSizeRet) *cubinSizeRet = 0;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetCUBIN(void *prog, char *cubin) {
+    (void)prog; (void)cubin;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetProgramLogSize(void *prog, size_t *logSizeRet) {
+    (void)prog;
+    if (logSizeRet) *logSizeRet = 1;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetProgramLog(void *prog, char *log) {
+    (void)prog;
+    if (log) log[0] = '\0';
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcAddNameExpression(void *prog, const char *name_expression) {
+    (void)prog; (void)name_expression;
+    return NVRTC_SUCCESS;
+}
+
+nvrtcResult nvrtcGetLoweredName(void *prog, const char *name_expression,
+                                 const char **lowered_name) {
+    (void)prog; (void)name_expression;
+    if (lowered_name) *lowered_name = "";
+    return NVRTC_SUCCESS;
+}
+
+/*
  * Cleanup on library unload
  */
 __attribute__((destructor))

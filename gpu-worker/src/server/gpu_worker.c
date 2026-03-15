@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -227,6 +228,20 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "[juice-gpu-worker] Received client socket fd=%d\n", client_fd);
+
+        /*
+         * The Go agent sets sockets to non-blocking mode (required by Go's
+         * runtime netpoller).  When the fd is forwarded via SCM_RIGHTS, it
+         * retains the O_NONBLOCK flag.  We must clear it so that our
+         * blocking read/write calls in dispatch_loop work correctly.
+         */
+        {
+            int flags = fcntl(client_fd, F_GETFL, 0);
+            if (flags != -1 && (flags & O_NONBLOCK)) {
+                fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
+                fprintf(stderr, "[juice-gpu-worker] Cleared O_NONBLOCK on fd=%d\n", client_fd);
+            }
+        }
 
         /* Signal readiness to Agent IMMEDIATELY (before CUDA init) */
         char ready = 1;

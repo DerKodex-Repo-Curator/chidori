@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cudnn.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,16 @@ static handle_map_t g_rt_events;   /* Runtime API cudaEvent_t handles */
 
 /* Handle maps for cuBLAS */
 static handle_map_t g_cublas_handles;  /* cublasHandle_t handles */
+
+/* Handle maps for cuDNN */
+static handle_map_t g_cudnn_handles;              /* cudnnHandle_t */
+static handle_map_t g_cudnn_tensor_descs;          /* cudnnTensorDescriptor_t */
+static handle_map_t g_cudnn_filter_descs;          /* cudnnFilterDescriptor_t */
+static handle_map_t g_cudnn_conv_descs;            /* cudnnConvolutionDescriptor_t */
+static handle_map_t g_cudnn_activation_descs;      /* cudnnActivationDescriptor_t */
+static handle_map_t g_cudnn_pooling_descs;         /* cudnnPoolingDescriptor_t */
+static handle_map_t g_cudnn_dropout_descs;         /* cudnnDropoutDescriptor_t */
+static handle_map_t g_cudnn_rnn_descs;             /* cudnnRNNDescriptor_t */
 
 static uint64_t g_next_handle = 0x10000;
 
@@ -91,6 +102,14 @@ int cuda_dispatch_init(const char *pcibus) {
     hmap_init(&g_rt_streams);
     hmap_init(&g_rt_events);
     hmap_init(&g_cublas_handles);
+    hmap_init(&g_cudnn_handles);
+    hmap_init(&g_cudnn_tensor_descs);
+    hmap_init(&g_cudnn_filter_descs);
+    hmap_init(&g_cudnn_conv_descs);
+    hmap_init(&g_cudnn_activation_descs);
+    hmap_init(&g_cudnn_pooling_descs);
+    hmap_init(&g_cudnn_dropout_descs);
+    hmap_init(&g_cudnn_rnn_descs);
 
     memset(g_devices, 0, sizeof(g_devices));
     memset(g_contexts, 0, sizeof(g_contexts));
@@ -1882,6 +1901,1044 @@ int cuda_dispatch(int fd, juice_request_t *req, void *payload) {
             (const void *)(uintptr_t)B, (cudaDataType)Btype, ldb, (long long)strideB,
             beta_buf, (void *)(uintptr_t)C, (cudaDataType)Ctype, ldc, (long long)strideC,
             batchCount, (cublasComputeType_t)computeType, (cublasGemmAlgo_t)algo);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ================================================================
+     * cuDNN API (0x0300 - 0x03FF)
+     * ================================================================ */
+
+    case JUICE_CUDNN_CREATE: {
+        cudnnHandle_t handle;
+        cudnnStatus_t st = cudnnCreate(&handle);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire_handle = alloc_handle();
+            hmap_put(&g_cudnn_handles, wire_handle, (uint64_t)(uintptr_t)handle);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire_handle, sizeof(wire_handle));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY: {
+        uint64_t wire_handle = 0;
+        if (req->payload_size >= 8) memcpy(&wire_handle, payload, 8);
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wire_handle);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (handle) {
+            st = cudnnDestroy(handle);
+            hmap_remove(&g_cudnn_handles, wire_handle);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_STREAM: {
+        uint64_t wire_handle = 0, stream_handle = 0;
+        if (req->payload_size >= 16) {
+            memcpy(&wire_handle, payload, 8);
+            memcpy(&stream_handle, (char *)payload + 8, 8);
+        }
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wire_handle);
+        cudaStream_t stream = NULL;
+        if (stream_handle != 0) {
+            uint64_t real_stream = hmap_get(&g_rt_streams, stream_handle);
+            if (real_stream == 0) real_stream = hmap_get(&g_streams, stream_handle);
+            if (real_stream != 0) stream = (cudaStream_t)(uintptr_t)real_stream;
+            else stream = (cudaStream_t)(uintptr_t)stream_handle;
+        }
+        cudnnStatus_t st = cudnnSetStream(handle, stream);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_GET_VERSION: {
+        size_t version = cudnnGetVersion();
+        uint64_t v = (uint64_t)version;
+        return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_SUCCESS, &v, sizeof(v));
+    }
+
+    /* ---- Tensor Descriptor ---- */
+
+    case JUICE_CUDNN_CREATE_TENSOR_DESCRIPTOR: {
+        cudnnTensorDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreateTensorDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_tensor_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_TENSOR_4D_DESCRIPTOR: {
+        /* Payload: desc(8) + format(4) + dataType(4) + n(4) + c(4) + h(4) + w(4) = 32 */
+        if (req->payload_size < 32) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_desc; memcpy(&wire_desc, p, 8); p += 8;
+        int32_t format; memcpy(&format, p, 4); p += 4;
+        int32_t dataType; memcpy(&dataType, p, 4); p += 4;
+        int32_t n, c, h, w;
+        memcpy(&n, p, 4); p += 4;
+        memcpy(&c, p, 4); p += 4;
+        memcpy(&h, p, 4); p += 4;
+        memcpy(&w, p, 4);
+
+        cudnnTensorDescriptor_t desc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wire_desc);
+        cudnnStatus_t st = cudnnSetTensor4dDescriptor(desc,
+            (cudnnTensorFormat_t)format, (cudnnDataType_t)dataType, n, c, h, w);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_TENSOR_ND_DESCRIPTOR: {
+        /* Payload: desc(8) + dataType(4) + nbDims(4) + dims(4*n) + strides(4*n) */
+        if (req->payload_size < 16) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire_desc; memcpy(&wire_desc, p, 8); p += 8;
+        int32_t dataType; memcpy(&dataType, p, 4); p += 4;
+        int32_t nbDims; memcpy(&nbDims, p, 4); p += 4;
+
+        if (nbDims > 8) nbDims = 8; /* safety cap */
+        int dimA[8], strideA[8];
+        for (int i = 0; i < nbDims; i++) { memcpy(&dimA[i], p, 4); p += 4; }
+        for (int i = 0; i < nbDims; i++) { memcpy(&strideA[i], p, 4); p += 4; }
+
+        cudnnTensorDescriptor_t desc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wire_desc);
+        cudnnStatus_t st = cudnnSetTensorNdDescriptor(desc,
+            (cudnnDataType_t)dataType, nbDims, dimA, strideA);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_GET_TENSOR_4D_DESCRIPTOR: {
+        uint64_t wire_desc = 0;
+        if (req->payload_size >= 8) memcpy(&wire_desc, payload, 8);
+        cudnnTensorDescriptor_t desc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wire_desc);
+        cudnnDataType_t dataType;
+        int n, c, h, w, nStride, cStride, hStride, wStride;
+        cudnnStatus_t st = cudnnGetTensor4dDescriptor(desc,
+            &dataType, &n, &c, &h, &w, &nStride, &cStride, &hStride, &wStride);
+        struct {
+            int32_t dataType;
+            int32_t n, c, h, w;
+            int32_t nStride, cStride, hStride, wStride;
+        } out;
+        out.dataType = (int32_t)dataType;
+        out.n = n; out.c = c; out.h = h; out.w = w;
+        out.nStride = nStride; out.cStride = cStride;
+        out.hStride = hStride; out.wStride = wStride;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &out, sizeof(out));
+    }
+
+    case JUICE_CUDNN_DESTROY_TENSOR_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnTensorDescriptor_t desc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyTensorDescriptor(desc);
+            hmap_remove(&g_cudnn_tensor_descs, wire);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Filter Descriptor ---- */
+
+    case JUICE_CUDNN_CREATE_FILTER_DESCRIPTOR: {
+        cudnnFilterDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreateFilterDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_filter_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_FILTER_4D_DESCRIPTOR: {
+        /* desc(8) + dataType(4) + format(4) + k(4) + c(4) + h(4) + w(4) = 32 */
+        if (req->payload_size < 32) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        int32_t dataType; memcpy(&dataType, p, 4); p += 4;
+        int32_t format; memcpy(&format, p, 4); p += 4;
+        int32_t k, c, h, w;
+        memcpy(&k, p, 4); p += 4;
+        memcpy(&c, p, 4); p += 4;
+        memcpy(&h, p, 4); p += 4;
+        memcpy(&w, p, 4);
+
+        cudnnFilterDescriptor_t desc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wire);
+        cudnnStatus_t st = cudnnSetFilter4dDescriptor(desc,
+            (cudnnDataType_t)dataType, (cudnnTensorFormat_t)format, k, c, h, w);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_FILTER_ND_DESCRIPTOR: {
+        /* desc(8) + dataType(4) + format(4) + nbDims(4) + dims(4*n) */
+        if (req->payload_size < 20) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        int32_t dataType; memcpy(&dataType, p, 4); p += 4;
+        int32_t format; memcpy(&format, p, 4); p += 4;
+        int32_t nbDims; memcpy(&nbDims, p, 4); p += 4;
+        if (nbDims > 8) nbDims = 8;
+        int filterDimA[8];
+        for (int i = 0; i < nbDims; i++) { memcpy(&filterDimA[i], p, 4); p += 4; }
+
+        cudnnFilterDescriptor_t desc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wire);
+        cudnnStatus_t st = cudnnSetFilterNdDescriptor(desc,
+            (cudnnDataType_t)dataType, (cudnnTensorFormat_t)format, nbDims, filterDimA);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY_FILTER_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnFilterDescriptor_t desc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyFilterDescriptor(desc);
+            hmap_remove(&g_cudnn_filter_descs, wire);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Convolution Descriptor ---- */
+
+    case JUICE_CUDNN_CREATE_CONVOLUTION_DESCRIPTOR: {
+        cudnnConvolutionDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreateConvolutionDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_conv_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_CONVOLUTION_2D_DESCRIPTOR: {
+        /* desc(8) + pad_h(4) + pad_w(4) + u(4) + v(4) + dilation_h(4) + dilation_w(4) + mode(4) + computeType(4) = 40 */
+        if (req->payload_size < 40) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        int32_t pad_h, pad_w, u, v, dh, dw, mode, ct;
+        memcpy(&pad_h, p, 4); p += 4;
+        memcpy(&pad_w, p, 4); p += 4;
+        memcpy(&u, p, 4); p += 4;
+        memcpy(&v, p, 4); p += 4;
+        memcpy(&dh, p, 4); p += 4;
+        memcpy(&dw, p, 4); p += 4;
+        memcpy(&mode, p, 4); p += 4;
+        memcpy(&ct, p, 4);
+
+        cudnnConvolutionDescriptor_t desc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wire);
+        cudnnStatus_t st = cudnnSetConvolution2dDescriptor(desc,
+            pad_h, pad_w, u, v, dh, dw,
+            (cudnnConvolutionMode_t)mode, (cudnnDataType_t)ct);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_CONVOLUTION_ND_DESCRIPTOR: {
+        /* desc(8) + arrayLength(4) + mode(4) + computeType(4) + pads(4*n) + strides(4*n) + dilations(4*n) */
+        if (req->payload_size < 20) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        int32_t arrayLength; memcpy(&arrayLength, p, 4); p += 4;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        int32_t ct; memcpy(&ct, p, 4); p += 4;
+        if (arrayLength > 6) arrayLength = 6;
+        int padA[6], strideA[6], dilA[6];
+        for (int i = 0; i < arrayLength; i++) { memcpy(&padA[i], p, 4); p += 4; }
+        for (int i = 0; i < arrayLength; i++) { memcpy(&strideA[i], p, 4); p += 4; }
+        for (int i = 0; i < arrayLength; i++) { memcpy(&dilA[i], p, 4); p += 4; }
+
+        cudnnConvolutionDescriptor_t desc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wire);
+        cudnnStatus_t st = cudnnSetConvolutionNdDescriptor(desc,
+            arrayLength, padA, strideA, dilA,
+            (cudnnConvolutionMode_t)mode, (cudnnDataType_t)ct);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY_CONVOLUTION_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnConvolutionDescriptor_t desc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyConvolutionDescriptor(desc);
+            hmap_remove(&g_cudnn_conv_descs, wire);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_CONVOLUTION_MATH_TYPE: {
+        uint64_t wire = 0;
+        int32_t mathType = 0;
+        if (req->payload_size >= 12) {
+            memcpy(&wire, payload, 8);
+            memcpy(&mathType, (char *)payload + 8, 4);
+        }
+        cudnnConvolutionDescriptor_t desc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wire);
+        cudnnStatus_t st = cudnnSetConvolutionMathType(desc, (cudnnMathType_t)mathType);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_CONVOLUTION_GROUP_COUNT: {
+        uint64_t wire = 0;
+        int32_t groupCount = 1;
+        if (req->payload_size >= 12) {
+            memcpy(&wire, payload, 8);
+            memcpy(&groupCount, (char *)payload + 8, 4);
+        }
+        cudnnConvolutionDescriptor_t desc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wire);
+        cudnnStatus_t st = cudnnSetConvolutionGroupCount(desc, groupCount);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Convolution Forward Algorithm ---- */
+
+    case JUICE_CUDNN_GET_CONVOLUTION_FORWARD_ALGORITHM: {
+        /* handle(8) + xDesc(8) + wDesc(8) + convDesc(8) + yDesc(8) + requestedAlgoCount(4) = 44 */
+        if (req->payload_size < 44) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh, wx, ww, wc, wy;
+        int32_t requestedCount;
+        memcpy(&wh, p, 8); p += 8;
+        memcpy(&wx, p, 8); p += 8;
+        memcpy(&ww, p, 8); p += 8;
+        memcpy(&wc, p, 8); p += 8;
+        memcpy(&wy, p, 8); p += 8;
+        memcpy(&requestedCount, p, 4);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wx);
+        cudnnFilterDescriptor_t wDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, ww);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wc);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wy);
+
+        if (requestedCount > 8) requestedCount = 8;
+        cudnnConvolutionFwdAlgoPerf_t perfResults[8];
+        int returnedCount = 0;
+
+        cudnnStatus_t st = cudnnGetConvolutionForwardAlgorithm_v7(handle,
+            xDesc, wDesc, convDesc, yDesc,
+            requestedCount, &returnedCount, perfResults);
+
+        /* Response: returnedCount(4) + perfResults array */
+        size_t perf_sz = (size_t)returnedCount * sizeof(cudnnConvolutionFwdAlgoPerf_t);
+        size_t out_len = 4 + perf_sz;
+        void *out = malloc(out_len);
+        if (!out) return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_ALLOC_FAILED, NULL, 0);
+        int32_t rc32 = (int32_t)returnedCount;
+        memcpy(out, &rc32, 4);
+        memcpy((char *)out + 4, perfResults, perf_sz);
+        int r = juice_send_response(fd, req->seq_num, (int32_t)st, out, out_len);
+        free(out);
+        return r;
+    }
+
+    /* ---- Convolution Workspace Size ---- */
+
+    case JUICE_CUDNN_GET_CONVOLUTION_FORWARD_WORKSPACE_SIZE: {
+        /* handle(8) + xDesc(8) + wDesc(8) + convDesc(8) + yDesc(8) + algo(4) = 44 */
+        if (req->payload_size < 44) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh, wx, ww, wc, wy;
+        int32_t algo;
+        memcpy(&wh, p, 8); p += 8;
+        memcpy(&wx, p, 8); p += 8;
+        memcpy(&ww, p, 8); p += 8;
+        memcpy(&wc, p, 8); p += 8;
+        memcpy(&wy, p, 8); p += 8;
+        memcpy(&algo, p, 4);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wx);
+        cudnnFilterDescriptor_t wDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, ww);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wc);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wy);
+
+        size_t sizeInBytes = 0;
+        cudnnStatus_t st = cudnnGetConvolutionForwardWorkspaceSize(handle,
+            xDesc, wDesc, convDesc, yDesc,
+            (cudnnConvolutionFwdAlgo_t)algo, &sizeInBytes);
+        uint64_t sz = (uint64_t)sizeInBytes;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &sz, sizeof(sz));
+    }
+
+    case JUICE_CUDNN_GET_CONVOLUTION_BACKWARD_DATA_WORKSPACE_SIZE: {
+        if (req->payload_size < 44) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh, ww, wdy, wc, wdx;
+        int32_t algo;
+        memcpy(&wh, p, 8); p += 8;
+        memcpy(&ww, p, 8); p += 8;
+        memcpy(&wdy, p, 8); p += 8;
+        memcpy(&wc, p, 8); p += 8;
+        memcpy(&wdx, p, 8); p += 8;
+        memcpy(&algo, p, 4);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnFilterDescriptor_t wDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, ww);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdy);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wc);
+        cudnnTensorDescriptor_t dxDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdx);
+
+        size_t sizeInBytes = 0;
+        cudnnStatus_t st = cudnnGetConvolutionBackwardDataWorkspaceSize(handle,
+            wDesc, dyDesc, convDesc, dxDesc,
+            (cudnnConvolutionBwdDataAlgo_t)algo, &sizeInBytes);
+        uint64_t sz = (uint64_t)sizeInBytes;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &sz, sizeof(sz));
+    }
+
+    case JUICE_CUDNN_GET_CONVOLUTION_BACKWARD_FILTER_WORKSPACE_SIZE: {
+        if (req->payload_size < 44) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh, wx, wdy, wc, wgrad;
+        int32_t algo;
+        memcpy(&wh, p, 8); p += 8;
+        memcpy(&wx, p, 8); p += 8;
+        memcpy(&wdy, p, 8); p += 8;
+        memcpy(&wc, p, 8); p += 8;
+        memcpy(&wgrad, p, 8); p += 8;
+        memcpy(&algo, p, 4);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wx);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdy);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wc);
+        cudnnFilterDescriptor_t gradDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wgrad);
+
+        size_t sizeInBytes = 0;
+        cudnnStatus_t st = cudnnGetConvolutionBackwardFilterWorkspaceSize(handle,
+            xDesc, dyDesc, convDesc, gradDesc,
+            (cudnnConvolutionBwdFilterAlgo_t)algo, &sizeInBytes);
+        uint64_t sz = (uint64_t)sizeInBytes;
+        return juice_send_response(fd, req->seq_num, (int32_t)st, &sz, sizeof(sz));
+    }
+
+    /* ---- Convolution Forward ---- */
+
+    case JUICE_CUDNN_CONVOLUTION_FORWARD: {
+        /*
+         * handle(8) + alpha(8) + xDesc(8) + x(8) + wDesc(8) + w(8)
+         * + convDesc(8) + algo(4) + workspace(8) + workspaceSize(8)
+         * + beta(8) + yDesc(8) + y(8) = 100
+         */
+        if (req->payload_size < 100) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint64_t wwd; memcpy(&wwd, p, 8); p += 8;
+        uint64_t wptr; memcpy(&wptr, p, 8); p += 8;
+        uint64_t wcd; memcpy(&wcd, p, 8); p += 8;
+        int32_t algo; memcpy(&algo, p, 4); p += 4;
+        uint64_t ws_ptr; memcpy(&ws_ptr, p, 8); p += 8;
+        uint64_t ws_size; memcpy(&ws_size, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnFilterDescriptor_t wDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wwd);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wcd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+
+        cudnnStatus_t st = cudnnConvolutionForward(handle,
+            alpha, xDesc, (const void *)(uintptr_t)xptr,
+            wDesc, (const void *)(uintptr_t)wptr,
+            convDesc, (cudnnConvolutionFwdAlgo_t)algo,
+            (void *)(uintptr_t)ws_ptr, (size_t)ws_size,
+            beta, yDesc, (void *)(uintptr_t)yptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Convolution Backward Data ---- */
+
+    case JUICE_CUDNN_CONVOLUTION_BACKWARD_DATA: {
+        if (req->payload_size < 100) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wwd; memcpy(&wwd, p, 8); p += 8;
+        uint64_t wptr; memcpy(&wptr, p, 8); p += 8;
+        uint64_t wdyd; memcpy(&wdyd, p, 8); p += 8;
+        uint64_t dyptr; memcpy(&dyptr, p, 8); p += 8;
+        uint64_t wcd; memcpy(&wcd, p, 8); p += 8;
+        int32_t algo; memcpy(&algo, p, 4); p += 4;
+        uint64_t ws_ptr; memcpy(&ws_ptr, p, 8); p += 8;
+        uint64_t ws_size; memcpy(&ws_size, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wdxd; memcpy(&wdxd, p, 8); p += 8;
+        uint64_t dxptr; memcpy(&dxptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnFilterDescriptor_t wDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wwd);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdyd);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wcd);
+        cudnnTensorDescriptor_t dxDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdxd);
+
+        cudnnStatus_t st = cudnnConvolutionBackwardData(handle,
+            alpha, wDesc, (const void *)(uintptr_t)wptr,
+            dyDesc, (const void *)(uintptr_t)dyptr,
+            convDesc, (cudnnConvolutionBwdDataAlgo_t)algo,
+            (void *)(uintptr_t)ws_ptr, (size_t)ws_size,
+            beta, dxDesc, (void *)(uintptr_t)dxptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Convolution Backward Filter ---- */
+
+    case JUICE_CUDNN_CONVOLUTION_BACKWARD_FILTER: {
+        if (req->payload_size < 100) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint64_t wdyd; memcpy(&wdyd, p, 8); p += 8;
+        uint64_t dyptr; memcpy(&dyptr, p, 8); p += 8;
+        uint64_t wcd; memcpy(&wcd, p, 8); p += 8;
+        int32_t algo; memcpy(&algo, p, 4); p += 4;
+        uint64_t ws_ptr; memcpy(&ws_ptr, p, 8); p += 8;
+        uint64_t ws_size; memcpy(&ws_size, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wdwd; memcpy(&wdwd, p, 8); p += 8;
+        uint64_t dwptr; memcpy(&dwptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdyd);
+        cudnnConvolutionDescriptor_t convDesc = (cudnnConvolutionDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_conv_descs, wcd);
+        cudnnFilterDescriptor_t dwDesc = (cudnnFilterDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_filter_descs, wdwd);
+
+        cudnnStatus_t st = cudnnConvolutionBackwardFilter(handle,
+            alpha, xDesc, (const void *)(uintptr_t)xptr,
+            dyDesc, (const void *)(uintptr_t)dyptr,
+            convDesc, (cudnnConvolutionBwdFilterAlgo_t)algo,
+            (void *)(uintptr_t)ws_ptr, (size_t)ws_size,
+            beta, dwDesc, (void *)(uintptr_t)dwptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Activation Descriptor ---- */
+
+    case JUICE_CUDNN_CREATE_ACTIVATION_DESCRIPTOR: {
+        cudnnActivationDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreateActivationDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_activation_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_ACTIVATION_DESCRIPTOR: {
+        /* desc(8) + mode(4) + reluNanOpt(4) + coef(8) = 24 */
+        if (req->payload_size < 24) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        int32_t nanOpt; memcpy(&nanOpt, p, 4); p += 4;
+        double coef; memcpy(&coef, p, 8);
+
+        cudnnActivationDescriptor_t desc = (cudnnActivationDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_activation_descs, wire);
+        cudnnStatus_t st = cudnnSetActivationDescriptor(desc,
+            (cudnnActivationMode_t)mode, (cudnnNanPropagation_t)nanOpt, coef);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY_ACTIVATION_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnActivationDescriptor_t desc = (cudnnActivationDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_activation_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyActivationDescriptor(desc);
+            hmap_remove(&g_cudnn_activation_descs, wire);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_ACTIVATION_FORWARD: {
+        /* handle(8) + activationDesc(8) + alpha(8) + xDesc(8) + x(8) + beta(8) + yDesc(8) + y(8) = 64 */
+        if (req->payload_size < 64) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint64_t wad; memcpy(&wad, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnActivationDescriptor_t actDesc = (cudnnActivationDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_activation_descs, wad);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+
+        cudnnStatus_t st = cudnnActivationForward(handle, actDesc,
+            alpha, xDesc, (const void *)(uintptr_t)xptr,
+            beta, yDesc, (void *)(uintptr_t)yptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_ACTIVATION_BACKWARD: {
+        /* handle(8) + actDesc(8) + alpha(8) + yDesc(8) + y(8) + dyDesc(8) + dy(8) + xDesc(8) + x(8) + beta(8) + dxDesc(8) + dx(8) = 96 */
+        if (req->payload_size < 96) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint64_t wad; memcpy(&wad, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8); p += 8;
+        uint64_t wdyd; memcpy(&wdyd, p, 8); p += 8;
+        uint64_t dyptr; memcpy(&dyptr, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wdxd; memcpy(&wdxd, p, 8); p += 8;
+        uint64_t dxptr; memcpy(&dxptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnActivationDescriptor_t actDesc = (cudnnActivationDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_activation_descs, wad);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdyd);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t dxDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdxd);
+
+        cudnnStatus_t st = cudnnActivationBackward(handle, actDesc,
+            alpha, yDesc, (const void *)(uintptr_t)yptr,
+            dyDesc, (const void *)(uintptr_t)dyptr,
+            xDesc, (const void *)(uintptr_t)xptr,
+            beta, dxDesc, (void *)(uintptr_t)dxptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Pooling Descriptor ---- */
+
+    case JUICE_CUDNN_CREATE_POOLING_DESCRIPTOR: {
+        cudnnPoolingDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreatePoolingDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_pooling_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_POOLING_2D_DESCRIPTOR: {
+        /* desc(8) + mode(4) + nanOpt(4) + wH(4) + wW(4) + vP(4) + hP(4) + vS(4) + hS(4) = 40 */
+        if (req->payload_size < 40) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        int32_t nanOpt; memcpy(&nanOpt, p, 4); p += 4;
+        int32_t wH, wW, vP, hP, vS, hS;
+        memcpy(&wH, p, 4); p += 4;
+        memcpy(&wW, p, 4); p += 4;
+        memcpy(&vP, p, 4); p += 4;
+        memcpy(&hP, p, 4); p += 4;
+        memcpy(&vS, p, 4); p += 4;
+        memcpy(&hS, p, 4);
+
+        cudnnPoolingDescriptor_t desc = (cudnnPoolingDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_pooling_descs, wire);
+        cudnnStatus_t st = cudnnSetPooling2dDescriptor(desc,
+            (cudnnPoolingMode_t)mode, (cudnnNanPropagation_t)nanOpt,
+            wH, wW, vP, hP, vS, hS);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY_POOLING_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnPoolingDescriptor_t desc = (cudnnPoolingDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_pooling_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyPoolingDescriptor(desc);
+            hmap_remove(&g_cudnn_pooling_descs, wire);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_POOLING_FORWARD: {
+        /* handle(8) + poolingDesc(8) + alpha(8) + xDesc(8) + x(8) + beta(8) + yDesc(8) + y(8) = 64 */
+        if (req->payload_size < 64) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint64_t wpd; memcpy(&wpd, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnPoolingDescriptor_t poolDesc = (cudnnPoolingDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_pooling_descs, wpd);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+
+        cudnnStatus_t st = cudnnPoolingForward(handle, poolDesc,
+            alpha, xDesc, (const void *)(uintptr_t)xptr,
+            beta, yDesc, (void *)(uintptr_t)yptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_POOLING_BACKWARD: {
+        /* handle(8) + poolDesc(8) + alpha(8) + yDesc(8) + y(8) + dyDesc(8) + dy(8) + xDesc(8) + x(8) + beta(8) + dxDesc(8) + dx(8) = 96 */
+        if (req->payload_size < 96) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        uint64_t wpd; memcpy(&wpd, p, 8); p += 8;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8); p += 8;
+        uint64_t wdyd; memcpy(&wdyd, p, 8); p += 8;
+        uint64_t dyptr; memcpy(&dyptr, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wdxd; memcpy(&wdxd, p, 8); p += 8;
+        uint64_t dxptr; memcpy(&dxptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnPoolingDescriptor_t poolDesc = (cudnnPoolingDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_pooling_descs, wpd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdyd);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t dxDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdxd);
+
+        cudnnStatus_t st = cudnnPoolingBackward(handle, poolDesc,
+            alpha, yDesc, (const void *)(uintptr_t)yptr,
+            dyDesc, (const void *)(uintptr_t)dyptr,
+            xDesc, (const void *)(uintptr_t)xptr,
+            beta, dxDesc, (void *)(uintptr_t)dxptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Batch Normalization ---- */
+
+    case JUICE_CUDNN_BATCH_NORM_FORWARD_TRAINING: {
+        /*
+         * handle(8) + mode(4) + alpha(8) + beta(8) + xDesc(8) + x(8)
+         * + yDesc(8) + y(8) + bnDesc(8) + bnScale(8) + bnBias(8)
+         * + expAvgFactor(8) + runMean(8) + runVar(8)
+         * + epsilon(8) + saveMean(8) + saveInvVar(8) = 140
+         */
+        if (req->payload_size < 140) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8); p += 8;
+        uint64_t wbn; memcpy(&wbn, p, 8); p += 8;
+        uint64_t scaleptr; memcpy(&scaleptr, p, 8); p += 8;
+        uint64_t biasptr; memcpy(&biasptr, p, 8); p += 8;
+        double expAvg; memcpy(&expAvg, p, 8); p += 8;
+        uint64_t runMean; memcpy(&runMean, p, 8); p += 8;
+        uint64_t runVar; memcpy(&runVar, p, 8); p += 8;
+        double epsilon; memcpy(&epsilon, p, 8); p += 8;
+        uint64_t saveMean; memcpy(&saveMean, p, 8); p += 8;
+        uint64_t saveInvVar; memcpy(&saveInvVar, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+        cudnnTensorDescriptor_t bnDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wbn);
+
+        cudnnStatus_t st = cudnnBatchNormalizationForwardTraining(handle,
+            (cudnnBatchNormMode_t)mode, alpha, beta,
+            xDesc, (const void *)(uintptr_t)xptr,
+            yDesc, (void *)(uintptr_t)yptr,
+            bnDesc,
+            (const void *)(uintptr_t)scaleptr,
+            (const void *)(uintptr_t)biasptr,
+            expAvg,
+            (void *)(uintptr_t)runMean,
+            (void *)(uintptr_t)runVar,
+            epsilon,
+            (void *)(uintptr_t)saveMean,
+            (void *)(uintptr_t)saveInvVar);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_BATCH_NORM_FORWARD_INFERENCE: {
+        /*
+         * handle(8) + mode(4) + alpha(8) + beta(8) + xDesc(8) + x(8)
+         * + yDesc(8) + y(8) + bnDesc(8) + bnScale(8) + bnBias(8)
+         * + estMean(8) + estVar(8) + epsilon(8) = 116
+         */
+        if (req->payload_size < 116) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8); p += 8;
+        uint64_t wbn; memcpy(&wbn, p, 8); p += 8;
+        uint64_t scaleptr; memcpy(&scaleptr, p, 8); p += 8;
+        uint64_t biasptr; memcpy(&biasptr, p, 8); p += 8;
+        uint64_t estMean; memcpy(&estMean, p, 8); p += 8;
+        uint64_t estVar; memcpy(&estVar, p, 8); p += 8;
+        double epsilon; memcpy(&epsilon, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+        cudnnTensorDescriptor_t bnDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wbn);
+
+        cudnnStatus_t st = cudnnBatchNormalizationForwardInference(handle,
+            (cudnnBatchNormMode_t)mode, alpha, beta,
+            xDesc, (const void *)(uintptr_t)xptr,
+            yDesc, (void *)(uintptr_t)yptr,
+            bnDesc,
+            (const void *)(uintptr_t)scaleptr,
+            (const void *)(uintptr_t)biasptr,
+            (const void *)(uintptr_t)estMean,
+            (const void *)(uintptr_t)estVar,
+            epsilon);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_BATCH_NORM_BACKWARD: {
+        /*
+         * handle(8) + mode(4) + alphaDD(8) + betaDD(8) + alphaPD(8) + betaPD(8)
+         * + xDesc(8) + x(8) + dyDesc(8) + dy(8) + dxDesc(8) + dx(8)
+         * + dBnDesc(8) + bnScale(8) + dScale(8) + dBias(8)
+         * + epsilon(8) + savedMean(8) + savedInvVar(8) = 164
+         */
+        if (req->payload_size < 164) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        uint8_t alphaDD[8]; memcpy(alphaDD, p, 8); p += 8;
+        uint8_t betaDD[8]; memcpy(betaDD, p, 8); p += 8;
+        uint8_t alphaPD[8]; memcpy(alphaPD, p, 8); p += 8;
+        uint8_t betaPD[8]; memcpy(betaPD, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint64_t wdyd; memcpy(&wdyd, p, 8); p += 8;
+        uint64_t dyptr; memcpy(&dyptr, p, 8); p += 8;
+        uint64_t wdxd; memcpy(&wdxd, p, 8); p += 8;
+        uint64_t dxptr; memcpy(&dxptr, p, 8); p += 8;
+        uint64_t wdbn; memcpy(&wdbn, p, 8); p += 8;
+        uint64_t scaleptr; memcpy(&scaleptr, p, 8); p += 8;
+        uint64_t dscaleptr; memcpy(&dscaleptr, p, 8); p += 8;
+        uint64_t dbiasptr; memcpy(&dbiasptr, p, 8); p += 8;
+        double epsilon; memcpy(&epsilon, p, 8); p += 8;
+        uint64_t savedMean; memcpy(&savedMean, p, 8); p += 8;
+        uint64_t savedInvVar; memcpy(&savedInvVar, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdyd);
+        cudnnTensorDescriptor_t dxDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdxd);
+        cudnnTensorDescriptor_t dBnDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdbn);
+
+        cudnnStatus_t st = cudnnBatchNormalizationBackward(handle,
+            (cudnnBatchNormMode_t)mode,
+            alphaDD, betaDD, alphaPD, betaPD,
+            xDesc, (const void *)(uintptr_t)xptr,
+            dyDesc, (const void *)(uintptr_t)dyptr,
+            dxDesc, (void *)(uintptr_t)dxptr,
+            dBnDesc,
+            (const void *)(uintptr_t)scaleptr,
+            (void *)(uintptr_t)dscaleptr,
+            (void *)(uintptr_t)dbiasptr,
+            epsilon,
+            (const void *)(uintptr_t)savedMean,
+            (const void *)(uintptr_t)savedInvVar);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Softmax ---- */
+
+    case JUICE_CUDNN_SOFTMAX_FORWARD: {
+        /* handle(8) + algo(4) + mode(4) + alpha(8) + xDesc(8) + x(8) + beta(8) + yDesc(8) + y(8) = 64 */
+        if (req->payload_size < 64) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        int32_t algo; memcpy(&algo, p, 4); p += 4;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wxd; memcpy(&wxd, p, 8); p += 8;
+        uint64_t xptr; memcpy(&xptr, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t xDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wxd);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+
+        cudnnStatus_t st = cudnnSoftmaxForward(handle,
+            (cudnnSoftmaxAlgorithm_t)algo, (cudnnSoftmaxMode_t)mode,
+            alpha, xDesc, (const void *)(uintptr_t)xptr,
+            beta, yDesc, (void *)(uintptr_t)yptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SOFTMAX_BACKWARD: {
+        /* handle(8) + algo(4) + mode(4) + alpha(8) + yDesc(8) + y(8) + dyDesc(8) + dy(8) + beta(8) + dxDesc(8) + dx(8) = 80 */
+        if (req->payload_size < 80) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        int32_t algo; memcpy(&algo, p, 4); p += 4;
+        int32_t mode; memcpy(&mode, p, 4); p += 4;
+        uint8_t alpha[8]; memcpy(alpha, p, 8); p += 8;
+        uint64_t wyd; memcpy(&wyd, p, 8); p += 8;
+        uint64_t yptr; memcpy(&yptr, p, 8); p += 8;
+        uint64_t wdyd; memcpy(&wdyd, p, 8); p += 8;
+        uint64_t dyptr; memcpy(&dyptr, p, 8); p += 8;
+        uint8_t beta[8]; memcpy(beta, p, 8); p += 8;
+        uint64_t wdxd; memcpy(&wdxd, p, 8); p += 8;
+        uint64_t dxptr; memcpy(&dxptr, p, 8);
+
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnTensorDescriptor_t yDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wyd);
+        cudnnTensorDescriptor_t dyDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdyd);
+        cudnnTensorDescriptor_t dxDesc = (cudnnTensorDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_tensor_descs, wdxd);
+
+        cudnnStatus_t st = cudnnSoftmaxBackward(handle,
+            (cudnnSoftmaxAlgorithm_t)algo, (cudnnSoftmaxMode_t)mode,
+            alpha, yDesc, (const void *)(uintptr_t)yptr,
+            dyDesc, (const void *)(uintptr_t)dyptr,
+            beta, dxDesc, (void *)(uintptr_t)dxptr);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ---- Dropout ---- */
+
+    case JUICE_CUDNN_CREATE_DROPOUT_DESCRIPTOR: {
+        cudnnDropoutDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreateDropoutDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_dropout_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_SET_DROPOUT_DESCRIPTOR: {
+        /* desc(8) + handle(8) + dropout(4) + states(8) + stateSize(8) + seed(8) = 44 */
+        if (req->payload_size < 44) {
+            return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_BAD_PARAM, NULL, 0);
+        }
+        char *p = (char *)payload;
+        uint64_t wire; memcpy(&wire, p, 8); p += 8;
+        uint64_t wh; memcpy(&wh, p, 8); p += 8;
+        float dropout; memcpy(&dropout, p, 4); p += 4;
+        uint64_t states; memcpy(&states, p, 8); p += 8;
+        uint64_t stateSize; memcpy(&stateSize, p, 8); p += 8;
+        uint64_t seed; memcpy(&seed, p, 8);
+
+        cudnnDropoutDescriptor_t desc = (cudnnDropoutDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_dropout_descs, wire);
+        cudnnHandle_t handle = (cudnnHandle_t)(uintptr_t)hmap_get(&g_cudnn_handles, wh);
+        cudnnStatus_t st = cudnnSetDropoutDescriptor(desc, handle, dropout,
+            (void *)(uintptr_t)states, (size_t)stateSize, (unsigned long long)seed);
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY_DROPOUT_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnDropoutDescriptor_t desc = (cudnnDropoutDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_dropout_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyDropoutDescriptor(desc);
+            hmap_remove(&g_cudnn_dropout_descs, wire);
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DROPOUT_FORWARD: {
+        /* Stub: dropout forward requires reserveSpace management; return NOT_SUPPORTED for now */
+        return juice_send_response(fd, req->seq_num, (int32_t)CUDNN_STATUS_NOT_SUPPORTED, NULL, 0);
+    }
+
+    /* ---- RNN ---- */
+
+    case JUICE_CUDNN_CREATE_RNN_DESCRIPTOR: {
+        cudnnRNNDescriptor_t desc;
+        cudnnStatus_t st = cudnnCreateRNNDescriptor(&desc);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            uint64_t wire = alloc_handle();
+            hmap_put(&g_cudnn_rnn_descs, wire, (uint64_t)(uintptr_t)desc);
+            return juice_send_response(fd, req->seq_num, (int32_t)st, &wire, sizeof(wire));
+        }
+        return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    case JUICE_CUDNN_DESTROY_RNN_DESCRIPTOR: {
+        uint64_t wire = 0;
+        if (req->payload_size >= 8) memcpy(&wire, payload, 8);
+        cudnnRNNDescriptor_t desc = (cudnnRNNDescriptor_t)(uintptr_t)hmap_get(&g_cudnn_rnn_descs, wire);
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (desc) {
+            st = cudnnDestroyRNNDescriptor(desc);
+            hmap_remove(&g_cudnn_rnn_descs, wire);
+        }
         return juice_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
     }
 
