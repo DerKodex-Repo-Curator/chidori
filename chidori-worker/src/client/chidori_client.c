@@ -3619,12 +3619,23 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
      * The server then passes kernelParams (not extra buffer) to cuLaunchKernel.
      */
 
-    /* Count args safely — cap at 16 */
+    /* Count args — PyTorch kernels typically have 2-10 args.
+     * The args array is NOT null-terminated in general, but PyTorch's
+     * cudaLaunchKernel wrapper does null-terminate it in practice.
+     * Cap at 10 to be safe. */
     int num_args = 0;
     if (args != NULL) {
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 10; i++) {
             if (args[i] == NULL) break;
             num_args++;
+            if (g_verbose)
+                fprintf(stderr, "[chidori-launch] arg[%d] ptr=%p val=", i, args[i]);
+            /* Try to peek at the value safely */
+            if (g_verbose) {
+                uint64_t v = 0;
+                memcpy(&v, args[i], sizeof(v));
+                fprintf(stderr, "0x%llx\n", (unsigned long long)v);
+            }
         }
     }
     /* Override param_size to actual packed size */
