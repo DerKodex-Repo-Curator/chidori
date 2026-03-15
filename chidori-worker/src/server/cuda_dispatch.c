@@ -198,6 +198,16 @@ void cuda_dispatch_shutdown(void) {
 }
 
 int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
+    static int s_verbose = -1;
+    if (s_verbose == -1) {
+        const char *v = getenv("CHIDORI_SERVER_VERBOSE");
+        s_verbose = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (s_verbose) {
+        fprintf(stderr, "[cuda_dispatch] >> func=0x%04x payload=%u seq=%u\n",
+                req->func_id, req->payload_size, req->seq_num);
+    }
+
     CUresult res;
 
     switch (req->func_id) {
@@ -1253,6 +1263,121 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     case CHIDORI_CUDA_PEEK_AT_LAST_ERROR: {
         cudaError_t err = cudaPeekAtLastError();
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
+    }
+
+    case CHIDORI_CUDA_REGISTER_FAT_BINARY: {
+        /* Payload is raw fat binary data */
+        CUmodule mod;
+        res = cuModuleLoadData(&mod, payload);
+        if (res == CUDA_SUCCESS) {
+            uint64_t handle = alloc_handle();
+            hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CUDA_REGISTER_FUNCTION: {
+        /* Payload: module_handle(8) + function_name (null-terminated) */
+        uint64_t mod_handle = 0;
+        const char *func_name = "";
+        if (req->payload_size >= 9) {
+            memcpy(&mod_handle, payload, 8);
+            func_name = (const char *)((char *)payload + 8);
+        }
+        CUmodule mod = (CUmodule)(uintptr_t)hmap_get(&g_modules, mod_handle);
+        if (!mod) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
+        }
+        CUfunction func;
+        res = cuModuleGetFunction(&func, mod, func_name);
+        if (res == CUDA_SUCCESS) {
+            uint64_t handle = alloc_handle();
+            hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)func);
+            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CUDA_LAUNCH_KERNEL: {
+        /*
+         * Same payload layout as CHIDORI_CU_LAUNCH_KERNEL:
+         *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
+         *   + blockX(4) + blockY(4) + blockZ(4)
+         *   + sharedMem(4) + stream_handle(8)
+         *   + has_params(1) + [buffer_size(4) + buffer_data(buffer_size)]
+         */
+        if (req->payload_size < 44) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+
+        uint64_t func_handle;
+        uint32_t gridX, gridY, gridZ, blockX, blockY, blockZ, shared;
+        uint64_t stream_handle;
+
+        char *p = (char *)payload;
+        memcpy(&func_handle, p, 8); p += 8;
+        memcpy(&gridX, p, 4); p += 4;
+        memcpy(&gridY, p, 4); p += 4;
+        memcpy(&gridZ, p, 4); p += 4;
+        memcpy(&blockX, p, 4); p += 4;
+        memcpy(&blockY, p, 4); p += 4;
+        memcpy(&blockZ, p, 4); p += 4;
+        memcpy(&shared, p, 4); p += 4;
+        memcpy(&stream_handle, p, 8); p += 8;
+
+        CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
+        if (!func) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
+        }
+
+        CUstream stream = NULL;
+        if (stream_handle != 0) {
+            stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+            if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        }
+
+        /* Parse kernel parameters if present */
+        size_t remaining = req->payload_size - 44;
+
+        if (remaining >= 1) {
+            uint8_t has_params = 0;
+            memcpy(&has_params, p, 1); p += 1;
+            remaining -= 1;
+
+            if (has_params && remaining >= 4) {
+                uint32_t buf_size = 0;
+                memcpy(&buf_size, p, 4); p += 4;
+                remaining -= 4;
+
+                if (buf_size > 0 && remaining >= buf_size) {
+                    void *param_buffer = p;
+                    size_t param_size = (size_t)buf_size;
+
+                    void *extra[] = {
+                        CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
+                        CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
+                        CU_LAUNCH_PARAM_END
+                    };
+
+                    res = cuLaunchKernel(func,
+                                         gridX, gridY, gridZ,
+                                         blockX, blockY, blockZ,
+                                         shared, stream,
+                                         NULL, extra);
+                    return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+                }
+            }
+        }
+
+        /* No parameters — launch with NULL */
+        res = cuLaunchKernel(func,
+                             gridX, gridY, gridZ,
+                             blockX, blockY, blockZ,
+                             shared, stream,
+                             NULL, NULL);
+
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
 
     /* ================================================================

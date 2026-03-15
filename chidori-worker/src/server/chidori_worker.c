@@ -110,15 +110,28 @@ static int receive_socket_from_agent(int ipc_read_fd) {
  * Main dispatch loop: read CUDA API requests, execute them via real CUDA, send responses.
  */
 static int dispatch_loop(int client_fd) {
+    static int s_verbose = -1;
+    if (s_verbose == -1) {
+        const char *v = getenv("CHIDORI_SERVER_VERBOSE");
+        s_verbose = (v && v[0] == '1') ? 1 : 0;
+    }
+
+    if (s_verbose)
+        fprintf(stderr, "[dispatch_loop] Entering dispatch loop for client fd=%d\n", client_fd);
+
     void *payload_buf = NULL;
     size_t payload_buf_size = 0;
 
     for (;;) {
         chidori_request_t req;
         if (chidori_recv_request(client_fd, &req) != 0) {
-            fprintf(stderr, "[chidori-worker] Client disconnected\n");
+            fprintf(stderr, "[chidori-worker] Client disconnected (EOF or read error on fd=%d)\n", client_fd);
             break;
         }
+
+        if (s_verbose)
+            fprintf(stderr, "[dispatch_loop] Received func_id=0x%04x payload_size=%u seq=%u\n",
+                    req.func_id, req.payload_size, req.seq_num);
 
         /* Read payload if present */
         if (req.payload_size > 0) {
@@ -127,22 +140,28 @@ static int dispatch_loop(int client_fd) {
                 payload_buf_size = req.payload_size;
                 payload_buf = malloc(payload_buf_size);
                 if (!payload_buf) {
-                    fprintf(stderr, "[chidori-worker] OOM allocating %u bytes\n", req.payload_size);
+                    fprintf(stderr, "[chidori-worker] OOM allocating %u bytes for fd=%d\n",
+                            req.payload_size, client_fd);
                     break;
                 }
             }
             if (chidori_read_full(client_fd, payload_buf, req.payload_size) != 0) {
-                fprintf(stderr, "[chidori-worker] Failed to read payload\n");
+                fprintf(stderr, "[chidori-worker] Failed to read payload (%u bytes) from fd=%d\n",
+                        req.payload_size, client_fd);
                 break;
             }
         }
 
         /* Dispatch to real CUDA */
         if (cuda_dispatch(client_fd, &req, payload_buf) != 0) {
-            fprintf(stderr, "[chidori-worker] Error dispatching func_id=0x%04x\n", req.func_id);
+            fprintf(stderr, "[chidori-worker] Error dispatching func_id=0x%04x on fd=%d\n",
+                    req.func_id, client_fd);
             break;
         }
     }
+
+    if (s_verbose)
+        fprintf(stderr, "[dispatch_loop] Exiting dispatch loop for client fd=%d\n", client_fd);
 
     free(payload_buf);
     close(client_fd);

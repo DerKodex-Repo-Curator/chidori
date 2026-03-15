@@ -118,6 +118,19 @@ static int tcp_connect(const char *host, int port) {
     }
 
     freeaddrinfo(res);
+
+    /* TCP keepalive to detect dead connections */
+    int keepalive = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#ifdef TCP_KEEPIDLE
+    int idle = 10;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    int interval = 5;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    int cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+
     return fd;
 }
 
@@ -311,7 +324,8 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
     req.seq_num = ++g_seq_num;
 
     if (chidori_send_request(g_server_fd, &req, payload, payload_len) != 0) {
-        fprintf(stderr, "[chidori] Failed to send request for func=0x%04x\n", func_id);
+        fprintf(stderr, "[chidori] Failed to send func=0x%04x: %s (errno=%d)\n",
+                func_id, strerror(errno), errno);
         close(g_server_fd);
         g_server_fd = -1;
         pthread_mutex_unlock(&g_lock);
@@ -321,7 +335,8 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
     /* Receive response */
     chidori_response_t resp;
     if (chidori_recv_response(g_server_fd, &resp) != 0) {
-        fprintf(stderr, "[chidori] Failed to receive response for func=0x%04x\n", func_id);
+        fprintf(stderr, "[chidori] Failed to recv response for func=0x%04x: %s (errno=%d)\n",
+                func_id, strerror(errno), errno);
         close(g_server_fd);
         g_server_fd = -1;
         pthread_mutex_unlock(&g_lock);
@@ -336,6 +351,8 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
             to_read = *out_payload_len;
 
         if (chidori_read_full(g_server_fd, out_payload, to_read) != 0) {
+            fprintf(stderr, "[chidori] Failed to read response payload (%zu bytes) for func=0x%04x: %s (errno=%d)\n",
+                    to_read, func_id, strerror(errno), errno);
             close(g_server_fd);
             g_server_fd = -1;
             pthread_mutex_unlock(&g_lock);
@@ -518,8 +535,24 @@ CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
 
 /* Module */
 CUresult cuModuleLoadData(CUmodule *module, const void *image) {
-    /* Send the PTX/CUBIN data to the server */
-    size_t image_len = strlen((const char *)image) + 1; /* For PTX; CUBIN needs header parsing */
+    /* Determine image size: check for PTX (text) vs CUBIN (binary) */
+    size_t image_len;
+    const unsigned char *data = (const unsigned char *)image;
+
+    if (data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
+        /* ELF CUBIN — read size from ELF header (e_shoff + e_shnum * e_shentsize) */
+        /* For safety, send 64KB which covers most kernels */
+        image_len = 64 * 1024;
+    } else if (memcmp(data, "\xed\xfe\xba\xbe", 4) == 0 || memcmp(data, "\xba\xbe\xfe\xed", 4) == 0) {
+        /* Fat binary magic */
+        uint64_t fat_size;
+        memcpy(&fat_size, data + 8, 8);
+        image_len = (size_t)fat_size;
+    } else {
+        /* Assume PTX (text) */
+        image_len = strlen((const char *)image) + 1;
+    }
+
     size_t out_len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_MODULE_LOAD_DATA, image, image_len, module, &out_len);
 }
@@ -755,7 +788,10 @@ CUresult cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd) 
  */
 
 typedef int cudaError_t;
+typedef void *cudaStream_t;
+typedef struct { unsigned int x, y, z; } dim3;
 #define cudaSuccess 0
+#define cudaErrorInvalidDeviceFunction 8
 
 /* cudaMemcpyKind enum values */
 #define cudaMemcpyHostToHost     0
@@ -3471,12 +3507,161 @@ cudaError_t cudaEventQuery(void *event) {
 
 /* ---- Execution (Runtime API) ---- */
 
-cudaError_t cudaLaunchKernel(const void *func, void *gridDim, void *blockDim,
-                             void **args, size_t sharedMem, void *stream) {
-    (void)func; (void)gridDim; (void)blockDim;
-    (void)args; (void)sharedMem; (void)stream;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+/*
+ * Lazy kernel registration: store fat binaries and function registrations
+ * locally, only send to server on first cudaLaunchKernel call per function.
+ * This avoids 1400+ synchronous RPCs during PyTorch init.
+ */
+
+/* Stored fat binary data (not yet sent to server) */
+#define MAX_FAT_BINARIES 256
+static struct {
+    const void *data;       /* raw fat binary data pointer (lives in process memory) */
+    uint64_t size;          /* fat binary size */
+    uint64_t server_handle; /* 0 = not yet registered on server */
+} g_fat_binaries[MAX_FAT_BINARIES];
+static int g_fat_binary_count = 0;
+
+/* Stored function registrations (not yet sent to server) */
+#define MAX_REGISTERED_FUNCTIONS 8192
+static struct {
+    const void *hostFun;        /* host function pointer (PyTorch's kernel ID) */
+    int fat_binary_idx;         /* index into g_fat_binaries */
+    char deviceName[256];       /* kernel name on device */
+    uint64_t server_handle;     /* 0 = not yet registered on server */
+} g_registered_functions[MAX_REGISTERED_FUNCTIONS];
+static int g_registered_function_count = 0;
+
+/* Lazily register a fat binary on the server, returns server module handle */
+static uint64_t lazy_register_fat_binary(int idx) {
+    if (g_fat_binaries[idx].server_handle != 0)
+        return g_fat_binaries[idx].server_handle;
+
+    uint64_t handle = 0;
+    size_t out_len = sizeof(handle);
+    CUresult r = chidori_rpc(CHIDORI_CUDA_REGISTER_FAT_BINARY,
+                             g_fat_binaries[idx].data,
+                             (size_t)g_fat_binaries[idx].size,
+                             &handle, &out_len);
+    if (r == 0 && handle != 0)
+        g_fat_binaries[idx].server_handle = handle;
+    return handle;
+}
+
+/* Lazily register a function on the server, returns server CUfunction handle */
+static uint64_t lazy_register_function(int idx) {
+    if (g_registered_functions[idx].server_handle != 0)
+        return g_registered_functions[idx].server_handle;
+
+    /* First ensure the fat binary is registered */
+    int fb_idx = g_registered_functions[idx].fat_binary_idx;
+    uint64_t mod_handle = lazy_register_fat_binary(fb_idx);
+    if (mod_handle == 0) return 0;
+
+    /* Register the function */
+    const char *name = g_registered_functions[idx].deviceName;
+    size_t name_len = strlen(name) + 1;
+    size_t payload_len = 8 + name_len;
+    void *payload = malloc(payload_len);
+    memcpy(payload, &mod_handle, 8);
+    memcpy((char *)payload + 8, name, name_len);
+
+    uint64_t func_handle = 0;
+    size_t out_len = sizeof(func_handle);
+    chidori_rpc(CHIDORI_CUDA_REGISTER_FUNCTION, payload, payload_len, &func_handle, &out_len);
+    free(payload);
+
+    if (func_handle != 0)
+        g_registered_functions[idx].server_handle = func_handle;
+    return func_handle;
+}
+
+cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
+                             void **args, size_t sharedMem, cudaStream_t stream) {
+    /* Look up the function — lazily register on first use */
+    uint64_t func_handle = 0;
+    for (int i = 0; i < g_registered_function_count; i++) {
+        if (g_registered_functions[i].hostFun == func) {
+            func_handle = lazy_register_function(i);
+            break;
+        }
+    }
+
+    if (func_handle == 0) {
+        g_last_error = cudaErrorInvalidDeviceFunction;
+        return cudaErrorInvalidDeviceFunction;
+    }
+
+    /* Query parameter size from server using CU_FUNC_ATTRIBUTE_PARAM_SIZE (74) */
+    /* Pack manually to avoid struct padding: attrib(4) + func_handle(8) = 12 bytes */
+    uint8_t attr_req[12];
+    int32_t attrib_val = 74; /* CU_FUNC_ATTRIBUTE_PARAM_SIZE */
+    memcpy(attr_req, &attrib_val, 4);
+    memcpy(attr_req + 4, &func_handle, 8);
+    int32_t param_size = 0;
+    size_t out_len = sizeof(param_size);
+    chidori_rpc(CHIDORI_CU_FUNC_GET_ATTRIBUTE, attr_req, 12, &param_size, &out_len);
+
+    /*
+     * Build launch payload:
+     *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
+     *   + blockX(4) + blockY(4) + blockZ(4)
+     *   + sharedMem(4) + stream_handle(8) = 44 bytes
+     *   + has_params(1) + [buffer_size(4) + buffer_data(param_size)]
+     */
+    size_t payload_len = 44 + 1;
+    uint8_t *param_buf = NULL;
+
+    if (param_size > 0 && args != NULL) {
+        param_buf = (uint8_t *)calloc(1, param_size);
+        int offset = 0;
+        int arg_idx = 0;
+        while (args[arg_idx] != NULL && offset < param_size) {
+            int copy_size = 8;
+            if (offset + copy_size > param_size)
+                copy_size = param_size - offset;
+            memcpy(param_buf + offset, args[arg_idx], copy_size);
+            offset += copy_size;
+            /* Align to 8 bytes */
+            offset = (offset + 7) & ~7;
+            arg_idx++;
+        }
+        payload_len += 4 + param_size;
+    }
+
+    void *payload = malloc(payload_len);
+    char *p = (char *)payload;
+
+    memcpy(p, &func_handle, 8); p += 8;
+    uint32_t gx = gridDim.x, gy = gridDim.y, gz = gridDim.z;
+    uint32_t bx = blockDim.x, by = blockDim.y, bz = blockDim.z;
+    uint32_t shared = (uint32_t)sharedMem;
+    uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
+    memcpy(p, &gx, 4); p += 4;
+    memcpy(p, &gy, 4); p += 4;
+    memcpy(p, &gz, 4); p += 4;
+    memcpy(p, &bx, 4); p += 4;
+    memcpy(p, &by, 4); p += 4;
+    memcpy(p, &bz, 4); p += 4;
+    memcpy(p, &shared, 4); p += 4;
+    memcpy(p, &stream_handle, 8); p += 8;
+
+    if (param_size > 0 && param_buf) {
+        uint8_t has_params = 1;
+        memcpy(p, &has_params, 1); p += 1;
+        uint32_t buf_size = (uint32_t)param_size;
+        memcpy(p, &buf_size, 4); p += 4;
+        memcpy(p, param_buf, param_size);
+        free(param_buf);
+    } else {
+        uint8_t has_params = 0;
+        memcpy(p, &has_params, 1);
+    }
+
+    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_LAUNCH_KERNEL, payload, payload_len, NULL, NULL);
+    free(payload);
+    g_last_error = r;
+    return r;
 }
 
 cudaError_t cudaFuncSetAttribute(const void *func, int attr, int value) {
@@ -3674,13 +3859,46 @@ cudaError_t cudaGetDeviceFlags(unsigned int *flags) {
 /*
  * __cudaRegisterFatBinary / __cudaUnregisterFatBinary / __cudaRegisterFunction
  *
- * Called by CUDA Runtime code generated by nvcc. On a GPU-less client using
- * LD_PRELOAD, compiled .cu files may still reference these. Return dummies.
+ * Called by CUDA Runtime code generated by nvcc. These send the fat binary
+ * and function registration data to the remote GPU server.
  */
 void **__cudaRegisterFatBinary(void *fatCubin) {
-    (void)fatCubin;
-    static void *dummy = NULL;
-    return &dummy;
+    /*
+     * LAZY REGISTRATION: Store the fat binary data locally.
+     * Only send to server when a kernel from this module is actually launched.
+     * This avoids 50+ RPCs during PyTorch init (each ~166ms over internet).
+     */
+    struct __fatBinC_Wrapper {
+        int magic;
+        int version;
+        const void *data;
+        void *filename;
+    };
+
+    struct __fatBinC_Wrapper *wrapper = (struct __fatBinC_Wrapper *)fatCubin;
+    const unsigned char *data = (const unsigned char *)wrapper->data;
+
+    /* Read fat binary size from the header at offset 8 */
+    uint64_t fat_size = 0;
+    memcpy(&fat_size, data + 8, 8);
+
+    if (fat_size == 0 || fat_size > 100*1024*1024) {
+        fat_size = 4096;
+    }
+
+    /* Store locally — NO RPC */
+    static int fat_idx_storage[MAX_FAT_BINARIES];
+    if (g_fat_binary_count < MAX_FAT_BINARIES) {
+        int idx = g_fat_binary_count++;
+        g_fat_binaries[idx].data = data;
+        g_fat_binaries[idx].size = fat_size;
+        g_fat_binaries[idx].server_handle = 0; /* not yet registered */
+        fat_idx_storage[idx] = idx;
+        return (void **)&fat_idx_storage[idx];
+    }
+
+    static int fallback_idx = 0;
+    return (void **)&fallback_idx;
 }
 
 void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
@@ -3695,8 +3913,24 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
                             char *deviceFun, const char *deviceName,
                             int thread_limit, void *tid, void *bid,
                             void *bDim, void *gDim, int *wSize) {
-    (void)fatCubinHandle; (void)hostFun; (void)deviceFun; (void)deviceName;
     (void)thread_limit; (void)tid; (void)bid; (void)bDim; (void)gDim; (void)wSize;
+
+    /*
+     * LAZY REGISTRATION: Store function info locally.
+     * Only send to server when cudaLaunchKernel is called with this function.
+     * This avoids 1400+ RPCs during PyTorch init.
+     */
+    int fat_idx = *(int *)fatCubinHandle;
+    const char *name = deviceName ? deviceName : deviceFun;
+
+    if (g_registered_function_count < MAX_REGISTERED_FUNCTIONS) {
+        int idx = g_registered_function_count++;
+        g_registered_functions[idx].hostFun = (const void *)hostFun;
+        g_registered_functions[idx].fat_binary_idx = fat_idx;
+        strncpy(g_registered_functions[idx].deviceName, name, 255);
+        g_registered_functions[idx].deviceName[255] = '\0';
+        g_registered_functions[idx].server_handle = 0; /* not yet registered */
+    }
 }
 
 void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
