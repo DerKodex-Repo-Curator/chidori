@@ -1,0 +1,342 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema#",
+    "title": "Values",
+    "type": "object",
+    "required": [
+        "frontend",
+        "backend",
+        "image",
+        "service"
+    ],
+    "additionalProperties": false,
+    "properties": {
+        "image": {
+            "description": "",
+            "type": "string"
+        },
+        "postgresql": {
+            "description": "",
+            "type": "object",
+            "oneOf": [
+                {
+                    "required": [
+                        "user",
+                        "password",
+                        "dbname",
+                        "host"
+                    ],
+                    "properties": {
+                        "user": {
+                            "description": "",
+                            "type": "string"
+                        },
+                        "password": {
+                            "description": "",
+                            "type": "string"
+                        },
+                        "dbname": {
+                            "description": "",
+                            "type": "string"
+                        },
+                        "host": {
+                            "description": "",
+                            "type": "string"
+                        },
+                        "port": {
+                            "description": "",
+                            "type": "number"
+                        },
+                        "sslmode": {
+                            "description": "",
+                            "type": "string",
+                            "enum": [
+                                "disable",
+                                "require",
+                                "verify-ca",
+                                "verify-full"
+                            ]
+                        },
+                        "connect_timeout": {
+                            "description": "",
+                            "type": "number"
+                        },
+                        "sslcert": {
+                            "description": "",
+                            "type": "string"
+                        },
+                        "sslkey": {
+                            "description": "",
+                            "type": "string"
+                        },
+                        "sslrootcert": {
+                            "description": "",
+                            "type": "string"
+                        }
+                    }
+                },
+                {
+                    "required": [
+                        "from_file"
+                    ],
+                    "additionalProperties": {
+                        "from_file": {
+                            "description": "",
+                            "type": "string"
+                        }
+                    }
+                }
+            ]
+        },
+        "frontend": {
+            "description": "",
+            "type": "object",
+            "required": [
+                "name",
+                "replicas"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "description": "",
+                    "type": "string"
+                },
+                "replicas": {
+                    "description": "",
+                    "type": "number"
+                },
+                "additionalLabels": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalAnnotations": {
+                    "#ref": "#/$defs/additionalAnnotations"
+                },
+                "additionalSpec": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalTemplateLabels": {
+                    "#ref": "#/$defs/additionalTemplateLabels"
+                },
+                "additionalTemplateAnnotations": {
+                    "#ref": "#/$defs/additionalTemplateAnnotations"
+                },
+                "additionalTemplateSpec": {
+                    "#ref": "#/$defs/additionalTemplateSpec"
+                },
+                "additionalControllerSpec": {
+                    "#ref": "#/$defs/additionalControllerSpec"
+                },
+                "additionalControllerArgs": {
+                    "#ref": "#/$defs/additionalControllerArgs"
+                }
+            }
+        },
+        "backend": {
+            "description": "",
+            "type": "object",
+            "required": [
+                "name"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "description": "",
+                    "type": "string"
+                },
+                "additionalLabels": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalAnnotations": {
+                    "#ref": "#/$defs/additionalAnnotations"
+                },
+                "additionalSpec": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalTemplateLabels": {
+                    "#ref": "#/$defs/additionalTemplateLabels"
+                },
+                "additionalTemplateAnnotations": {
+                    "#ref": "#/$defs/additionalTemplateAnnotations"
+                },
+                "additionalTemplateSpec": {
+                    "#ref": "#/$defs/additionalTemplateSpec"
+                },
+                "additionalControllerSpec": {
+                    "#ref": "#/$defs/additionalControllerSpec"
+                },
+                "additionalControllerArgs": {
+                    "#ref": "#/$defs/additionalControllerArgs"
+                }
+            }
+        },
+        "prometheus": {
+            "description": "",
+            "type": "object",
+            "required": [
+                "name",
+                "port"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "description": "",
+                    "type": "string"
+                },
+                "port": {
+                    "description": "",
+                    "type": "number"
+                },
+                "additionalLabels": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalAnnotations": {
+                    "#ref": "#/$defs/additionalAnnotations"
+                },
+                "additionalSpec": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalTemplateLabels": {
+                    "#ref": "#/$defs/additionalTemplateLabels"
+                },
+                "additionalTemplateAnnotations": {
+                    "#ref": "#/$defs/additionalTemplateAnnotations"
+                },
+                "additionalTemplateSpec": {
+                    "#ref": "#/$defs/additionalTemplateSpec"
+                },
+                "additionalControllerSpec": {
+                    "#ref": "#/$defs/additionalControllerSpec"
+                },
+                "additionalControllerArgs": {
+                    "#ref": "#/$defs/additionalControllerArgs"
+                }
+            }
+        },
+        "common": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "additionalLabels": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalAnnotations": {
+                    "#ref": "#/$defs/additionalAnnotations"
+                },
+                "additionalSpec": {
+                    "#ref": "#/$defs/additionalSpec"
+                },
+                "additionalTemplateLabels": {
+                    "#ref": "#/$defs/additionalTemplateLabels"
+                },
+                "additionalTemplateAnnotations": {
+                    "#ref": "#/$defs/additionalTemplateAnnotations"
+                },
+                "additionalTemplateSpec": {
+                    "#ref": "#/$defs/additionalTemplateSpec"
+                },
+                "additionalControllerSpec": {
+                    "#ref": "#/$defs/additionalControllerSpec"
+                },
+                "additionalControllerArgs": {
+                    "#ref": "#/$defs/additionalControllerArgs"
+                }
+            }
+        },
+        "service": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "namePrefix",
+                "port"
+            ],
+            "properties": {
+                "namePrefix": {
+                    "description": "",
+                    "type": "string"
+                },
+                "port": {
+                    "description": "",
+                    "type": "number"
+                },
+                "additionalSpec": {
+                    "#ref": "#/$defs/additionalServiceSpec"
+                },
+                "additionalAnnotations": {
+                    "#ref": "#/$defs/additionalAnnotations"
+                }
+            }
+        }
+    },
+    "$defs": {
+        "additionalLabels": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "app.juicelabs.co/controller": false
+            }
+        },
+        "additionalAnnotations": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true
+        },
+        "additionalSpec": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "replicas": false,
+                "selector": false
+            }
+        },
+        "additionalTemplateLabels": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "app.juicelabs.co/controller": false
+            }
+        },
+        "additionalTemplateAnnotations": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true
+        },
+        "additionalTemplateSpec": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "containers": false
+            }
+        },
+        "additionalControllerSpec": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "name": false,
+                "image": false,
+                "args": false
+            }
+        },
+        "additionalControllerArgs": {
+            "description": "",
+            "type": "array",
+            "items": {
+                "type": "string"
+            }
+        },
+        "additionalServiceSpec": {
+            "description": "",
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "ports": false,
+                "selector": false
+            }
+        }
+    }
+}

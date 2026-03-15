@@ -1,0 +1,35 @@
+.buttonDiv {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* background-color: rgb(180, 130, 228); */
+    color: #410099 ;
+  }
+
+  .downloadFeaturesSection {
+    display: flex;
+    align-items: center;
+    padding: 2rem 0;
+    width: 100%;
+  }
+  
+  .featureImgLogo {
+    height: 150px;
+    width: 150px;
+    margin-bottom: 60px;
+    margin-top: 20px;
+  }
+  
+  .link {
+    color: inherit;
+    text-decoration: none;
+  }
+  
+  .link:hover {
+    text-decoration: none;
+  }
+  
+  .downloadIcon {
+    font-size: 45px !important;
+    margin-right: 10px;
+  }

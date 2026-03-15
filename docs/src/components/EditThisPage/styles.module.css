@@ -1,0 +1,56 @@
+.editContainer {
+  margin: 2rem 0;
+  padding: 1.5rem;
+  border-radius: 8px;
+  background-color: var(--ifm-color-emphasis-100);
+  text-align: center;
+}
+
+.editTitle {
+  margin-bottom: 1rem;
+  font-size: 1.2rem;
+}
+
+.editButtons {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.editButton {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  background-color: var(--ifm-color-primary);
+  color: white;
+  font-weight: bold;
+  text-decoration: none;
+  transition: background-color 0.2s;
+}
+
+.editButton:hover {
+  background-color: var(--ifm-color-primary-darker);
+  color: white;
+  text-decoration: none;
+}
+
+.editButtonSecondary {
+  background-color: var(--ifm-color-emphasis-700);
+}
+
+.editButtonSecondary:hover {
+  background-color: var(--ifm-color-emphasis-800);
+}
+
+.editIcon {
+  margin-right: 0.5rem;
+}
+
+.editDescription {
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+  color: var(--ifm-color-emphasis-700);
+} 

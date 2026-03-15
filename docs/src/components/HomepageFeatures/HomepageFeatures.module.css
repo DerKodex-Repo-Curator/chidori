@@ -1,0 +1,121 @@
+.features {
+  display: flex;
+  align-items: center;
+  padding: 2rem 0;
+  width: 100%;
+}
+
+.buttonDiv {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* background-color: rgb(180, 130, 228); */
+  color: #410099;
+}
+
+.aihelixfeatureSvg {
+  filter: drop-shadow(0 0 7px darkgray);
+  height: 200px;
+  width: 200px;
+}
+
+.featureSvg {
+  height: 200px;
+  width: 200px;
+}
+
+.textBtn {
+  background-color: #410099;
+  color: #fff;
+  border-radius: var(--ifm-button-border-radius);
+  margin-right: 30px;
+  font-weight: bold;
+  width: 140px;
+  text-align: center;
+  padding: 5px;
+}
+
+.textBtn:hover {
+  color: #fff;
+  background-color: #5400c7 !important;
+  text-decoration: none;
+}
+
+.othertextBtn {
+  border: 1px solid #a053e7;
+  border-radius: var(--ifm-button-border-radius);
+  color: #fff;
+  font-weight: bold;
+  width: 190px;
+  text-align: center;
+  padding: 5px;
+}
+
+.othertextBtn:hover {
+  text-decoration: none;
+}
+
+.listTextDiv {
+  display: flex;
+  justify-content: center;
+  text-align: left;
+  margin-bottom: 40px;
+  align-items: center;
+  color: white;
+  font-weight: bold;
+}
+
+.listTextDiv>ul {
+  list-style: none;
+}
+
+.listTextDiv>ul li:before {
+  content: "\27A4";
+  position: relative;
+  left: -25px;
+  color: #410099;
+}
+
+.customBtn {
+  width: 220px !important;
+  background: #410099 !important;
+  color: #ffffff !important;
+  border-style: none !important;
+  margin: 0 15px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  text-decoration: none !important;
+  padding: 10px !important;
+}
+
+.customBtn:hover {
+  background-color: #5400c7 !important;
+}
+
+.downloadIcon {
+  font-size: 26px !important;
+  margin-left: 10px;
+}
+
+.downloadLabel {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  transform: translateX(-50%);
+}
+
+.downloadBtnError {
+  background-color: rgb(255, 214, 220);
+  border: 1px solid crimson;
+  border-radius: 5px;
+  color: rgb(124, 5, 29);
+  padding: 0.5em;
+  margin: 0 0 1em 0;
+}

@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.prometheus.name }}
+  labels:
+    app.juicelabs.co/controller: prometheus
+{{- if and .Values.common .Values.common.additionalLabels }}
+{{ toYaml .Values.common.additionalLabels | indent 4 }}
+{{- end }}
+{{- if .Values.prometheus.additionalLabels }}
+{{ toYaml .Values.prometheus.additionalLabels | indent 4 }}
+{{- end }}
+{{- if or .Values.prometheus.additionalAnnotations (and .Values.common .Values.common.additionalAnnotations) }}
+  annotations:
+{{- if and .Values.common .Values.common.additionalAnnotations }}
+{{ toYaml .Values.common.additionalAnnotations | indent 4 }}
+{{- end }}
+{{- if .Values.prometheus.additionalAnnotations }}
+{{ toYaml .Values.prometheus.additionalAnnotations | indent 4 }}
+{{- end }}
+{{- end }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.juicelabs.co/controller: prometheus
+{{- if and .Values.common .Values.common.additionalLabels }}
+{{ toYaml .Values.common.additionalLabels | indent 6 }}
+{{- end }}
+{{- if .Values.prometheus.additionalLabels }}
+{{ toYaml .Values.prometheus.additionalLabels | indent 6 }}
+{{- end }}
+{{- if and .Values.common .Values.common.additionalSpec }}
+{{ toYaml .Values.common.additionalSpec | indent 2 }}
+{{- end }}
+{{- if .Values.prometheus.additionalSpec }}
+{{ toYaml .Values.prometheus.additionalSpec | indent 2 }}
+{{- end }}
+  template:
+    metadata:
+      labels:
+        app.juicelabs.co/controller: prometheus
+{{- if and .Values.common .Values.common.additionalTemplateLabels }}
+{{ toYaml .Values.common.additionalTemplateLabels | indent 8 }}
+{{- end }}
+{{- if .Values.prometheus.additionalTemplateLabels }}
+{{ toYaml .Values.prometheus.additionalTemplateLabels | indent 8 }}
+{{- end }}
+{{- if or .Values.prometheus.additionalTemplateAnnotations (and .Values.common .Values.common.additionalTemplateAnnotations) }}
+      annotations:
+{{- if and .Values.common .Values.common.additionalTemplateAnnotations }}
+{{ toYaml .Values.common.additionalTemplateAnnotations | indent 8 }}
+{{- end }}
+{{- if .Values.prometheus.additionalTemplateAnnotations }}
+{{ toYaml .Values.prometheus.additionalTemplateAnnotations | indent 8 }}
+{{- end }}
+{{- end }}
+    spec:
+{{- if and .Values.common .Values.common.additionalTemplateSpec }}
+{{ toYaml .Values.common.additionalTemplateSpec | indent 6 }}
+{{- end }}
+{{- if .Values.prometheus.additionalTemplateSpec }}
+{{ toYaml .Values.prometheus.additionalTemplateSpec | indent 6 }}
+{{- end }}
+      containers:
+      - name: controller
+        image: {{ .Values.image }}
+        ports:
+          - name: prometheus
+            containerPort: {{ .Values.prometheus.port }}
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.prometheus.port }}
+          initialDelaySeconds: 5
+          periodSeconds: 30
+{{- if and .Values.common .Values.common.additionalControllerSpec }}
+{{ toYaml .Values.common.additionalControllerSpec | indent 8 }}
+{{- end }}
+{{- if .Values.prometheus.additionalControllerSpec }}
+{{ toYaml .Values.prometheus.additionalControllerSpec | indent 8 }}
+{{- end }}
+        args:
+        - --prometheus
+        - 0.0.0.0:{{ .Values.prometheus.port }}
+{{- if .Values.postgresql }}
+{{- with .Values.postgresql }}
+{{- if .from_file }}
+        - --psql-connection-from-file
+        - {{ .from_file }}
+{{- else }}
+        - --psql-connection
+        - >-
+          "dbname='{{ .dbname }}'
+          host='{{ .host }}'
+          user='{{ .user }}'
+          password='{{ .password }}'
+{{- if .sslmode }}
+          sslmode='{{ .sslmode }}'
+{{- end }}
+{{- if .connect_timeout }}
+          connect_timeout={{ .connect_timeout }}
+{{- end }}
+{{- if .sslcert }}
+          sslcert='{{ .sslcert }}'
+{{- end }}
+{{- if .sslkey }}
+          sslkey='{{ .sslkey }}'
+{{- end }}
+{{- if .sslrootcert }}
+          sslrootcert='{{ .sslrootcert }}'
+{{- end }}
+          "
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.common .Values.common.additionalControllerArgs }}
+{{ toYaml .Values.common.additionalControllerArgs | indent 8 }}
+{{- end }}
+{{- if .Values.prometheus.additionalControllerArgs }}
+{{ toYaml .Values.prometheus.additionalControllerArgs | indent 8 }}
+{{- end }}

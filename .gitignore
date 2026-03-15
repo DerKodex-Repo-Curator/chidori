@@ -1,0 +1,5 @@
+gpu-worker/build/
+gpu-worker/src/generated/
+*.o
+*.so
+*.exe

@@ -1,0 +1,29 @@
+.editSection {
+  margin-top: 2rem;
+}
+
+.editOptions {
+  margin: 2rem 0;
+}
+
+.editOption {
+  margin-bottom: 2rem;
+  padding: 1.5rem;
+  border-radius: 8px;
+  background-color: var(--ifm-color-emphasis-100);
+}
+
+.codeBlock {
+  margin: 1rem 0;
+  padding: 1rem;
+  background-color: var(--ifm-color-emphasis-200);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.helpSection {
+  margin-top: 3rem;
+  padding: 1.5rem;
+  border-radius: 8px;
+  background-color: var(--ifm-color-emphasis-100);
+} 

@@ -1,0 +1,63 @@
+name: Controller Docker Image
+
+on:
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    paths:
+    - cmd/controller/**
+    - docker/controller/**
+    - pkg/**
+  push:
+    branches:
+    - master
+    paths:
+    - cmd/controller/**
+    - docker/controller/**
+    - pkg/**
+
+jobs:
+  docker:
+    strategy:
+      fail-fast: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Determine Controller Version
+        env:
+          SHA: ${{ github.sha }}
+        id: version
+        shell: bash
+        run: |
+          tag=`git show -s --date=format:'%Y.%m.%d-%H%M' --format=%cd.%h ${SHA}`
+          echo "version=${tag}" >> $GITHUB_OUTPUT
+      - if: ${{ github.event_name == 'push' }}
+        name: Controller Image
+        uses: docker/build-push-action@v3
+        with:
+          build-args: |
+            BASE_CONTAINER=ubuntu:22.04
+            JUICE_VERSION=${{ steps.version.outputs.version }}
+            JUICE_SENTRY_DSN=${{ secrets.CONTROLLER_SENTRY_DSN }}
+          file: docker/controller/Dockerfile
+          push: true
+          tags: juicelabs/controller:latest,juicelabs/controller:${{ steps.version.outputs.version }}
+      - if: ${{ github.event_name == 'pull_request' }}
+        name: Controller Image
+        uses: docker/build-push-action@v3
+        with:
+          build-args: |
+            BASE_CONTAINER=ubuntu:22.04
+            JUICE_VERSION=${{ steps.version.outputs.version }}
+          file: docker/controller/Dockerfile
+          push: true
+          tags: juicelabs/controller-test:${{ steps.version.outputs.version }}
