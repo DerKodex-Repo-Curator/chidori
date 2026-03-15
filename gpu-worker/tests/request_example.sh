@@ -5,15 +5,15 @@
 # Two-shell approach (simplest, most reliable):
 #
 # SHELL 1 — GPU Server (ssh into the GPU machine):
-#   scp -r gpu-worker/ ubuntu@66.85.148.90:/tmp/juice-test/
+#   scp -r gpu-worker/ ubuntu@66.85.148.90:/tmp/juice-test
 #   ssh ubuntu@66.85.148.90
-#   cd /tmp/juice-test/tests
+#   cd /tmp/juice-test/gpu-worker/tests
 #   ./start-server.sh 43211
 #
 # SHELL 2 — Client (ssh into the GPU-less machine):
-#   scp -r gpu-worker/ root@66.85.148.120:/tmp/juice-test/
+#   scp -r gpu-worker/ root@66.85.148.120:/tmp/juice-test
 #   ssh root@66.85.148.120
-#   cd /tmp/juice-test/tests
+#   cd /tmp/juice-test/gpu-worker/tests
 #   ./run-test.sh 66.85.148.90 43211
 #
 # Or run everything from your laptop with deploy + test:
