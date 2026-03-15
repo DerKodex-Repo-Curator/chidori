@@ -3624,12 +3624,18 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
 
     if (param_size > 0 && args != NULL) {
         param_buf = (uint8_t *)calloc(1, param_size);
-        /* Pack exactly param_size bytes. Number of args = param_size / 8 */
-        int num_args = param_size / 8;
+        /* Pack args into buffer. Each args[i] points to a kernel arg value.
+         * Copy 8 bytes per arg. Stop if we hit NULL (end of args array)
+         * or fill the buffer. Safe: never read more than param_size/8 entries. */
+        int max_args = param_size / 8;
+        if (max_args > 64) max_args = 64; /* absolute safety cap */
         int offset = 0;
-        for (int i = 0; i < num_args && offset < param_size; i++) {
-            memcpy(param_buf + offset, args[i], 8);
-            offset += 8;
+        for (int i = 0; i < max_args && offset < param_size; i++) {
+            if (args[i] == NULL) break;
+            int copy = 8;
+            if (offset + copy > param_size) copy = param_size - offset;
+            memcpy(param_buf + offset, args[i], copy);
+            offset += copy;
         }
         payload_len += 4 + param_size;
     }

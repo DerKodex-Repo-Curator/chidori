@@ -1300,7 +1300,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)func);
             /* Return func_handle(8) + param_size(4) so client knows exact arg buffer size */
             int param_sz = 0;
-            cuFuncGetAttribute(&param_sz, (CUfunction_attribute)74, func); /* PARAM_SIZE */
+            CUresult attr_res = cuFuncGetAttribute(&param_sz, (CUfunction_attribute)74, func);
+            /* Attribute 74 (PARAM_SIZE) requires CUDA 12+. If it fails, use 256 as fallback */
+            if (attr_res != CUDA_SUCCESS || param_sz <= 0)
+                param_sz = 256;
             struct __attribute__((packed)) { uint64_t h; int32_t ps; } resp;
             resp.h = handle;
             resp.ps = param_sz;
