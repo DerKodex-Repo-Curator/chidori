@@ -3529,6 +3529,7 @@ static struct {
     int fat_binary_idx;         /* index into g_fat_binaries */
     char deviceName[256];       /* kernel name on device */
     uint64_t server_handle;     /* 0 = not yet registered on server */
+    int32_t param_size;         /* kernel parameter buffer size (from server) */
 } g_registered_functions[MAX_REGISTERED_FUNCTIONS];
 static int g_registered_function_count = 0;
 
@@ -3566,23 +3567,32 @@ static uint64_t lazy_register_function(int idx) {
     memcpy(payload, &mod_handle, 8);
     memcpy((char *)payload + 8, name, name_len);
 
-    uint64_t func_handle = 0;
-    size_t out_len = sizeof(func_handle);
-    chidori_rpc(CHIDORI_CUDA_REGISTER_FUNCTION, payload, payload_len, &func_handle, &out_len);
+    /* Server returns: func_handle(8) + param_size(4) = 12 bytes */
+    struct __attribute__((packed)) { uint64_t h; int32_t ps; } resp = {0, 0};
+    size_t out_len = sizeof(resp);
+    chidori_rpc(CHIDORI_CUDA_REGISTER_FUNCTION, payload, payload_len, &resp, &out_len);
     free(payload);
 
-    if (func_handle != 0)
-        g_registered_functions[idx].server_handle = func_handle;
-    return func_handle;
+    if (resp.h != 0) {
+        g_registered_functions[idx].server_handle = resp.h;
+        g_registered_functions[idx].param_size = resp.ps;
+        if (g_verbose)
+            fprintf(stderr, "[chidori] Registered '%s' handle=0x%llx param_size=%d\n",
+                    g_registered_functions[idx].deviceName,
+                    (unsigned long long)resp.h, resp.ps);
+    }
+    return resp.h;
 }
 
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem, cudaStream_t stream) {
-    /* Look up the function — lazily register on first use */
+    /* Look up function and its param_size (set during lazy registration) */
     uint64_t func_handle = 0;
+    int32_t param_size = 0;
     for (int i = 0; i < g_registered_function_count; i++) {
         if (g_registered_functions[i].hostFun == func) {
             func_handle = lazy_register_function(i);
+            param_size = g_registered_functions[i].param_size;
             break;
         }
     }
@@ -3592,22 +3602,15 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
         return cudaErrorInvalidDeviceFunction;
     }
 
+    if (args == NULL) param_size = 0;
+
     /*
-     * Kernel parameter serialization.
-     *
-     * args is an array of pointers to each kernel argument. We don't know the
-     * count or sizes without kernel metadata. Rather than query the server
-     * (extra round-trip), we pack a conservative buffer of 256 bytes
-     * (covers up to 32 pointer-sized args). The server will use
-     * cuFuncGetAttribute(PARAM_SIZE) to know how many bytes to actually pass.
+     * We know the exact param_size from the server (returned during
+     * __cudaRegisterFunction). Pack exactly that many bytes from args[].
+     * Each args[i] points to a kernel argument value. We copy 8 bytes
+     * per arg (covers pointers, int64, double; smaller types are padded).
+     * We send the EXACT param_size the server reported.
      */
-    /*
-     * We send a fixed 256-byte parameter buffer. The server will query the
-     * actual param size and only use what it needs. We safely copy args
-     * entries until we either fill the buffer, hit a NULL, or exhaust
-     * a reasonable max count.
-     */
-    int32_t param_size = (args != NULL) ? 256 : 0;
 
     if (g_verbose)
         fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) param_size=%d\n",
@@ -3616,33 +3619,17 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                 blockDim.x, blockDim.y, blockDim.z,
                 param_size);
 
-    /*
-     * Build launch payload:
-     *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
-     *   + blockX(4) + blockY(4) + blockZ(4)
-     *   + sharedMem(4) + stream_handle(8) = 44 bytes
-     *   + has_params(1) + [buffer_size(4) + buffer_data(param_size)]
-     */
     size_t payload_len = 44 + 1;
     uint8_t *param_buf = NULL;
 
     if (param_size > 0 && args != NULL) {
         param_buf = (uint8_t *)calloc(1, param_size);
-        /*
-         * Each args[i] is a pointer to the value of kernel parameter i.
-         * We dereference each pointer and copy 8 bytes (largest scalar/pointer size).
-         * We stop when we've filled the buffer or hit a NULL pointer.
-         * Use signal-safe reads: check each pointer before dereferencing.
-         */
+        /* Pack exactly param_size bytes. Number of args = param_size / 8 */
+        int num_args = param_size / 8;
         int offset = 0;
-        for (int i = 0; i < 32 && offset < param_size; i++) {
-            void *argp = args[i];
-            if (argp == NULL) break;
-            int copy_size = 8;
-            if (offset + copy_size > param_size)
-                copy_size = param_size - offset;
-            memcpy(param_buf + offset, argp, copy_size);
-            offset += copy_size;
+        for (int i = 0; i < num_args && offset < param_size; i++) {
+            memcpy(param_buf + offset, args[i], 8);
+            offset += 8;
         }
         payload_len += 4 + param_size;
     }

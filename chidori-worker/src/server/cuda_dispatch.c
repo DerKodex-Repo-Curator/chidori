@@ -1298,7 +1298,16 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
             hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)func);
-            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+            /* Return func_handle(8) + param_size(4) so client knows exact arg buffer size */
+            int param_sz = 0;
+            cuFuncGetAttribute(&param_sz, (CUfunction_attribute)74, func); /* PARAM_SIZE */
+            struct __attribute__((packed)) { uint64_t h; int32_t ps; } resp;
+            resp.h = handle;
+            resp.ps = param_sz;
+            if (s_verbose)
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction '%s' -> handle=0x%llx param_size=%d\n",
+                        func_name, (unsigned long long)handle, param_sz);
+            return chidori_send_response(fd, req->seq_num, res, &resp, sizeof(resp));
         }
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
