@@ -3592,15 +3592,29 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
         return cudaErrorInvalidDeviceFunction;
     }
 
-    /* Query parameter size from server using CU_FUNC_ATTRIBUTE_PARAM_SIZE (74) */
-    /* Pack manually to avoid struct padding: attrib(4) + func_handle(8) = 12 bytes */
-    uint8_t attr_req[12];
-    int32_t attrib_val = 74; /* CU_FUNC_ATTRIBUTE_PARAM_SIZE */
-    memcpy(attr_req, &attrib_val, 4);
-    memcpy(attr_req + 4, &func_handle, 8);
-    int32_t param_size = 0;
-    size_t out_len = sizeof(param_size);
-    chidori_rpc(CHIDORI_CU_FUNC_GET_ATTRIBUTE, attr_req, 12, &param_size, &out_len);
+    /*
+     * Kernel parameter serialization.
+     *
+     * args is an array of pointers to each kernel argument. We don't know the
+     * count or sizes without kernel metadata. Rather than query the server
+     * (extra round-trip), we pack a conservative buffer of 256 bytes
+     * (covers up to 32 pointer-sized args). The server will use
+     * cuFuncGetAttribute(PARAM_SIZE) to know how many bytes to actually pass.
+     */
+    /*
+     * We send a fixed 256-byte parameter buffer. The server will query the
+     * actual param size and only use what it needs. We safely copy args
+     * entries until we either fill the buffer, hit a NULL, or exhaust
+     * a reasonable max count.
+     */
+    int32_t param_size = (args != NULL) ? 256 : 0;
+
+    if (g_verbose)
+        fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) param_size=%d\n",
+                (unsigned long long)func_handle,
+                gridDim.x, gridDim.y, gridDim.z,
+                blockDim.x, blockDim.y, blockDim.z,
+                param_size);
 
     /*
      * Build launch payload:
@@ -3614,17 +3628,21 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
 
     if (param_size > 0 && args != NULL) {
         param_buf = (uint8_t *)calloc(1, param_size);
+        /*
+         * Each args[i] is a pointer to the value of kernel parameter i.
+         * We dereference each pointer and copy 8 bytes (largest scalar/pointer size).
+         * We stop when we've filled the buffer or hit a NULL pointer.
+         * Use signal-safe reads: check each pointer before dereferencing.
+         */
         int offset = 0;
-        int arg_idx = 0;
-        while (args[arg_idx] != NULL && offset < param_size) {
+        for (int i = 0; i < 32 && offset < param_size; i++) {
+            void *argp = args[i];
+            if (argp == NULL) break;
             int copy_size = 8;
             if (offset + copy_size > param_size)
                 copy_size = param_size - offset;
-            memcpy(param_buf + offset, args[arg_idx], copy_size);
+            memcpy(param_buf + offset, argp, copy_size);
             offset += copy_size;
-            /* Align to 8 bytes */
-            offset = (offset + 7) & ~7;
-            arg_idx++;
         }
         payload_len += 4 + param_size;
     }

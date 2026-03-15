@@ -665,7 +665,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
                 if (buf_size > 0 && remaining >= buf_size) {
                     void *param_buffer = p;
-                    size_t param_size = (size_t)buf_size;
+
+                    /* Use actual kernel param size, not client buffer size */
+                    int actual_ps = 0;
+                    cuFuncGetAttribute(&actual_ps, (CUfunction_attribute)74, func); /* PARAM_SIZE */
+                    size_t param_size = (actual_ps > 0) ? (size_t)actual_ps : (size_t)buf_size;
 
                     void *extra[] = {
                         CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
@@ -1352,7 +1356,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
                 if (buf_size > 0 && remaining >= buf_size) {
                     void *param_buffer = p;
-                    size_t param_size = (size_t)buf_size;
+
+                    /* Use actual kernel param size, not client buffer size */
+                    int actual_ps = 0;
+                    cuFuncGetAttribute(&actual_ps, (CUfunction_attribute)74, func); /* PARAM_SIZE */
+                    size_t param_size = (actual_ps > 0) ? (size_t)actual_ps : (size_t)buf_size;
 
                     void *extra[] = {
                         CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
