@@ -15,11 +15,9 @@ PCIBUS_ARG=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
 
-# Build if needed
-if [ ! -f "$BUILD_DIR/juice-gpu-worker" ]; then
-    echo "Building gpu-worker..."
-    make -C "$SCRIPT_DIR/.." server
-fi
+# Always rebuild to ensure correct architecture
+echo "Building gpu-worker..."
+make -C "$SCRIPT_DIR/.." server
 
 # Kill any existing worker
 pkill -f "juice-gpu-worker.*standalone" 2>/dev/null || true

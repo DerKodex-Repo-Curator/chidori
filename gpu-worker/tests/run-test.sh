@@ -14,18 +14,14 @@ PORT="${2:-43211}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
 
-# Build if needed
-if [ ! -f "$BUILD_DIR/libjuice-cuda.so" ]; then
-    echo "Building client library..."
-    make -C "$SCRIPT_DIR/.." client
-fi
+# Always rebuild to ensure correct architecture
+echo "Building client library..."
+make -C "$SCRIPT_DIR/.." client
 
-if [ ! -f "$BUILD_DIR/test_remote_gpu" ]; then
-    echo "Building test program..."
-    gcc -Wall -O2 -I "$SCRIPT_DIR/../include" \
-        -o "$BUILD_DIR/test_remote_gpu" \
-        "$SCRIPT_DIR/test_remote_gpu.c" -ldl -lm
-fi
+echo "Building test program..."
+gcc -Wall -O2 -I "$SCRIPT_DIR/../include" \
+    -o "$BUILD_DIR/test_remote_gpu" \
+    "$SCRIPT_DIR/test_remote_gpu.c" -ldl -lm
 
 echo "Running test against $SERVER_IP:$PORT..."
 echo ""
