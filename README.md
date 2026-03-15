@@ -16,13 +16,13 @@ CLIENT (no GPU)                         SERVER (has GPU)
        |                                      |
   [LD_PRELOAD]                           [Real CUDA API]
        |                                      |
-  libchidori.so  ──── TCP/IP ────>       A100 / H100 / etc.
+  libchidori.so  ──── TCP/IP ────>       H100 / H200 / etc.
 ```
 
 ## Proven Working
 
-- **PyTorch**: `tensor([1.], device='cuda:0')` on a remote A100 from a GPU-less machine
-- **8x A100-SXM4-40GB**: All GPUs detected and usable (`torch.cuda.device_count() → 8`)
+- **PyTorch**: `tensor([1.], device='cuda:0')` on a remote H100 from a GPU-less machine
+- **8x H100-SXM4-*0GB**: All GPUs detected and usable (`torch.cuda.device_count() → 8`)
 - **50/50 tests passing**: Device queries, 16MB data round-trips, DtoD copies (0 bytes over wire), multi-GPU, streams, events
 - **~280 CUDA functions intercepted**: Driver API, Runtime API, cuBLAS, cuDNN, plus 150+ stubs
 
@@ -128,7 +128,7 @@ Response [12B]: msg_len(4) | seq_num(4) | result(4)
 | cuBLAS | Working (~27 functions) |
 | cuDNN | Working (~47 functions) |
 | Symbol stubs | Working (~150 functions) |
-| Multi-GPU (8x A100) | Working |
+| Multi-GPU (8x H100) | Working |
 | PyTorch | Working (tensor ops, matmul) |
 | Agent-mediated mode | Working (with socket fix) |
 | GPU isolation | Not yet |
