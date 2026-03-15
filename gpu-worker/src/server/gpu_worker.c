@@ -18,6 +18,8 @@
 #include <getopt.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "juice_protocol.h"
 
@@ -58,6 +60,15 @@ static void parse_args(int argc, char **argv, worker_config_t *cfg) {
         case 'g': break; /* log_group: ignored */
         }
     }
+
+    /*
+     * Go's exec.Cmd.ExtraFiles maps files to fd 3, 4, 5, ... in the child.
+     * The --ipc_write and --ipc_read args contain the PARENT's fd numbers,
+     * but in the child they're always fd 3 (first ExtraFile) and fd 4 (second).
+     * Override with the correct child fd numbers.
+     */
+    cfg->ipc_write_fd = 3;  /* ch1Write = first ExtraFile */
+    cfg->ipc_read_fd = 4;   /* ch2Read = second ExtraFile */
 }
 
 /*
@@ -137,22 +148,77 @@ static int dispatch_loop(int client_fd) {
     return 0;
 }
 
+/*
+ * Standalone TCP server mode: listen on a port and accept direct connections.
+ * Used for testing without the Juice agent.
+ */
+static int standalone_mode(const char *pcibus, int port) {
+    fprintf(stderr, "[juice-gpu-worker] Standalone mode on port %d\n", port);
+
+    if (cuda_dispatch_init(pcibus) != 0) {
+        fprintf(stderr, "[juice-gpu-worker] Failed to initialize CUDA\n");
+        return 1;
+    }
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return 1; }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); return 1;
+    }
+    if (listen(server_fd, 5) < 0) { perror("listen"); return 1; }
+
+    fprintf(stderr, "[juice-gpu-worker] Listening on port %d\n", port);
+
+    for (;;) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) { perror("accept"); break; }
+
+        int flag = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+        fprintf(stderr, "[juice-gpu-worker] Client connected (fd=%d)\n", client_fd);
+        dispatch_loop(client_fd);
+        fprintf(stderr, "[juice-gpu-worker] Client disconnected\n");
+    }
+
+    close(server_fd);
+    cuda_dispatch_shutdown();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     worker_config_t cfg;
     parse_args(argc, argv, &cfg);
+
+    /* Check for standalone mode: --standalone <port> */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--standalone") == 0 && i + 1 < argc) {
+            int port = atoi(argv[i + 1]);
+            return standalone_mode(cfg.pcibus, port > 0 ? port : 43211);
+        }
+    }
 
     fprintf(stderr, "[juice-gpu-worker] Starting session=%s pcibus=%s\n",
             cfg.session_id, cfg.pcibus);
     fprintf(stderr, "[juice-gpu-worker] IPC write_fd=%d read_fd=%d\n",
             cfg.ipc_write_fd, cfg.ipc_read_fd);
 
-    /* Initialize real CUDA on the assigned GPU */
-    if (cuda_dispatch_init(cfg.pcibus) != 0) {
-        fprintf(stderr, "[juice-gpu-worker] Failed to initialize CUDA\n");
-        return 1;
-    }
+    /* Serve client connections forwarded by the Agent.
+     * CUDA initialization is deferred until after the first socket is received,
+     * because cuInit() can take several seconds and the agent's context
+     * would time out if we blocked here.
+     */
+    int cuda_initialized = 0;
 
-    /* Serve client connections forwarded by the Agent */
     for (;;) {
         int client_fd = receive_socket_from_agent(cfg.ipc_read_fd);
         if (client_fd < 0) {
@@ -162,7 +228,7 @@ int main(int argc, char **argv) {
 
         fprintf(stderr, "[juice-gpu-worker] Received client socket fd=%d\n", client_fd);
 
-        /* Signal readiness to Agent */
+        /* Signal readiness to Agent IMMEDIATELY (before CUDA init) */
         char ready = 1;
         if (write(cfg.ipc_write_fd, &ready, 1) != 1) {
             perror("[juice-gpu-worker] write ready");
@@ -174,6 +240,16 @@ int main(int argc, char **argv) {
         char confirm;
         if (read(cfg.ipc_read_fd, &confirm, 1) != 1) {
             fprintf(stderr, "[juice-gpu-worker] Agent confirmation read failed\n");
+        }
+
+        /* Lazy CUDA init on first connection */
+        if (!cuda_initialized) {
+            if (cuda_dispatch_init(cfg.pcibus) != 0) {
+                fprintf(stderr, "[juice-gpu-worker] Failed to initialize CUDA\n");
+                close(client_fd);
+                break;
+            }
+            cuda_initialized = 1;
         }
 
         dispatch_loop(client_fd);

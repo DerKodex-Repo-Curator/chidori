@@ -86,6 +86,13 @@ func (connection *Connection) Start(group task.Group, exitCode chan int) error {
 
 					inheritFiles(connection.cmd, ch1Write, ch2Read)
 
+					// Capture gpu-worker stderr for debugging
+					workerLog, logErr := os.Create(filepath.Join(logsPath, logName+".stderr"))
+					if logErr == nil {
+						connection.cmd.Stderr = workerLog
+						defer workerLog.Close()
+					}
+
 					err = connection.cmd.Start()
 					if err == nil {
 						group.GoFn(fmt.Sprintf("connection %s", connection.Id), func(g task.Group) error {
@@ -149,8 +156,12 @@ func (connection *Connection) Connect(c net.Conn) error {
 		}
 	}
 
-	err = errors.Join(err, c.Close())
+	// NOTE: Do NOT close the hijacked connection here.
+	// The socket fd has been forwarded to juice-gpu-worker via SCM_RIGHTS.
+	// Closing it here would send TCP FIN/RST to the remote client.
+	// Let the gpu-worker own the socket lifetime.
 	if err != nil {
+		errors.Join(err, c.Close())
 		err = errors.Newf("connection %s failed to connect", connection.Id).Wrap(err)
 	}
 

@@ -10,7 +10,6 @@ import (
 	"os"
 
 	"github.com/Juice-Labs/Juice-Labs/cmd/agent/app"
-	"github.com/Juice-Labs/Juice-Labs/cmd/agent/playnite"
 	"github.com/Juice-Labs/Juice-Labs/cmd/agent/prometheus"
 	"github.com/Juice-Labs/Juice-Labs/cmd/internal/build"
 	"github.com/Juice-Labs/Juice-Labs/pkg/appmain"
@@ -72,13 +71,6 @@ func main() {
 
 		agent, err := app.NewAgent(group.Ctx(), tlsConfig)
 		if err == nil {
-			consumer, err_ := playnite.NewGpuMetricsConsumer(agent)
-			err = err_
-			if err != nil {
-				logger.Warning(err)
-			}
-
-			agent.GpuMetricsProvider.AddConsumer(consumer)
 			agent.GpuMetricsProvider.AddConsumer(prometheus.NewGpuMetricsConsumer())
 
 			err = agent.ConnectToController(group, tlsConfig)

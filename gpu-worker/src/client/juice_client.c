@@ -51,46 +51,41 @@ static int g_initialized = 0;
  * Parses JUICE_CFG_OVERRIDE for server address, or falls back to
  * connecting to the Agent's address directly.
  */
-static int juice_connect(void) {
-    if (g_server_fd >= 0)
-        return 0;
+/*
+ * Extract a JSON string value by key (minimal parser).
+ * Returns pointer to malloc'd string or NULL.
+ */
+static char *json_get_string(const char *json, const char *key) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\":\"", key);
+    const char *start = strstr(json, search);
+    if (!start) return NULL;
+    start += strlen(search);
+    const char *end = strchr(start, '"');
+    if (!end) return NULL;
+    size_t len = (size_t)(end - start);
+    char *val = (char *)malloc(len + 1);
+    memcpy(val, start, len);
+    val[len] = '\0';
+    return val;
+}
 
-    /* Read configuration from environment */
-    const char *cfg = getenv("JUICE_CFG_OVERRIDE");
-    const char *host = "127.0.0.1";
-    int port = 43210;
+static char *json_get_array_first(const char *json, const char *key) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\":[\"", key);
+    const char *start = strstr(json, search);
+    if (!start) return NULL;
+    start += strlen(search);
+    const char *end = strchr(start, '"');
+    if (!end) return NULL;
+    size_t len = (size_t)(end - start);
+    char *val = (char *)malloc(len + 1);
+    memcpy(val, start, len);
+    val[len] = '\0';
+    return val;
+}
 
-    if (cfg != NULL) {
-        /*
-         * JUICE_CFG_OVERRIDE is a JSON string like:
-         * {"id":"...","servers":["host:port"],...}
-         *
-         * For now, do minimal parsing to extract the first server address.
-         * TODO: Use a proper JSON parser.
-         */
-        const char *servers = strstr(cfg, "\"servers\":[\"");
-        if (servers) {
-            servers += strlen("\"servers\":[\"");
-            char addr_buf[256];
-            int i = 0;
-            while (*servers && *servers != '"' && i < (int)sizeof(addr_buf) - 1) {
-                addr_buf[i++] = *servers++;
-            }
-            addr_buf[i] = '\0';
-
-            /* Split host:port */
-            char *colon = strrchr(addr_buf, ':');
-            if (colon) {
-                *colon = '\0';
-                host = strdup(addr_buf);
-                port = atoi(colon + 1);
-            }
-        }
-    }
-
-    fprintf(stderr, "[juice-cuda] Connecting to %s:%d\n", host, port);
-
-    /* Resolve and connect */
+static int tcp_connect(const char *host, int port) {
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -100,31 +95,123 @@ static int juice_connect(void) {
 
     int rc = getaddrinfo(host, port_str, &hints, &res);
     if (rc != 0) {
-        fprintf(stderr, "[juice-cuda] getaddrinfo: %s\n", gai_strerror(rc));
+        fprintf(stderr, "[juice-cuda] getaddrinfo(%s): %s\n", host, gai_strerror(rc));
         return -1;
     }
 
-    g_server_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (g_server_fd < 0) {
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
         perror("[juice-cuda] socket");
         freeaddrinfo(res);
         return -1;
     }
 
-    /* TCP_NODELAY for low latency */
     int flag = 1;
-    setsockopt(g_server_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-    if (connect(g_server_fd, res->ai_addr, res->ai_addrlen) < 0) {
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         perror("[juice-cuda] connect");
-        close(g_server_fd);
-        g_server_fd = -1;
+        close(fd);
         freeaddrinfo(res);
         return -1;
     }
 
     freeaddrinfo(res);
-    fprintf(stderr, "[juice-cuda] Connected to GPU worker\n");
+    return fd;
+}
+
+static int juice_connect(void) {
+    if (g_server_fd >= 0)
+        return 0;
+
+    const char *cfg = getenv("JUICE_CFG_OVERRIDE");
+    if (!cfg) {
+        fprintf(stderr, "[juice-cuda] JUICE_CFG_OVERRIDE not set\n");
+        return -1;
+    }
+
+    /* Parse session ID and server address from config */
+    char *session_id = json_get_string(cfg, "id");
+    char *server = json_get_array_first(cfg, "servers");
+
+    if (!session_id || !server) {
+        fprintf(stderr, "[juice-cuda] Missing id or servers in config\n");
+        free(session_id);
+        free(server);
+        return -1;
+    }
+
+    /* Split host:port */
+    char host[256] = "127.0.0.1";
+    int port = 43210;
+    char *colon = strrchr(server, ':');
+    if (colon) {
+        *colon = '\0';
+        strncpy(host, server, sizeof(host) - 1);
+        port = atoi(colon + 1);
+    } else {
+        strncpy(host, server, sizeof(host) - 1);
+    }
+
+    /*
+     * Check if JUICE_DIRECT_CONNECT is set — if so, connect directly to
+     * juice-gpu-worker's standalone TCP port (no HTTP/agent middleman).
+     */
+    const char *direct = getenv("JUICE_DIRECT_CONNECT");
+
+    if (direct && direct[0] == '1') {
+        /* Direct TCP connection to gpu-worker standalone mode */
+        fprintf(stderr, "[juice-cuda] Direct connect to gpu-worker at %s:%d\n", host, port);
+
+        g_server_fd = tcp_connect(host, port);
+        if (g_server_fd < 0) {
+            free(session_id);
+            free(server);
+            return -1;
+        }
+
+        fprintf(stderr, "[juice-cuda] Connected directly to GPU worker\n");
+    } else {
+        /* Agent-mediated connection via HTTP session protocol */
+        fprintf(stderr, "[juice-cuda] Connecting to agent at %s:%d (session %s)\n",
+                host, port, session_id);
+
+        g_server_fd = tcp_connect(host, port);
+        if (g_server_fd < 0) {
+            free(session_id);
+            free(server);
+            return -1;
+        }
+
+        char http_req[2048];
+        const char *body = "{\"id\":\"conn-1\",\"pid\":\"0\",\"processName\":\"juice-client\"}";
+        int body_len = (int)strlen(body);
+
+        int req_len = snprintf(http_req, sizeof(http_req),
+            "POST /v1/connect/session/%s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: Upgrade\r\n"
+            "\r\n"
+            "%s",
+            session_id, host, port, body_len, body);
+
+        if (juice_write_full(g_server_fd, http_req, (size_t)req_len) != 0) {
+            fprintf(stderr, "[juice-cuda] Failed to send HTTP connect request\n");
+            close(g_server_fd);
+            g_server_fd = -1;
+            free(session_id);
+            free(server);
+            return -1;
+        }
+
+        usleep(6000000); /* Wait for agent + CUDA init */
+        fprintf(stderr, "[juice-cuda] Connected to remote GPU (session %s)\n", session_id);
+    }
+
+    free(session_id);
+    free(server);
     return 0;
 }
 
