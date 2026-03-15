@@ -1,6 +1,10 @@
-# Chidori ⚡ — GPU-over-IP
+<p align="center">
+  <img src="assets/chidori-logo.png" width="400" alt="Chidori">
+</p>
 
-Transparent remote GPU access for CUDA compute workloads over TCP/IP.
+<h1 align="center">Chidori ⚡ — GPU-over-IP</h1>
+
+<p align="center">Transparent remote GPU access for CUDA compute workloads over TCP/IP.</p>
 
 Run any CUDA application on a machine with **no GPU** — Chidori intercepts CUDA API calls via `LD_PRELOAD` and forwards them to a remote GPU server over the network. The application doesn't know the GPU is remote.
 
