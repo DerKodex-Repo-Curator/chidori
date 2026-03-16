@@ -1397,7 +1397,7 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
     req.C = (uint64_t)(uintptr_t)C;
     req.ldc = ldc;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SGEMM, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMM, &req, sizeof(req));
 }
 
 /*
@@ -1440,7 +1440,7 @@ cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
     req.C = (uint64_t)(uintptr_t)C;
     req.ldc = ldc;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DGEMM, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DGEMM, &req, sizeof(req));
 }
 
 /*
@@ -1525,7 +1525,7 @@ cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
     req.C = (uint64_t)(uintptr_t)C;
     req.Ctype = Ctype; req.ldc = ldc;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SGEMM_EX, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMM_EX, &req, sizeof(req));
 }
 
 /*
@@ -2020,7 +2020,7 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
     req.strideC = (int64_t)strideC;
     req.batchCount = batchCount;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SGEMM_STRIDED_BATCHED, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMM_STRIDED_BATCHED, &req, sizeof(req));
 }
 
 /*
