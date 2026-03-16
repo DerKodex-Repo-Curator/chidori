@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "chidori_protocol.h"
 
@@ -118,6 +119,21 @@ static int tcp_connect(const char *host, int port) {
     }
 
     freeaddrinfo(res);
+
+    /* Move fd to a high number to avoid PyTorch/cuBLAS closing it.
+     * Low fds (3, 4, 5) get reused and closed by CUDA runtime internals. */
+    int high_fd = dup(fd);
+    if (high_fd >= 0) {
+        close(fd);
+        fd = high_fd;
+        /* Try to get an even higher fd */
+        int higher = fcntl(fd, F_DUPFD, 500);
+        if (higher >= 0) {
+            close(fd);
+            fd = higher;
+        }
+    }
+    fprintf(stderr, "[chidori] Socket fd=%d\n", fd);
 
     /* TCP keepalive to detect dead connections */
     int keepalive = 1;
