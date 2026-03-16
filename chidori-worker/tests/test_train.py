@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chidori ⚡ — SPIKE THE GPU"""
+"""Chidori ⚡ — Proper GPU workflow: LOAD → COMPUTE → READ"""
 import torch
 import time
 
@@ -7,30 +7,59 @@ torch._C._cuda_init()
 print(f"Device: {torch.cuda.get_device_name(0)}")
 print("=" * 60)
 
-# Allocate big matrices
 N = 4096
-print(f"Allocating {N}x{N} matrices ({N*N*4/1e6:.0f} MB each)...")
+ITERS = 200
+
+# ============================================================
+# LOAD PHASE — upload everything to GPU, accept the latency
+# ============================================================
+print(f"\n[LOAD] Uploading {N}x{N} matrices to GPU...")
+t0 = time.time()
 a = torch.randn(N, N).cuda()
 b = torch.randn(N, N).cuda()
+c = torch.zeros(N, N).cuda()
+torch.cuda.synchronize()
+load_dt = time.time() - t0
+print(f"[LOAD] Done: {load_dt:.1f}s ({N*N*4*3/1e6:.0f} MB transferred)")
 
-# Warm up
+# ============================================================
+# COMPUTE PHASE — burst matmuls, GPU should stay busy
+# ============================================================
+print(f"\n[COMPUTE] {ITERS}x mm({N}x{N}) — ALL data already on GPU")
+print("[COMPUTE] Watch nvidia-smi NOW...")
+
+# Warmup
 c = torch.mm(a, b)
 torch.cuda.synchronize()
-print("Warmup done")
 
-# Burst: 100 matmuls back to back
-print(f"\n100x mm({N}x{N}) — watch nvidia-smi...")
 t0 = time.time()
-for i in range(100):
+for i in range(ITERS):
     c = torch.mm(a, b)
+# Single sync at the end — GPU processes entire queue
 torch.cuda.synchronize()
-dt = time.time() - t0
+compute_dt = time.time() - t0
 
-flops = 2 * N * N * N * 100
-tflops = flops / dt / 1e12
-print(f"Time: {dt:.2f}s — {tflops:.2f} TFLOPS")
-print(f"Sum: {c.cpu().sum().item():.2f}")
+flops = 2 * N * N * N * ITERS
+tflops = flops / compute_dt / 1e12
+print(f"[COMPUTE] Done: {compute_dt:.2f}s — {tflops:.2f} TFLOPS")
+print(f"[COMPUTE] {ITERS/compute_dt:.0f} matmuls/s")
 
-print("\n" + "=" * 60)
-print("DONE")
-print("=" * 60)
+# ============================================================
+# READ PHASE — pull back one result
+# ============================================================
+print(f"\n[READ] Downloading result...")
+t0 = time.time()
+result = c.cpu()
+read_dt = time.time() - t0
+print(f"[READ] Done: {read_dt:.1f}s")
+print(f"[READ] Sum: {result.sum().item():.2f}")
+
+# ============================================================
+# Summary
+# ============================================================
+print(f"\n{'='*60}")
+print(f"LOAD:    {load_dt:.1f}s (network transfer)")
+print(f"COMPUTE: {compute_dt:.2f}s ({tflops:.2f} TFLOPS, {ITERS} matmuls)")
+print(f"READ:    {read_dt:.1f}s (network transfer)")
+print(f"TOTAL:   {load_dt + compute_dt + read_dt:.1f}s")
+print(f"{'='*60}")
