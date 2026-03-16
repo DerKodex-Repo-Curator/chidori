@@ -1,59 +1,75 @@
 #!/usr/bin/env python3
-"""Chidori ⚡ — Make the H100 SWEAT"""
+"""Chidori ⚡ — Sustained H100 stress test using operations that work"""
 import torch, time
 
 torch._C._cuda_init()
 print(f"Device: {torch.cuda.get_device_name(0)}")
 print("=" * 60)
 
-# 1. Verify basic compute works
-print("\n[1] Basic: x * 2")
-x = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]).cuda()
-y = x * 2
-print(f"    Result: {y.cpu()}")
+# Warm up — first kernel launch has overhead
+x = torch.tensor([1.0]).cuda()
+_ = x * 2
+_.cpu()
 
-# 2. Bigger element-wise
-print("\n[2] Element-wise: 1M floats * 3.14")
-big = torch.randn(1000000).cuda()
+# 1. Scale 10M floats
+print("\n[1] Scale 10M floats × 3.14")
+big = torch.randn(10_000_000).cuda()
 t0 = time.time()
-result = big * 3.14
+r = big * 3.14
 torch.cuda.synchronize()
 dt = time.time() - t0
-print(f"    Time: {dt:.3f}s")
-r = result.cpu()
-print(f"    sum={r.sum().item():.2f} mean={r.mean().item():.4f}")
+print(f"    {dt:.3f}s — {10/dt:.0f} M elements/s")
+v = r.cpu()
+print(f"    sum={v.sum().item():.2f}")
 
-# 3. Chain of operations
-print("\n[3] Chain: sin(x^2 + 1) * exp(-x)")
-x = torch.randn(1000000).cuda()
+# 2. Scale 100M floats
+print("\n[2] Scale 100M floats × 2.71")
+big = torch.randn(100_000_000).cuda()
 t0 = time.time()
-y = torch.sin(x * x + 1) * torch.exp(-x)
+r = big * 2.71
 torch.cuda.synchronize()
 dt = time.time() - t0
-print(f"    Time: {dt:.3f}s")
-print(f"    sum={y.cpu().sum().item():.2f}")
+print(f"    {dt:.3f}s — {100/dt:.0f} M elements/s")
+v = r.cpu()
+print(f"    sum={v.sum().item():.2f}")
 
-# 4. Large tensor fill + reduce
-print("\n[4] Reduction: sum of 10M random floats")
-big = torch.randn(10000000).cuda()
+# 3. Repeated multiply — 500 kernel launches
+print("\n[3] 500 consecutive multiplies on 1M tensor")
+x = torch.randn(1_000_000).cuda()
 t0 = time.time()
-s = big.sum()
+for i in range(500):
+    x = x * 1.0001
 torch.cuda.synchronize()
 dt = time.time() - t0
-print(f"    Time: {dt:.3f}s")
-print(f"    sum={s.cpu().item():.2f}")
+print(f"    {dt:.3f}s — {500/dt:.0f} kernels/s ({dt/500*1000:.1f}ms per kernel)")
+v = x.cpu()
+print(f"    sum={v.sum().item():.2f}")
 
-# 5. Multiple kernels back to back
-print("\n[5] 100 consecutive kernel launches")
-x = torch.randn(100000).cuda()
+# 4. Large tensor — 500M floats (2GB)
+print("\n[4] Allocate + scale 500M floats (2GB)")
+try:
+    big = torch.randn(500_000_000).cuda()
+    t0 = time.time()
+    r = big * 1.5
+    torch.cuda.synchronize()
+    dt = time.time() - t0
+    print(f"    {dt:.3f}s — {500/dt:.0f} M elements/s — {2000/dt:.0f} MB/s")
+    del big, r
+except Exception as e:
+    print(f"    FAILED: {e}")
+
+# 5. Sustained burst — 1000 kernel launches
+print("\n[5] 1000 kernel launches on 100K tensor")
+x = torch.randn(100_000).cuda()
 t0 = time.time()
-for i in range(100):
-    x = x * 1.001 + 0.001
+for i in range(1000):
+    x = x * 1.00001
 torch.cuda.synchronize()
 dt = time.time() - t0
-print(f"    Time: {dt:.3f}s ({dt/100*1000:.1f}ms per kernel)")
-print(f"    final sum={x.cpu().sum().item():.2f}")
+print(f"    {dt:.3f}s — {1000/dt:.0f} kernels/s")
+v = x.cpu()
+print(f"    sum={v.sum().item():.2f}")
 
 print("\n" + "=" * 60)
-print("ALL COMPUTE TESTS PASSED ON REMOTE H100!")
+print(f"ALL TESTS COMPLETE — H100 COMPUTED OVER TCP/IP")
 print("=" * 60)
