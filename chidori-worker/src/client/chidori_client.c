@@ -3595,7 +3595,7 @@ cudaError_t cudaEventQuery(void *event) {
  */
 
 /* Stored fat binary data (not yet sent to server) */
-#define MAX_FAT_BINARIES 256
+#define MAX_FAT_BINARIES 1024
 static struct {
     const void *data;       /* raw fat binary data pointer (lives in process memory) */
     uint64_t size;          /* fat binary size */
@@ -3604,7 +3604,7 @@ static struct {
 static int g_fat_binary_count = 0;
 
 /* Stored function registrations (not yet sent to server) */
-#define MAX_REGISTERED_FUNCTIONS 8192
+#define MAX_REGISTERED_FUNCTIONS 65536
 #define MAX_KERNEL_PARAMS 64
 static struct {
     const void *hostFun;        /* host function pointer (PyTorch's kernel ID) */
