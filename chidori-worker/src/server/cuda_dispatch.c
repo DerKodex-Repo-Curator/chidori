@@ -1403,9 +1403,15 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     void *param_buffer = p;
                     size_t param_size = (size_t)buf_size;
 
-                    if (s_verbose)
+                    if (s_verbose) {
                         fprintf(stderr, "[cuda_dispatch] LAUNCH grid=(%u,%u,%u) block=(%u,%u,%u) buf=%u\n",
                                 gridX, gridY, gridZ, blockX, blockY, blockZ, buf_size);
+                        /* Hex dump of parameter buffer */
+                        fprintf(stderr, "[cuda_dispatch] PARAMS: ");
+                        for (uint32_t bi = 0; bi < buf_size && bi < 64; bi++)
+                            fprintf(stderr, "%02x", ((uint8_t*)param_buffer)[bi]);
+                        fprintf(stderr, "\n");
+                    }
 
                     void *extra[] = {
                         CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
@@ -1419,8 +1425,13 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                                          shared, stream,
                                          NULL, extra);
 
-                    if (s_verbose)
+                    if (s_verbose) {
                         fprintf(stderr, "[cuda_dispatch] LAUNCH result=%d\n", res);
+                        /* Check for async errors */
+                        CUresult sync_res = cuCtxSynchronize();
+                        if (sync_res != CUDA_SUCCESS)
+                            fprintf(stderr, "[cuda_dispatch] POST-LAUNCH SYNC ERROR=%d\n", sync_res);
+                    }
 
                     return chidori_send_response(fd, req->seq_num, res, NULL, 0);
                 }
