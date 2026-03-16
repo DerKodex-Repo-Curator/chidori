@@ -298,7 +298,83 @@ static int chidori_connect(void) {
  * Thread-safe via mutex (simple approach; could use per-thread connections later).
  */
 static int g_verbose = -1; /* -1 = unchecked */
+static int g_pending_responses = 0; /* count of async responses not yet read */
 
+/*
+ * Flush all pending async responses from the socket.
+ * Must be called with g_lock held.
+ */
+static void chidori_flush_responses(void) {
+    char drain[4096];
+    while (g_pending_responses > 0 && g_server_fd >= 0) {
+        chidori_response_t resp;
+        if (chidori_recv_response(g_server_fd, &resp) != 0) {
+            /* Connection died — reset */
+            close(g_server_fd);
+            g_server_fd = -1;
+            g_pending_responses = 0;
+            return;
+        }
+        /* Drain any response payload */
+        size_t resp_payload = resp.msg_len - CHIDORI_RESPONSE_HEADER_SIZE;
+        while (resp_payload > 0) {
+            size_t chunk = resp_payload < sizeof(drain) ? resp_payload : sizeof(drain);
+            if (chidori_read_full(g_server_fd, drain, chunk) != 0) {
+                close(g_server_fd);
+                g_server_fd = -1;
+                g_pending_responses = 0;
+                return;
+            }
+            resp_payload -= chunk;
+        }
+        g_pending_responses--;
+    }
+}
+
+/*
+ * Async RPC: send request, DON'T wait for response.
+ * The response will be drained by the next sync RPC or explicit flush.
+ */
+static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t payload_len) {
+    if (g_verbose == -1) {
+        const char *v = getenv("CHIDORI_VERBOSE");
+        g_verbose = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (g_verbose)
+        fprintf(stderr, "[chidori-async] func=0x%04x payload=%zu\n", func_id, payload_len);
+
+    pthread_mutex_lock(&g_lock);
+
+    if (g_server_fd < 0) {
+        if (chidori_connect() != 0) {
+            pthread_mutex_unlock(&g_lock);
+            return CUDA_ERROR_NOT_INITIALIZED;
+        }
+    }
+
+    chidori_request_t req = {0};
+    req.func_id = func_id;
+    req.flags = CHIDORI_FLAG_ASYNC;
+    req.seq_num = ++g_seq_num;
+
+    if (chidori_send_request(g_server_fd, &req, payload, payload_len) != 0) {
+        fprintf(stderr, "[chidori] Async send failed func=0x%04x: %s\n", func_id, strerror(errno));
+        close(g_server_fd);
+        g_server_fd = -1;
+        g_pending_responses = 0;
+        pthread_mutex_unlock(&g_lock);
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+
+    g_pending_responses++;
+    pthread_mutex_unlock(&g_lock);
+    return CUDA_SUCCESS;
+}
+
+/*
+ * Synchronous RPC: send request, wait for response.
+ * Flushes any pending async responses first.
+ */
 static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payload_len,
                           void *out_payload, size_t *out_payload_len) {
     if (g_verbose == -1) {
@@ -306,9 +382,14 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
         g_verbose = (v && v[0] == '1') ? 1 : 0;
     }
     if (g_verbose)
-        fprintf(stderr, "[chidori-rpc] func=0x%04x payload=%zu\n", func_id, payload_len);
+        fprintf(stderr, "[chidori-rpc] func=0x%04x payload=%zu pending=%d\n",
+                func_id, payload_len, g_pending_responses);
 
     pthread_mutex_lock(&g_lock);
+
+    /* Flush pending async responses before sync call */
+    if (g_pending_responses > 0)
+        chidori_flush_responses();
 
     if (g_server_fd < 0) {
         if (chidori_connect() != 0) {
@@ -485,7 +566,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
 
 CUresult cuMemFree_v2(CUdeviceptr dptr) {
     uint64_t ptr = (uint64_t)dptr;
-    return chidori_rpc(CHIDORI_CU_MEM_FREE, &ptr, sizeof(ptr), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_MEM_FREE, &ptr, sizeof(ptr));
 }
 
 CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byteCount) {
@@ -499,7 +580,7 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byte
     memcpy((char *)payload + 8, &size64, 8);
     memcpy((char *)payload + 16, srcHost, byteCount);
 
-    CUresult r = chidori_rpc(CHIDORI_CU_MEMCPY_H_TO_D, payload, payload_len, NULL, NULL);
+    CUresult r = chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, payload, payload_len);
     free(payload);
     return r;
 }
@@ -519,7 +600,7 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t by
     req.dst = (uint64_t)dstDevice;
     req.src = (uint64_t)srcDevice;
     req.size = (uint64_t)byteCount;
-    return chidori_rpc(CHIDORI_CU_MEMCPY_D_TO_D, &req, sizeof(req), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_MEMCPY_D_TO_D, &req, sizeof(req));
 }
 
 CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
@@ -723,7 +804,7 @@ CUresult cuLaunchKernel(CUfunction f,
         memcpy(p, param_buffer, param_buffer_size);
     }
 
-    CUresult r = chidori_rpc(CHIDORI_CU_LAUNCH_KERNEL, payload, payload_len, NULL, NULL);
+    CUresult r = chidori_rpc_async(CHIDORI_CU_LAUNCH_KERNEL, payload, payload_len);
 
     free(payload);
     if (param_buffer_allocated) free(param_buffer);
@@ -3687,7 +3768,7 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
         memcpy(p, &has_params, 1);
     }
 
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_LAUNCH_KERNEL, payload, payload_len, NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_LAUNCH_KERNEL, payload, payload_len);
     free(payload);
     g_last_error = r;
     return r;
@@ -4415,7 +4496,7 @@ CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
     req.ptr = (uint64_t)dstDevice; req.value = (int32_t)uc; req.count = N;
-    return chidori_rpc(CHIDORI_CU_MEMSET_D8, &req, sizeof(req), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_MEMSET_D8, &req, sizeof(req));
 }
 
 CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream) {
@@ -4428,7 +4509,7 @@ CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
     req.ptr = (uint64_t)dstDevice; req.value = (int32_t)ui; req.count = N;
-    return chidori_rpc(CHIDORI_CU_MEMSET_D32, &req, sizeof(req), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_MEMSET_D32, &req, sizeof(req));
 }
 
 CUresult cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream hStream) {
