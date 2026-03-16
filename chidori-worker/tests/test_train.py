@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chidori ⚡ — FAT training loop — make the H100 sweat"""
+"""Chidori ⚡ — Heavy matmul training on remote GPU"""
 import torch
 import time
 
@@ -7,67 +7,65 @@ torch._C._cuda_init()
 print(f"Device: {torch.cuda.get_device_name(0)}")
 print("=" * 60)
 
-BATCH_SIZE = 4096
-DIM = 4096
-EPOCHS = 50
-lr = 0.00001
+# Test matmul at different scales
+for N in [64, 256, 1024, 2048]:
+    a = torch.randn(N, N).cuda()
+    b = torch.randn(N, N).cuda()
 
-# Big tensors on GPU
-W = (torch.randn(DIM, DIM) * 0.001).cuda()  # 4096x4096 = 64MB
+    # Warmup
+    c = torch.mm(a, b)
+
+    t0 = time.time()
+    for _ in range(10):
+        c = torch.mm(a, b)
+    dt = time.time() - t0
+
+    s = c.cpu().sum().item()
+    flops = 2 * N * N * N * 10
+    gflops = flops / dt / 1e9 if dt > 0 else 0
+    print(f"mm({N:4d}x{N:4d}): {dt:.3f}s  {gflops:.1f} GFLOPS  sum={s:.2f}")
+
+# Training loop with matmul
+print("\n--- Training with matmul ---")
+DIM = 512
+BATCH = 256
+EPOCHS = 50
+lr = 0.001
+
+W = (torch.randn(DIM, DIM) * 0.01).cuda()
 b = torch.zeros(DIM).cuda()
 
-mem_params = (W.nelement() + b.nelement()) * 4 / 1e6
-print(f"Weight matrix: {DIM}x{DIM} = {W.nelement():,} params ({mem_params:.0f} MB)")
-print(f"Batch={BATCH_SIZE}, Epochs={EPOCHS}")
-print()
-
 total_t0 = time.time()
-total_kernels = 0
-
 for epoch in range(EPOCHS):
-    t0 = time.time()
+    x = torch.randn(BATCH, DIM).cuda()
+    target = torch.mm(x, torch.eye(DIM).cuda() * 0.5)  # target: scale by 0.5
 
-    # Generate big batch on CPU, transfer to GPU (64MB)
-    x = torch.randn(BATCH_SIZE, DIM).cuda()
-    target = x * 0.5  # simple target: scale by 0.5
-
-    # Forward: y = x * W_diagonal (elementwise, treating W as diagonal)
-    # Use the diagonal of W as scaling factors
-    w_diag = W.sum(dim=0) * (1.0 / DIM)  # approximate diagonal
-    y = x * w_diag
+    # Forward
+    y = torch.mm(x, W) + b
 
     # Loss
     diff = y - target
-    loss_per_elem = diff * diff
-    loss = loss_per_elem.sum() * (1.0 / (BATCH_SIZE * DIM))
+    loss = (diff * diff).sum() * (1.0 / (BATCH * DIM))
 
     # Gradient
-    grad = diff * (2.0 / (BATCH_SIZE * DIM))
-    grad_w = (x * grad).sum(dim=0)
+    grad_W = torch.mm(x.t(), diff) * (2.0 / (BATCH * DIM))
+    grad_b = diff.sum(dim=0) * (2.0 / (BATCH * DIM))
 
-    # Clip gradient
-    grad_norm = (grad_w * grad_w).sum()
-    # Manual sqrt approximation: just scale down if too large
-    grad_w = grad_w * (lr / (grad_norm * 0.001 + 1.0))
+    # Update
+    W = W - grad_W * lr
+    b = b - grad_b * lr
 
-    # Update diagonal
-    w_update = grad_w.unsqueeze(0).expand(DIM, DIM) * (1.0 / DIM)
-    W = W - w_update
-
-    total_kernels += 12  # approximate kernels per epoch
-    dt = time.time() - t0
-
-    if epoch % 5 == 0 or epoch == EPOCHS - 1:
+    if epoch % 10 == 0 or epoch == EPOCHS - 1:
         l = loss.cpu().item()
-        print(f"  Epoch {epoch:3d}: loss={l:.6f}  ({dt:.2f}s/epoch, ~{12/dt:.0f} kernels/s)")
+        print(f"  Epoch {epoch:3d}: loss={l:.6f}")
 
 total_dt = time.time() - total_t0
+print(f"\nTraining: {total_dt:.1f}s ({EPOCHS/total_dt:.1f} epochs/s)")
 
-print()
-print(f"Training: {total_dt:.1f}s total ({EPOCHS/total_dt:.1f} epochs/s)")
-print(f"~{total_kernels} kernel launches, {total_kernels/total_dt:.0f} kernels/s")
-print(f"Data moved: ~{BATCH_SIZE * DIM * 4 * EPOCHS / 1e9:.1f} GB to GPU")
-print()
-print("=" * 60)
-print("FAT TRAINING ON REMOTE H100 COMPLETE")
+# Verify W converged to ~0.5 * I
+w_diag = torch.diag(W.cpu()).mean().item()
+print(f"W diagonal mean: {w_diag:.4f} (target: 0.5)")
+
+print("\n" + "=" * 60)
+print("DONE — REMOTE GPU MATMUL TRAINING COMPLETE")
 print("=" * 60)
