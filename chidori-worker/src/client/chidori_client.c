@@ -351,24 +351,30 @@ static void chidori_flush_responses(void) {
  * Async RPC: send request, DON'T wait for response.
  * The response will be drained by the next sync RPC or explicit flush.
  */
+static int g_cork_active = 0; /* TCP_CORK batching state */
+
 static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t payload_len) {
     if (g_verbose == -1) {
         const char *v = getenv("CHIDORI_VERBOSE");
         g_verbose = (v && v[0] == '1') ? 1 : 0;
     }
-    if (g_verbose)
-        fprintf(stderr, "[chidori-async] func=0x%04x payload=%zu pending=%d\n",
-                func_id, payload_len, g_pending_responses);
 
     pthread_mutex_lock(&g_lock);
-
-    fprintf(stderr, "[chidori-async] LOCKED fd=%d pending=%d\n", g_server_fd, g_pending_responses);
 
     if (g_server_fd < 0) {
         if (chidori_connect() != 0) {
             pthread_mutex_unlock(&g_lock);
             return CUDA_ERROR_NOT_INITIALIZED;
         }
+    }
+
+    /* Enable TCP_CORK to batch multiple async writes into one TCP segment */
+    if (!g_cork_active) {
+#ifdef TCP_CORK
+        int cork = 1;
+        setsockopt(g_server_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+        g_cork_active = 1;
     }
 
     chidori_request_t req = {0};
@@ -380,12 +386,11 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
         fprintf(stderr, "[chidori] Async send failed func=0x%04x: %s\n", func_id, strerror(errno));
         close(g_server_fd);
         fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
-        g_pending_responses = 0;
+        g_cork_active = 0;
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
     }
 
-    /* Server won't send a response for async requests — no pending to track */
     pthread_mutex_unlock(&g_lock);
     return CUDA_SUCCESS;
 }
@@ -406,7 +411,14 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
 
     pthread_mutex_lock(&g_lock);
 
-    fprintf(stderr, "[chidori-rpc] LOCKED fd=%d pending=%d\n", g_server_fd, g_pending_responses);
+    /* Uncork TCP to flush any batched async writes before sync call */
+    if (g_cork_active && g_server_fd >= 0) {
+#ifdef TCP_CORK
+        int cork = 0;
+        setsockopt(g_server_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+        g_cork_active = 0;
+    }
 
     /* Flush pending async responses before sync call */
     if (g_pending_responses > 0)
