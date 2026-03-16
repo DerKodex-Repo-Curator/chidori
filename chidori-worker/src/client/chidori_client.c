@@ -387,6 +387,8 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
 
     pthread_mutex_lock(&g_lock);
 
+    fprintf(stderr, "[chidori-rpc] LOCKED fd=%d pending=%d\n", g_server_fd, g_pending_responses);
+
     /* Flush pending async responses before sync call */
     if (g_pending_responses > 0)
         chidori_flush_responses();
