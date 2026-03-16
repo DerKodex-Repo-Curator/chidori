@@ -3524,12 +3524,15 @@ static int g_fat_binary_count = 0;
 
 /* Stored function registrations (not yet sent to server) */
 #define MAX_REGISTERED_FUNCTIONS 8192
+#define MAX_KERNEL_PARAMS 64
 static struct {
     const void *hostFun;        /* host function pointer (PyTorch's kernel ID) */
     int fat_binary_idx;         /* index into g_fat_binaries */
     char deviceName[256];       /* kernel name on device */
     uint64_t server_handle;     /* 0 = not yet registered on server */
-    int32_t param_size;         /* kernel parameter buffer size (from server) */
+    int32_t total_param_size;   /* total parameter buffer size */
+    int32_t num_params;         /* number of kernel parameters */
+    struct { int32_t offset; int32_t size; } params[MAX_KERNEL_PARAMS];
 } g_registered_functions[MAX_REGISTERED_FUNCTIONS];
 static int g_registered_function_count = 0;
 
@@ -3567,110 +3570,93 @@ static uint64_t lazy_register_function(int idx) {
     memcpy(payload, &mod_handle, 8);
     memcpy((char *)payload + 8, name, name_len);
 
-    /* Server returns: func_handle(8) + param_size(4) = 12 bytes */
-    struct __attribute__((packed)) { uint64_t h; int32_t ps; } resp = {0, 0};
-    size_t out_len = sizeof(resp);
-    chidori_rpc(CHIDORI_CUDA_REGISTER_FUNCTION, payload, payload_len, &resp, &out_len);
+    /*
+     * Server returns: func_handle(8) + total_param_size(4) + num_params(4)
+     *                 + [offset(4) + size(4)] × num_params
+     */
+    uint8_t resp_buf[8 + 4 + 4 + MAX_KERNEL_PARAMS * 8];
+    memset(resp_buf, 0, sizeof(resp_buf));
+    size_t out_len = sizeof(resp_buf);
+    chidori_rpc(CHIDORI_CUDA_REGISTER_FUNCTION, payload, payload_len, resp_buf, &out_len);
     free(payload);
 
-    if (resp.h != 0) {
-        g_registered_functions[idx].server_handle = resp.h;
-        g_registered_functions[idx].param_size = resp.ps;
-        if (g_verbose)
-            fprintf(stderr, "[chidori] Registered '%s' handle=0x%llx param_size=%d\n",
+    uint64_t func_h = 0;
+    memcpy(&func_h, resp_buf, 8);
+    if (func_h != 0) {
+        g_registered_functions[idx].server_handle = func_h;
+        memcpy(&g_registered_functions[idx].total_param_size, resp_buf + 8, 4);
+        memcpy(&g_registered_functions[idx].num_params, resp_buf + 12, 4);
+        int np = g_registered_functions[idx].num_params;
+        if (np > MAX_KERNEL_PARAMS) np = MAX_KERNEL_PARAMS;
+        for (int i = 0; i < np; i++) {
+            memcpy(&g_registered_functions[idx].params[i].offset, resp_buf + 16 + i * 8, 4);
+            memcpy(&g_registered_functions[idx].params[i].size, resp_buf + 16 + i * 8 + 4, 4);
+        }
+        if (g_verbose) {
+            fprintf(stderr, "[chidori] Registered '%s' handle=0x%llx params=%d total=%d\n",
                     g_registered_functions[idx].deviceName,
-                    (unsigned long long)resp.h, resp.ps);
+                    (unsigned long long)func_h, np,
+                    g_registered_functions[idx].total_param_size);
+            for (int i = 0; i < np; i++)
+                fprintf(stderr, "[chidori]   param[%d] offset=%d size=%d\n",
+                        i, g_registered_functions[idx].params[i].offset,
+                        g_registered_functions[idx].params[i].size);
+        }
     }
-    return resp.h;
+    return func_h;
 }
 
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem, cudaStream_t stream) {
-    /* Look up function and its param_size (set during lazy registration) */
+    /* Look up function (lazy register on first use) */
     uint64_t func_handle = 0;
-    int32_t param_size = 0;
+    int func_idx = -1;
     for (int i = 0; i < g_registered_function_count; i++) {
         if (g_registered_functions[i].hostFun == func) {
             func_handle = lazy_register_function(i);
-            param_size = g_registered_functions[i].param_size;
+            func_idx = i;
             break;
         }
     }
 
-    if (func_handle == 0) {
+    if (func_handle == 0 || func_idx < 0) {
         g_last_error = cudaErrorInvalidDeviceFunction;
         return cudaErrorInvalidDeviceFunction;
     }
 
-    if (args == NULL) param_size = 0;
+    int32_t total_ps = g_registered_functions[func_idx].total_param_size;
+    int32_t num_params = g_registered_functions[func_idx].num_params;
+    if (args == NULL) { total_ps = 0; num_params = 0; }
 
     /*
-     * Kernel parameter packing.
-     *
-     * args[] is an array of pointers where each points to a kernel argument.
-     * We DON'T know the exact count — CUDA provides no API for this.
-     * param_size from server is always 256 (fallback, attribute 74 doesn't exist).
-     *
-     * Strategy: send each arg as {size(4) + data(size)} so the server can
-     * reconstruct void** kernelParams. We count args by checking if args[i]
-     * looks like a valid pointer (non-NULL, aligned). Cap at 16 args max
-     * (PyTorch kernels rarely have more than 10).
-     *
-     * The server then passes kernelParams (not extra buffer) to cuLaunchKernel.
+     * Pack kernel parameters using EXACT layout from cuFuncGetParamInfo.
+     * Each param has a known offset and size in the contiguous buffer.
+     * args[i] points to the value of parameter i.
+     * We copy args[i] (size bytes) into param_buf at the correct offset.
      */
-
-    /*
-     * CONTIGUOUS BUFFER APPROACH:
-     * args[0], args[1], ... point into a contiguous parameter block
-     * (PyTorch packs kernel args on the stack). Instead of copying
-     * individual args, send the entire contiguous memory region from
-     * the lowest arg pointer to the highest + padding.
-     *
-     * The server passes this buffer to cuLaunchKernel via
-     * CU_LAUNCH_PARAM_BUFFER_POINTER — the CUDA driver knows the
-     * exact parameter layout from the kernel's metadata.
-     */
-    size_t total_param_size = 0;
     uint8_t *param_buf = NULL;
-
-    if (args != NULL && args[0] != NULL) {
-        /* Find the span of the contiguous parameter block */
-        uintptr_t buf_start = (uintptr_t)args[0];
-        uintptr_t buf_end = buf_start + 8;
-
-        /* Count args using proximity check */
-        int num_args = 1;
-        for (int i = 1; i < 16; i++) {
-            if (args[i] == NULL) break;
-            uintptr_t p = (uintptr_t)args[i];
-            uintptr_t diff = (p > buf_start) ? (p - buf_start) : (buf_start - p);
-            if (diff > 4096) break;
-            num_args++;
-            if (p < buf_start) buf_start = p;
-            if (p + 8 > buf_end) buf_end = p + 8;
+    if (total_ps > 0 && num_params > 0 && args != NULL) {
+        param_buf = (uint8_t *)calloc(1, total_ps);
+        for (int i = 0; i < num_params; i++) {
+            int32_t off = g_registered_functions[func_idx].params[i].offset;
+            int32_t sz = g_registered_functions[func_idx].params[i].size;
+            if (off + sz <= total_ps) {
+                memcpy(param_buf + off, args[i], sz);
+            }
         }
-
-        total_param_size = buf_end - buf_start;
-        /* Cap at reasonable size */
-        if (total_param_size > 4096) total_param_size = 4096;
-
-        param_buf = (uint8_t *)malloc(total_param_size);
-        memcpy(param_buf, (void *)buf_start, total_param_size);
-
-        if (g_verbose)
-            fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) "
-                    "num_args=%d buf_span=%zu (0x%llx-0x%llx)\n",
-                    (unsigned long long)func_handle,
-                    gridDim.x, gridDim.y, gridDim.z,
-                    blockDim.x, blockDim.y, blockDim.z,
-                    num_args, total_param_size,
-                    (unsigned long long)buf_start, (unsigned long long)buf_end);
     }
 
-    param_size = (int32_t)total_param_size;
+    if (g_verbose)
+        fprintf(stderr, "[chidori-launch] func=0x%llx grid=(%u,%u,%u) block=(%u,%u,%u) "
+                "params=%d total_size=%d\n",
+                (unsigned long long)func_handle,
+                gridDim.x, gridDim.y, gridDim.z,
+                blockDim.x, blockDim.y, blockDim.z,
+                num_params, total_ps);
+
     size_t payload_len = 44 + 1;
-    if (total_param_size > 0)
-        payload_len += 4 + total_param_size;
+    if (total_ps > 0)
+        payload_len += 4 + total_ps;
 
     void *payload = malloc(payload_len);
     char *p = (char *)payload;
@@ -3689,12 +3675,12 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
     memcpy(p, &shared, 4); p += 4;
     memcpy(p, &stream_handle, 8); p += 8;
 
-    if (param_size > 0 && param_buf) {
+    if (total_ps > 0 && param_buf) {
         uint8_t has_params = 1;
         memcpy(p, &has_params, 1); p += 1;
-        uint32_t buf_size = (uint32_t)param_size;
+        uint32_t buf_size = (uint32_t)total_ps;
         memcpy(p, &buf_size, 4); p += 4;
-        memcpy(p, param_buf, param_size);
+        memcpy(p, param_buf, total_ps);
         free(param_buf);
     } else {
         uint8_t has_params = 0;

@@ -1298,19 +1298,50 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
             hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)func);
-            /* Return func_handle(8) + param_size(4) so client knows exact arg buffer size */
-            int param_sz = 0;
-            CUresult attr_res = cuFuncGetAttribute(&param_sz, (CUfunction_attribute)74, func);
-            /* Attribute 74 (PARAM_SIZE) requires CUDA 12+. If it fails, use 256 as fallback */
-            if (attr_res != CUDA_SUCCESS || param_sz <= 0)
-                param_sz = 256;
-            struct __attribute__((packed)) { uint64_t h; int32_t ps; } resp;
-            resp.h = handle;
-            resp.ps = param_sz;
+
+            /*
+             * Query EXACT parameter layout using cuFuncGetParamInfo (CUDA 12.3+).
+             * Returns offset and size for each kernel parameter.
+             * This is the ONLY correct way to serialize kernel args.
+             */
+            struct { uint32_t offset; uint32_t size; } param_info[64];
+            int num_params = 0;
+            uint32_t total_param_size = 0;
+
+            for (int i = 0; i < 64; i++) {
+                size_t off, sz;
+                CUresult pi_res = cuFuncGetParamInfo(func, (size_t)i, &off, &sz);
+                if (pi_res != CUDA_SUCCESS) break;
+                param_info[num_params].offset = (uint32_t)off;
+                param_info[num_params].size = (uint32_t)sz;
+                num_params++;
+                uint32_t end = (uint32_t)(off + sz);
+                if (end > total_param_size) total_param_size = end;
+            }
+
             if (s_verbose)
-                fprintf(stderr, "[cuda_dispatch] RegisterFunction '%s' -> handle=0x%llx param_size=%d\n",
-                        func_name, (unsigned long long)handle, param_sz);
-            return chidori_send_response(fd, req->seq_num, res, &resp, sizeof(resp));
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction '%s' -> handle=0x%llx "
+                        "num_params=%d total_param_size=%u\n",
+                        func_name, (unsigned long long)handle, num_params, total_param_size);
+
+            /*
+             * Response: func_handle(8) + total_param_size(4) + num_params(4)
+             *           + [offset(4) + size(4)] × num_params
+             */
+            size_t resp_size = 8 + 4 + 4 + (num_params * 8);
+            uint8_t *resp = (uint8_t *)malloc(resp_size);
+            uint8_t *rp = resp;
+            memcpy(rp, &handle, 8); rp += 8;
+            memcpy(rp, &total_param_size, 4); rp += 4;
+            int32_t np = (int32_t)num_params;
+            memcpy(rp, &np, 4); rp += 4;
+            for (int i = 0; i < num_params; i++) {
+                memcpy(rp, &param_info[i].offset, 4); rp += 4;
+                memcpy(rp, &param_info[i].size, 4); rp += 4;
+            }
+            int rc = chidori_send_response(fd, req->seq_num, res, resp, resp_size);
+            free(resp);
+            return rc;
         }
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
