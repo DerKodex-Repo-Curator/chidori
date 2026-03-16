@@ -357,9 +357,12 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
         g_verbose = (v && v[0] == '1') ? 1 : 0;
     }
     if (g_verbose)
-        fprintf(stderr, "[chidori-async] func=0x%04x payload=%zu\n", func_id, payload_len);
+        fprintf(stderr, "[chidori-async] func=0x%04x payload=%zu pending=%d\n",
+                func_id, payload_len, g_pending_responses);
 
     pthread_mutex_lock(&g_lock);
+
+    fprintf(stderr, "[chidori-async] LOCKED fd=%d pending=%d\n", g_server_fd, g_pending_responses);
 
     if (g_server_fd < 0) {
         if (chidori_connect() != 0) {
