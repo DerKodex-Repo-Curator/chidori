@@ -3701,6 +3701,8 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
     }
 
     if (func_handle == 0 || func_idx < 0) {
+        fprintf(stderr, "[chidori-launch] UNREGISTERED func=%p (%d functions registered)\n",
+                func, g_registered_function_count);
         g_last_error = cudaErrorInvalidDeviceFunction;
         return cudaErrorInvalidDeviceFunction;
     }
