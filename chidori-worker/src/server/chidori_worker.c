@@ -152,11 +152,22 @@ static int dispatch_loop(int client_fd) {
             }
         }
 
-        /* Dispatch to real CUDA */
-        if (cuda_dispatch(client_fd, &req, payload_buf) != 0) {
-            fprintf(stderr, "[chidori-worker] Error dispatching func_id=0x%04x on fd=%d\n",
-                    req.func_id, client_fd);
-            break;
+        /*
+         * Dispatch to real CUDA.
+         * For async requests (CHIDORI_FLAG_ASYNC), use a dummy fd (-1) so
+         * cuda_dispatch skips sending the response. The client doesn't wait
+         * for it — this prevents TCP buffer deadlock and lets the GPU
+         * process a queue of operations without network round-trips.
+         */
+        int dispatch_fd = (req.flags & CHIDORI_FLAG_ASYNC) ? -1 : client_fd;
+        if (cuda_dispatch(dispatch_fd, &req, payload_buf) != 0) {
+            /* dispatch_fd == -1 means send_response was skipped, which returns 0.
+             * If it failed with the real fd, the connection is dead. */
+            if (dispatch_fd != -1) {
+                fprintf(stderr, "[chidori-worker] Error dispatching func_id=0x%04x on fd=%d\n",
+                        req.func_id, client_fd);
+                break;
+            }
         }
     }
 

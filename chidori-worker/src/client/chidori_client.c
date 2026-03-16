@@ -385,7 +385,7 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
         return CUDA_ERROR_NOT_INITIALIZED;
     }
 
-    g_pending_responses++;
+    /* Server won't send a response for async requests — no pending to track */
     pthread_mutex_unlock(&g_lock);
     return CUDA_SUCCESS;
 }

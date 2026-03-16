@@ -58,6 +58,9 @@ int chidori_recv_request(int fd, chidori_request_t *hdr) {
 
 int chidori_send_response(int fd, uint32_t seq_num, int32_t result,
                         const void *payload, size_t payload_len) {
+    /* fd == -1 means async request — skip response */
+    if (fd < 0) return 0;
+
     chidori_response_t resp;
     resp.msg_len = (uint32_t)(CHIDORI_RESPONSE_HEADER_SIZE + payload_len);
     resp.seq_num = seq_num;
