@@ -214,7 +214,7 @@ static int chidori_connect(void) {
         if (chidori_write_full(g_server_fd, http_req, (size_t)req_len) != 0) {
             fprintf(stderr, "[chidori] Failed to send HTTP connect request\n");
             close(g_server_fd);
-            g_server_fd = -1;
+            fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
             free(session_id);
             free(server);
             return -1;
@@ -243,7 +243,7 @@ static int chidori_connect(void) {
                 if (n <= 0) {
                     fprintf(stderr, "[chidori] Failed to read HTTP response from agent (n=%zd errno=%d)\n", n, errno);
                     close(g_server_fd);
-                    g_server_fd = -1;
+                    fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
                     free(session_id);
                     free(server);
                     return -1;
@@ -268,7 +268,7 @@ static int chidori_connect(void) {
             if (!found_end) {
                 fprintf(stderr, "[chidori] Invalid HTTP response from agent\n");
                 close(g_server_fd);
-                g_server_fd = -1;
+                fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
                 free(session_id);
                 free(server);
                 return -1;
@@ -278,7 +278,7 @@ static int chidori_connect(void) {
             if (strstr(resp_buf, "101") == NULL) {
                 fprintf(stderr, "[chidori] Agent did not return 101: %s\n", resp_buf);
                 close(g_server_fd);
-                g_server_fd = -1;
+                fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
                 free(session_id);
                 free(server);
                 return -1;
@@ -311,7 +311,7 @@ static void chidori_flush_responses(void) {
         if (chidori_recv_response(g_server_fd, &resp) != 0) {
             /* Connection died — reset */
             close(g_server_fd);
-            g_server_fd = -1;
+            fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
             g_pending_responses = 0;
             return;
         }
@@ -321,7 +321,7 @@ static void chidori_flush_responses(void) {
             size_t chunk = resp_payload < sizeof(drain) ? resp_payload : sizeof(drain);
             if (chidori_read_full(g_server_fd, drain, chunk) != 0) {
                 close(g_server_fd);
-                g_server_fd = -1;
+                fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
                 g_pending_responses = 0;
                 return;
             }
@@ -360,7 +360,7 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
     if (chidori_send_request(g_server_fd, &req, payload, payload_len) != 0) {
         fprintf(stderr, "[chidori] Async send failed func=0x%04x: %s\n", func_id, strerror(errno));
         close(g_server_fd);
-        g_server_fd = -1;
+        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
         g_pending_responses = 0;
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
@@ -408,7 +408,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
         fprintf(stderr, "[chidori] Failed to send func=0x%04x: %s (errno=%d)\n",
                 func_id, strerror(errno), errno);
         close(g_server_fd);
-        g_server_fd = -1;
+        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
     }
@@ -419,7 +419,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
         fprintf(stderr, "[chidori] Failed to recv response for func=0x%04x: %s (errno=%d)\n",
                 func_id, strerror(errno), errno);
         close(g_server_fd);
-        g_server_fd = -1;
+        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
     }
@@ -435,7 +435,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
             fprintf(stderr, "[chidori] Failed to read response payload (%zu bytes) for func=0x%04x: %s (errno=%d)\n",
                     to_read, func_id, strerror(errno), errno);
             close(g_server_fd);
-            g_server_fd = -1;
+            fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
             pthread_mutex_unlock(&g_lock);
             return CUDA_ERROR_NOT_INITIALIZED;
         }
@@ -4876,6 +4876,6 @@ __attribute__((destructor))
 static void chidori_cleanup(void) {
     if (g_server_fd >= 0) {
         close(g_server_fd);
-        g_server_fd = -1;
+        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
     }
 }
