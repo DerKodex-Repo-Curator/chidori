@@ -8,7 +8,7 @@ print(f"Device: {torch.cuda.get_device_name(0)}")
 print("=" * 60)
 
 N = 4096
-ITERS = 200
+ITERS = 2000
 
 # ============================================================
 # LOAD PHASE — upload everything to GPU, accept the latency
@@ -53,6 +53,15 @@ result = c.cpu()
 read_dt = time.time() - t0
 print(f"[READ] Done: {read_dt:.1f}s")
 print(f"[READ] Sum: {result.sum().item():.2f}")
+
+# Verify data is not garbage
+s = result.sum().item()
+if s == 0.0:
+    print("[VERIFY] FAIL: sum is exactly 0 — GPU may not have computed anything")
+elif abs(s) > 1e15:
+    print(f"[VERIFY] FAIL: sum is suspiciously large ({s}) — possible garbage data")
+else:
+    print(f"[VERIFY] OK: sum={s:.2f} looks reasonable for {N}x{N} matmul")
 
 # ============================================================
 # Summary

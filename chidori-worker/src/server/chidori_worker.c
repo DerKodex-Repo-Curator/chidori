@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <getopt.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -107,7 +108,16 @@ static int receive_socket_from_agent(int ipc_read_fd) {
 }
 
 /*
- * Main dispatch loop: read CUDA API requests, execute them via real CUDA, send responses.
+ * Batch-read dispatch loop.
+ *
+ * Instead of 2 blocking read() syscalls per request (header + payload),
+ * we recv() ALL available TCP data into a 256KB buffer, then parse and
+ * dispatch every complete request in a tight loop. This lets the GPU
+ * receive bursts of N requests with zero syscall overhead between them.
+ *
+ * Oversized payloads (e.g. HtoD memcpy of a 64MB matrix) that exceed
+ * the buffer are handled by a fallback path that reads directly from
+ * the socket into a separate allocation.
  */
 static int dispatch_loop(int client_fd) {
     static int s_verbose = -1;
@@ -117,66 +127,135 @@ static int dispatch_loop(int client_fd) {
     }
 
     if (s_verbose)
-        fprintf(stderr, "[dispatch_loop] Entering dispatch loop for client fd=%d\n", client_fd);
+        fprintf(stderr, "[dispatch] Entering batch-read loop for fd=%d\n", client_fd);
 
-    void *payload_buf = NULL;
-    size_t payload_buf_size = 0;
+    #define BATCH_BUF_SIZE (256 * 1024)
+    char buf[BATCH_BUF_SIZE];
+    size_t buf_len = 0;
+    int request_count = 0;
+    int batch_count = 0;
+
+    /* Separate buffer for oversized payloads */
+    void *big_payload = NULL;
+    size_t big_payload_cap = 0;
 
     for (;;) {
-        chidori_request_t req;
-        if (chidori_recv_request(client_fd, &req) != 0) {
-            fprintf(stderr, "[chidori-worker] Client disconnected (EOF or read error on fd=%d)\n", client_fd);
+        /* Step 1: Read ALL available data from socket */
+        ssize_t n = recv(client_fd, buf + buf_len, BATCH_BUF_SIZE - buf_len, 0);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;
+            fprintf(stderr, "[chidori-worker] Client disconnected (fd=%d)\n", client_fd);
             break;
         }
+        buf_len += (size_t)n;
 
-        if (s_verbose)
-            fprintf(stderr, "[dispatch_loop] Received func_id=0x%04x payload_size=%u seq=%u\n",
-                    req.func_id, req.payload_size, req.seq_num);
+        int batch_dispatched = 0;
 
-        /* Read payload if present */
-        if (req.payload_size > 0) {
-            if (req.payload_size > payload_buf_size) {
-                free(payload_buf);
-                payload_buf_size = req.payload_size;
-                payload_buf = malloc(payload_buf_size);
-                if (!payload_buf) {
-                    fprintf(stderr, "[chidori-worker] OOM allocating %u bytes for fd=%d\n",
-                            req.payload_size, client_fd);
-                    break;
+        /* Step 2: Parse and dispatch ALL complete requests in buffer */
+        size_t offset = 0;
+        while (offset + CHIDORI_REQUEST_HEADER_SIZE <= buf_len) {
+            chidori_request_t *req = (chidori_request_t *)(buf + offset);
+            size_t total_msg = CHIDORI_REQUEST_HEADER_SIZE + req->payload_size;
+
+            if (offset + total_msg <= buf_len) {
+                /*
+                 * Common path: entire request fits in buffer.
+                 * Dispatch directly from buffer — zero copy.
+                 */
+                void *payload = (req->payload_size > 0)
+                    ? buf + offset + CHIDORI_REQUEST_HEADER_SIZE
+                    : NULL;
+
+                if (s_verbose)
+                    fprintf(stderr, "[dispatch] func=0x%04x pl=%u seq=%u\n",
+                            req->func_id, req->payload_size, req->seq_num);
+
+                int dispatch_fd = (req->flags & CHIDORI_FLAG_ASYNC) ? -1 : client_fd;
+                if (cuda_dispatch(dispatch_fd, req, payload) != 0 && dispatch_fd != -1) {
+                    fprintf(stderr, "[chidori-worker] Dispatch error func=0x%04x fd=%d\n",
+                            req->func_id, client_fd);
+                    goto done;
                 }
-            }
-            if (chidori_read_full(client_fd, payload_buf, req.payload_size) != 0) {
-                fprintf(stderr, "[chidori-worker] Failed to read payload (%u bytes) from fd=%d\n",
-                        req.payload_size, client_fd);
+                request_count++;
+                batch_dispatched++;
+                offset += total_msg;
+            } else if (total_msg > BATCH_BUF_SIZE) {
+                /*
+                 * Oversized payload — will never fit in buffer.
+                 * Copy header, read payload via socket into separate alloc.
+                 */
+                chidori_request_t req_copy = *req;
+                size_t in_buf = buf_len - offset - CHIDORI_REQUEST_HEADER_SIZE;
+
+                if (req_copy.payload_size > big_payload_cap) {
+                    free(big_payload);
+                    big_payload_cap = req_copy.payload_size;
+                    big_payload = malloc(big_payload_cap);
+                    if (!big_payload) {
+                        fprintf(stderr, "[chidori-worker] OOM for %u byte payload\n",
+                                req_copy.payload_size);
+                        goto done;
+                    }
+                }
+
+                /* Copy payload bytes already in buffer */
+                if (in_buf > 0)
+                    memcpy(big_payload, buf + offset + CHIDORI_REQUEST_HEADER_SIZE, in_buf);
+
+                /* Read the rest directly from socket */
+                if (chidori_read_full(client_fd, (char *)big_payload + in_buf,
+                                      req_copy.payload_size - in_buf) != 0) {
+                    fprintf(stderr, "[chidori-worker] Failed reading oversized payload (%u bytes)\n",
+                            req_copy.payload_size);
+                    goto done;
+                }
+
+                if (s_verbose)
+                    fprintf(stderr, "[dispatch] func=0x%04x pl=%u seq=%u (oversized)\n",
+                            req_copy.func_id, req_copy.payload_size, req_copy.seq_num);
+
+                int dispatch_fd = (req_copy.flags & CHIDORI_FLAG_ASYNC) ? -1 : client_fd;
+                if (cuda_dispatch(dispatch_fd, &req_copy, big_payload) != 0 && dispatch_fd != -1) {
+                    fprintf(stderr, "[chidori-worker] Dispatch error func=0x%04x fd=%d\n",
+                            req_copy.func_id, client_fd);
+                    goto done;
+                }
+                request_count++;
+                batch_dispatched++;
+
+                /* Buffer is consumed — this request ate everything */
+                buf_len = 0;
+                offset = 0;
+                break;
+            } else {
+                /* Payload partially in buffer but fits after compaction + more recv */
                 break;
             }
         }
 
-        /*
-         * Dispatch to real CUDA.
-         * For async requests (CHIDORI_FLAG_ASYNC), use a dummy fd (-1) so
-         * cuda_dispatch skips sending the response. The client doesn't wait
-         * for it — this prevents TCP buffer deadlock and lets the GPU
-         * process a queue of operations without network round-trips.
-         */
-        int dispatch_fd = (req.flags & CHIDORI_FLAG_ASYNC) ? -1 : client_fd;
-        if (cuda_dispatch(dispatch_fd, &req, payload_buf) != 0) {
-            /* dispatch_fd == -1 means send_response was skipped, which returns 0.
-             * If it failed with the real fd, the connection is dead. */
-            if (dispatch_fd != -1) {
-                fprintf(stderr, "[chidori-worker] Error dispatching func_id=0x%04x on fd=%d\n",
-                        req.func_id, client_fd);
-                break;
-            }
+        /* Step 3: Compact buffer — move remaining partial data to front */
+        if (offset > 0) {
+            buf_len -= offset;
+            if (buf_len > 0)
+                memmove(buf, buf + offset, buf_len);
         }
+
+        if (batch_dispatched > 0)
+            batch_count++;
+
+        if (s_verbose && batch_dispatched > 1)
+            fprintf(stderr, "[dispatch] Batch #%d: %d requests dispatched at once\n",
+                    batch_count, batch_dispatched);
     }
 
-    if (s_verbose)
-        fprintf(stderr, "[dispatch_loop] Exiting dispatch loop for client fd=%d\n", client_fd);
-
-    free(payload_buf);
+done:
+    free(big_payload);
+    fprintf(stderr, "[chidori-worker] Processed %d requests in %d recv batches (fd=%d)\n",
+            request_count, batch_count, client_fd);
     close(client_fd);
     return 0;
+    #undef BATCH_BUF_SIZE
 }
 
 /*
