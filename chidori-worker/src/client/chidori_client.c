@@ -3740,7 +3740,7 @@ static int g_fat_binary_count = 0;
 static struct {
     const void *hostFun;        /* host function pointer (PyTorch's kernel ID) */
     int fat_binary_idx;         /* index into g_fat_binaries */
-    char deviceName[256];       /* kernel name on device */
+    char *deviceName;           /* kernel name on device (strdup'd, PyTorch names can be 300+ chars) */
     uint64_t server_handle;     /* 0 = not yet registered on server */
     int32_t total_param_size;   /* total parameter buffer size */
     int32_t num_params;         /* number of kernel parameters */
@@ -4239,8 +4239,7 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
         int idx = g_registered_function_count++;
         g_registered_functions[idx].hostFun = (const void *)hostFun;
         g_registered_functions[idx].fat_binary_idx = fat_idx;
-        strncpy(g_registered_functions[idx].deviceName, name, 255);
-        g_registered_functions[idx].deviceName[255] = '\0';
+        g_registered_functions[idx].deviceName = strdup(name);
         g_registered_functions[idx].server_handle = 0; /* not yet registered */
     }
 }
