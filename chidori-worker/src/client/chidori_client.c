@@ -314,7 +314,17 @@ static int chidori_connect(void) {
  * Thread-safe via mutex (simple approach; could use per-thread connections later).
  */
 static int g_verbose = -1; /* -1 = unchecked */
+static int g_trace = -1;   /* -1 = unchecked, CHIDORI_TRACE=1 logs every RPC */
 static int g_pending_responses = 0; /* count of async responses not yet read */
+static uint64_t g_async_count = 0;  /* total async RPCs sent */
+static uint64_t g_sync_count = 0;   /* total sync RPCs sent */
+
+static void check_trace(void) {
+    if (g_trace == -1) {
+        const char *v = getenv("CHIDORI_TRACE");
+        g_trace = (v && v[0] == '1') ? 1 : 0;
+    }
+}
 
 /*
  * Flush all pending async responses from the socket.
@@ -358,6 +368,15 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
         const char *v = getenv("CHIDORI_VERBOSE");
         g_verbose = (v && v[0] == '1') ? 1 : 0;
     }
+    check_trace();
+    if (g_trace) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        fprintf(stderr, "[TRACE %ld.%03ld] ASYNC func=0x%04x len=%zu\n",
+                (long)tv.tv_sec % 1000, (long)tv.tv_usec / 1000,
+                func_id, payload_len);
+    }
+    g_async_count++;
 
     pthread_mutex_lock(&g_lock);
 
@@ -405,6 +424,15 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
         const char *v = getenv("CHIDORI_VERBOSE");
         g_verbose = (v && v[0] == '1') ? 1 : 0;
     }
+    check_trace();
+    if (g_trace) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        fprintf(stderr, "[TRACE %ld.%03ld] SYNC  func=0x%04x len=%zu (async_total=%lu sync_total=%lu)\n",
+                (long)tv.tv_sec % 1000, (long)tv.tv_usec / 1000,
+                func_id, payload_len, (unsigned long)g_async_count, (unsigned long)g_sync_count);
+    }
+    g_sync_count++;
     if (g_verbose)
         fprintf(stderr, "[chidori-rpc] func=0x%04x payload=%zu pending=%d\n",
                 func_id, payload_len, g_pending_responses);
@@ -549,17 +577,45 @@ CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
     return chidori_rpc(CHIDORI_CU_DEVICE_TOTAL_MEM, &dev, sizeof(dev), bytes, &len);
 }
 
+/* Device attribute cache — avoids RPC for repeated queries (PyTorch queries 100+ attributes) */
+#define ATTR_CACHE_SIZE 512
+static struct { int dev; int attrib; int value; int valid; } g_attr_cache[ATTR_CACHE_SIZE];
+static int g_attr_cache_count = 0;
+
 CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
+    /* Check cache first */
+    for (int i = 0; i < g_attr_cache_count; i++) {
+        if (g_attr_cache[i].dev == dev && g_attr_cache[i].attrib == attrib && g_attr_cache[i].valid) {
+            *pi = g_attr_cache[i].value;
+            return CUDA_SUCCESS;
+        }
+    }
     struct { int32_t attrib; int32_t dev; } req = { attrib, dev };
     size_t len = sizeof(int32_t);
-    return chidori_rpc(CHIDORI_CU_DEVICE_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
+    if (r == CUDA_SUCCESS && g_attr_cache_count < ATTR_CACHE_SIZE) {
+        g_attr_cache[g_attr_cache_count].dev = dev;
+        g_attr_cache[g_attr_cache_count].attrib = attrib;
+        g_attr_cache[g_attr_cache_count].value = *pi;
+        g_attr_cache[g_attr_cache_count].valid = 1;
+        g_attr_cache_count++;
+    }
+    return r;
 }
 
 /* Context */
+static CUcontext g_cached_ctx = NULL;
+static int g_cached_ctx_valid = 0;
+
 CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev) {
     struct { uint32_t flags; int32_t dev; } req = { flags, dev };
     size_t len = sizeof(uint64_t);
-    return chidori_rpc(CHIDORI_CU_CTX_CREATE, &req, sizeof(req), pctx, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_CTX_CREATE, &req, sizeof(req), pctx, &len);
+    if (r == CUDA_SUCCESS) {
+        g_cached_ctx = *pctx;
+        g_cached_ctx_valid = 1;
+    }
+    return r;
 }
 
 CUresult cuCtxDestroy_v2(CUcontext ctx) {
@@ -569,12 +625,23 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
 
 CUresult cuCtxSetCurrent(CUcontext ctx) {
     uint64_t handle = (uint64_t)(uintptr_t)ctx;
-    return chidori_rpc(CHIDORI_CU_CTX_SET_CURRENT, &handle, sizeof(handle), NULL, NULL);
+    g_cached_ctx = ctx;
+    g_cached_ctx_valid = 1;
+    return chidori_rpc_async(CHIDORI_CU_CTX_SET_CURRENT, &handle, sizeof(handle));
 }
 
 CUresult cuCtxGetCurrent(CUcontext *pctx) {
+    if (g_cached_ctx_valid) {
+        *pctx = g_cached_ctx;
+        return CUDA_SUCCESS;
+    }
     size_t len = sizeof(uint64_t);
-    return chidori_rpc(CHIDORI_CU_CTX_GET_CURRENT, NULL, 0, pctx, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_CTX_GET_CURRENT, NULL, 0, pctx, &len);
+    if (r == CUDA_SUCCESS) {
+        g_cached_ctx = *pctx;
+        g_cached_ctx_valid = 1;
+    }
+    return r;
 }
 
 CUresult cuCtxSynchronize(void) {
@@ -583,7 +650,12 @@ CUresult cuCtxSynchronize(void) {
 
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
     size_t len = sizeof(uint64_t);
-    return chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &dev, sizeof(dev), pctx, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &dev, sizeof(dev), pctx, &len);
+    if (r == CUDA_SUCCESS) {
+        g_cached_ctx = *pctx;
+        g_cached_ctx_valid = 1;
+    }
+    return r;
 }
 
 CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
@@ -853,7 +925,7 @@ CUresult cuStreamCreate(CUstream *phStream, unsigned int flags) {
 
 CUresult cuStreamDestroy_v2(CUstream hStream) {
     uint64_t handle = (uint64_t)(uintptr_t)hStream;
-    return chidori_rpc(CHIDORI_CU_STREAM_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_STREAM_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuStreamSynchronize(CUstream hStream) {
@@ -869,14 +941,14 @@ CUresult cuEventCreate(CUevent *phEvent, unsigned int flags) {
 
 CUresult cuEventDestroy_v2(CUevent hEvent) {
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
-    return chidori_rpc(CHIDORI_CU_EVENT_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_EVENT_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
     struct { uint64_t event; uint64_t stream; } req;
     req.event = (uint64_t)(uintptr_t)hEvent;
     req.stream = (uint64_t)(uintptr_t)hStream;
-    return chidori_rpc(CHIDORI_CU_EVENT_RECORD, &req, sizeof(req), NULL, NULL);
+    return chidori_rpc_async(CHIDORI_CU_EVENT_RECORD, &req, sizeof(req));
 }
 
 CUresult cuEventSynchronize(CUevent hEvent) {
@@ -962,10 +1034,25 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
 }
 
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
+    /* Use the driver-API attribute cache */
+    for (int i = 0; i < g_attr_cache_count; i++) {
+        if (g_attr_cache[i].dev == device && g_attr_cache[i].attrib == attr && g_attr_cache[i].valid) {
+            *value = g_attr_cache[i].value;
+            g_last_error = cudaSuccess;
+            return cudaSuccess;
+        }
+    }
     struct { int32_t attr; int32_t device; } req = { attr, device };
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_GET_ATTRIBUTE,
                                             &req, sizeof(req), value, &len);
+    if (r == cudaSuccess && g_attr_cache_count < ATTR_CACHE_SIZE) {
+        g_attr_cache[g_attr_cache_count].dev = device;
+        g_attr_cache[g_attr_cache_count].attrib = attr;
+        g_attr_cache[g_attr_cache_count].value = *value;
+        g_attr_cache[g_attr_cache_count].valid = 1;
+        g_attr_cache_count++;
+    }
     g_last_error = r;
     return r;
 }
@@ -983,7 +1070,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 
 cudaError_t cudaFree(void *devPtr) {
     uint64_t ptr = (uint64_t)(uintptr_t)devPtr;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_FREE, &ptr, sizeof(ptr), NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_FREE, &ptr, sizeof(ptr));
     g_last_error = r;
     return r;
 }
@@ -1006,7 +1093,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
         memcpy((char *)payload + 16, &kind32, 4);
         memcpy((char *)payload + 20, src, count);
 
-        r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MEMCPY, payload, payload_len, NULL, NULL);
+        r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_MEMCPY, payload, payload_len);
         free(payload);
         break;
     }
@@ -1040,7 +1127,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
         req.size = (uint64_t)count;
         req.kind = kind;
 
-        r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MEMCPY, &req, sizeof(req), NULL, NULL);
+        r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_MEMCPY, &req, sizeof(req));
         break;
     }
     case cudaMemcpyHostToHost:
@@ -1076,7 +1163,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
         memcpy(p, &stream64, 8); p += 8;
         memcpy(p, src, count);
 
-        r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MEMCPY_ASYNC, payload, payload_len, NULL, NULL);
+        r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_MEMCPY_ASYNC, payload, payload_len);
         free(payload);
         break;
     }
@@ -1112,7 +1199,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
         req.kind = kind;
         req.stream = (uint64_t)(uintptr_t)stream;
 
-        r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MEMCPY_ASYNC, &req, sizeof(req), NULL, NULL);
+        r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_MEMCPY_ASYNC, &req, sizeof(req));
         break;
     }
     case cudaMemcpyHostToHost:
@@ -1135,7 +1222,7 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
     req.ptr = (uint64_t)(uintptr_t)devPtr;
     req.value = value;
     req.count = (uint64_t)count;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MEMSET, &req, sizeof(req), NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_MEMSET, &req, sizeof(req));
     g_last_error = r;
     return r;
 }
@@ -1158,7 +1245,7 @@ cudaError_t cudaStreamCreate(void **pStream) {
 
 cudaError_t cudaStreamDestroy(void *stream) {
     uint64_t handle = (uint64_t)(uintptr_t)stream;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_STREAM_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_STREAM_DESTROY, &handle, sizeof(handle));
     g_last_error = r;
     return r;
 }
@@ -1184,7 +1271,7 @@ cudaError_t cudaEventRecord(void *event, void *stream) {
     struct { uint64_t event; uint64_t stream; } req;
     req.event = (uint64_t)(uintptr_t)event;
     req.stream = (uint64_t)(uintptr_t)stream;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_EVENT_RECORD, &req, sizeof(req), NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_EVENT_RECORD, &req, sizeof(req));
     g_last_error = r;
     return r;
 }
@@ -1198,7 +1285,7 @@ cudaError_t cudaEventSynchronize(void *event) {
 
 cudaError_t cudaEventDestroy(void *event) {
     uint64_t handle = (uint64_t)(uintptr_t)event;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_EVENT_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_EVENT_DESTROY, &handle, sizeof(handle));
     g_last_error = r;
     return r;
 }
@@ -1324,7 +1411,7 @@ cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, CUstream stream) {
     struct { uint64_t handle; uint64_t stream; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.stream = (uint64_t)(uintptr_t)stream;
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SET_STREAM, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &req, sizeof(req));
 }
 
 cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
@@ -1341,7 +1428,7 @@ cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
     struct { uint64_t handle; int32_t mode; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.mode = (int32_t)mode;
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SET_MATH_MODE, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_MATH_MODE, &req, sizeof(req));
 }
 
 cublasStatus_t cublasGetMathMode(cublasHandle_t handle, cublasMath_t *mode) {
@@ -1495,7 +1582,7 @@ cublasStatus_t cublasHgemm(cublasHandle_t handle,
     req.C = (uint64_t)(uintptr_t)C;
     req.ldc = ldc;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_HGEMM, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_HGEMM, &req, sizeof(req));
 }
 
 /*
@@ -1596,7 +1683,7 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     req.computeType = computeType;
     req.algo = algo;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_GEMM_EX, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_GEMM_EX, &req, sizeof(req));
 }
 
 /*
@@ -1638,7 +1725,7 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
     req.y = (uint64_t)(uintptr_t)y;
     req.incy = incy;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SGEMV, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMV, &req, sizeof(req));
 }
 
 cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
@@ -1676,7 +1763,7 @@ cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
     req.y = (uint64_t)(uintptr_t)y;
     req.incy = incy;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DGEMV, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DGEMV, &req, sizeof(req));
 }
 
 /*
@@ -1705,7 +1792,7 @@ cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
     req.y = (uint64_t)(uintptr_t)y;
     req.incy = incy;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SAXPY, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SAXPY, &req, sizeof(req));
 }
 
 cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
@@ -1731,7 +1818,7 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
     req.y = (uint64_t)(uintptr_t)y;
     req.incy = incy;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DAXPY, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DAXPY, &req, sizeof(req));
 }
 
 /*
@@ -1847,7 +1934,7 @@ cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
     req.x = (uint64_t)(uintptr_t)x;
     req.incx = incx;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SSCAL, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SSCAL, &req, sizeof(req));
 }
 
 cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
@@ -1867,7 +1954,7 @@ cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
     req.x = (uint64_t)(uintptr_t)x;
     req.incx = incx;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DSCAL, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DSCAL, &req, sizeof(req));
 }
 
 /*
@@ -1892,7 +1979,7 @@ cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
     req.y = (uint64_t)(uintptr_t)y;
     req.incy = incy;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SCOPY, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SCOPY, &req, sizeof(req));
 }
 
 cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
@@ -1914,7 +2001,7 @@ cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
     req.y = (uint64_t)(uintptr_t)y;
     req.incy = incy;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DCOPY, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DCOPY, &req, sizeof(req));
 }
 
 /*
@@ -1979,7 +2066,7 @@ cublasStatus_t cublasSgemmBatched(cublasHandle_t handle,
         memcpy(p, &ptr, 8); p += 8;
     }
 
-    cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_SGEMM_BATCHED, payload, payload_len, NULL, NULL);
+    cublasStatus_t r = (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMM_BATCHED, payload, payload_len);
     free(payload);
     return r;
 }
@@ -2090,7 +2177,7 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
     req.computeType = computeType;
     req.algo = algo;
 
-    return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_GEMM_STRIDED_BATCHED_EX, &req, sizeof(req), NULL, NULL);
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_GEMM_STRIDED_BATCHED_EX, &req, sizeof(req));
 }
 
 /*
@@ -2147,14 +2234,14 @@ cudnnStatus_t cudnnCreate(cudnnHandle_t *handle) {
 
 cudnnStatus_t cudnnDestroy(cudnnHandle_t handle) {
     uint64_t h = (uint64_t)(uintptr_t)handle;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY, &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY, &h, sizeof(h));
 }
 
 cudnnStatus_t cudnnSetStream(cudnnHandle_t handle, CUstream stream) {
     struct { uint64_t handle; uint64_t stream; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.stream = (uint64_t)(uintptr_t)stream;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_STREAM, &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_STREAM, &req, sizeof(req));
 }
 
 size_t cudnnGetVersion(void) {
@@ -2192,8 +2279,8 @@ cudnnStatus_t cudnnSetTensor4dDescriptor(cudnnTensorDescriptor_t tensorDesc,
     req.dataType = (int32_t)dataType;
     req.n = n; req.c = c; req.h = h; req.w = w;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_TENSOR_4D_DESCRIPTOR,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_TENSOR_4D_DESCRIPTOR,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnSetTensorNdDescriptor(cudnnTensorDescriptor_t tensorDesc,
@@ -2221,8 +2308,8 @@ cudnnStatus_t cudnnSetTensorNdDescriptor(cudnnTensorDescriptor_t tensorDesc,
         int32_t s = strideA[i]; memcpy(p, &s, 4); p += 4;
     }
 
-    cudnnStatus_t r = (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_TENSOR_ND_DESCRIPTOR,
-                                                payload, payload_len, NULL, NULL);
+    cudnnStatus_t r = (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_TENSOR_ND_DESCRIPTOR,
+                                                      payload, payload_len);
     free(payload);
     return r;
 }
@@ -2254,8 +2341,8 @@ cudnnStatus_t cudnnGetTensor4dDescriptor(cudnnTensorDescriptor_t tensorDesc,
 
 cudnnStatus_t cudnnDestroyTensorDescriptor(cudnnTensorDescriptor_t tensorDesc) {
     uint64_t h = (uint64_t)(uintptr_t)tensorDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_TENSOR_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_TENSOR_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 /* ---- Filter Descriptor ---- */
@@ -2286,8 +2373,8 @@ cudnnStatus_t cudnnSetFilter4dDescriptor(cudnnFilterDescriptor_t filterDesc,
     req.format = (int32_t)format;
     req.k = k; req.c = c; req.h = h; req.w = w;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_FILTER_4D_DESCRIPTOR,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_FILTER_4D_DESCRIPTOR,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnSetFilterNdDescriptor(cudnnFilterDescriptor_t filterDesc,
@@ -2322,16 +2409,16 @@ cudnnStatus_t cudnnSetFilterNdDescriptor(cudnnFilterDescriptor_t filterDesc,
         int32_t d = filterDimA[i]; memcpy(p, &d, 4); p += 4;
     }
 
-    cudnnStatus_t r = (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_FILTER_ND_DESCRIPTOR,
-                                                payload, payload_len, NULL, NULL);
+    cudnnStatus_t r = (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_FILTER_ND_DESCRIPTOR,
+                                                      payload, payload_len);
     free(payload);
     return r;
 }
 
 cudnnStatus_t cudnnDestroyFilterDescriptor(cudnnFilterDescriptor_t filterDesc) {
     uint64_t h = (uint64_t)(uintptr_t)filterDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_FILTER_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_FILTER_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 /* ---- Convolution Descriptor ---- */
@@ -2366,8 +2453,8 @@ cudnnStatus_t cudnnSetConvolution2dDescriptor(cudnnConvolutionDescriptor_t convD
     req.mode = (int32_t)mode;
     req.computeType = (int32_t)computeType;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_CONVOLUTION_2D_DESCRIPTOR,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_CONVOLUTION_2D_DESCRIPTOR,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnSetConvolutionNdDescriptor(cudnnConvolutionDescriptor_t convDesc,
@@ -2399,16 +2486,16 @@ cudnnStatus_t cudnnSetConvolutionNdDescriptor(cudnnConvolutionDescriptor_t convD
         int32_t v = dilationA[i]; memcpy(p, &v, 4); p += 4;
     }
 
-    cudnnStatus_t r = (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_CONVOLUTION_ND_DESCRIPTOR,
-                                                payload, payload_len, NULL, NULL);
+    cudnnStatus_t r = (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_CONVOLUTION_ND_DESCRIPTOR,
+                                                      payload, payload_len);
     free(payload);
     return r;
 }
 
 cudnnStatus_t cudnnDestroyConvolutionDescriptor(cudnnConvolutionDescriptor_t convDesc) {
     uint64_t h = (uint64_t)(uintptr_t)convDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_CONVOLUTION_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_CONVOLUTION_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 cudnnStatus_t cudnnSetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc,
@@ -2416,8 +2503,8 @@ cudnnStatus_t cudnnSetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc,
     struct { uint64_t desc; int32_t mathType; } req;
     req.desc = (uint64_t)(uintptr_t)convDesc;
     req.mathType = (int32_t)mathType;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_CONVOLUTION_MATH_TYPE,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_CONVOLUTION_MATH_TYPE,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnSetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDesc,
@@ -2425,8 +2512,8 @@ cudnnStatus_t cudnnSetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDes
     struct { uint64_t desc; int32_t groupCount; } req;
     req.desc = (uint64_t)(uintptr_t)convDesc;
     req.groupCount = groupCount;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_CONVOLUTION_GROUP_COUNT,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_CONVOLUTION_GROUP_COUNT,
+                                           &req, sizeof(req));
 }
 
 /* ---- Convolution Forward Algorithm ---- */
@@ -2621,8 +2708,8 @@ cudnnStatus_t cudnnConvolutionForward(cudnnHandle_t handle,
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
     req.y = (uint64_t)(uintptr_t)y;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_CONVOLUTION_FORWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_CONVOLUTION_FORWARD,
+                                           &req, sizeof(req));
 }
 
 /* ---- Convolution Backward Data ---- */
@@ -2668,8 +2755,8 @@ cudnnStatus_t cudnnConvolutionBackwardData(cudnnHandle_t handle,
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
     req.dx = (uint64_t)(uintptr_t)dx;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_CONVOLUTION_BACKWARD_DATA,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_CONVOLUTION_BACKWARD_DATA,
+                                           &req, sizeof(req));
 }
 
 /* ---- Convolution Backward Filter ---- */
@@ -2715,8 +2802,8 @@ cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t handle,
     req.dwDesc = (uint64_t)(uintptr_t)dwDesc;
     req.dw = (uint64_t)(uintptr_t)dw;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_CONVOLUTION_BACKWARD_FILTER,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_CONVOLUTION_BACKWARD_FILTER,
+                                           &req, sizeof(req));
 }
 
 /* ---- Activation Descriptor ---- */
@@ -2747,14 +2834,14 @@ cudnnStatus_t cudnnSetActivationDescriptor(cudnnActivationDescriptor_t activatio
     req.reluNanOpt = (int32_t)reluNanOpt;
     req.coef = coef;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_ACTIVATION_DESCRIPTOR,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_ACTIVATION_DESCRIPTOR,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnDestroyActivationDescriptor(cudnnActivationDescriptor_t activationDesc) {
     uint64_t h = (uint64_t)(uintptr_t)activationDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_ACTIVATION_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_ACTIVATION_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
@@ -2785,8 +2872,8 @@ cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
     req.y = (uint64_t)(uintptr_t)y;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_ACTIVATION_FORWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_ACTIVATION_FORWARD,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnActivationBackward(cudnnHandle_t handle,
@@ -2827,8 +2914,8 @@ cudnnStatus_t cudnnActivationBackward(cudnnHandle_t handle,
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
     req.dx = (uint64_t)(uintptr_t)dx;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_ACTIVATION_BACKWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_ACTIVATION_BACKWARD,
+                                           &req, sizeof(req));
 }
 
 /* ---- Pooling Descriptor ---- */
@@ -2868,14 +2955,14 @@ cudnnStatus_t cudnnSetPooling2dDescriptor(cudnnPoolingDescriptor_t poolingDesc,
     req.verticalStride = verticalStride;
     req.horizontalStride = horizontalStride;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_POOLING_2D_DESCRIPTOR,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_POOLING_2D_DESCRIPTOR,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnDestroyPoolingDescriptor(cudnnPoolingDescriptor_t poolingDesc) {
     uint64_t h = (uint64_t)(uintptr_t)poolingDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_POOLING_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_POOLING_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 cudnnStatus_t cudnnPoolingForward(cudnnHandle_t handle,
@@ -2906,8 +2993,8 @@ cudnnStatus_t cudnnPoolingForward(cudnnHandle_t handle,
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
     req.y = (uint64_t)(uintptr_t)y;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_POOLING_FORWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_POOLING_FORWARD,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t handle,
@@ -2948,8 +3035,8 @@ cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t handle,
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
     req.dx = (uint64_t)(uintptr_t)dx;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_POOLING_BACKWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_POOLING_BACKWARD,
+                                           &req, sizeof(req));
 }
 
 /* ---- Batch Normalization ---- */
@@ -3005,8 +3092,8 @@ cudnnStatus_t cudnnBatchNormalizationForwardTraining(cudnnHandle_t handle,
     req.resultSaveMean = (uint64_t)(uintptr_t)resultSaveMean;
     req.resultSaveInvVariance = (uint64_t)(uintptr_t)resultSaveInvVariance;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_BATCH_NORM_FORWARD_TRAINING,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_BATCH_NORM_FORWARD_TRAINING,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnBatchNormalizationForwardInference(cudnnHandle_t handle,
@@ -3052,8 +3139,8 @@ cudnnStatus_t cudnnBatchNormalizationForwardInference(cudnnHandle_t handle,
     req.estimatedVariance = (uint64_t)(uintptr_t)estimatedVariance;
     req.epsilon = epsilon;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_BATCH_NORM_FORWARD_INFERENCE,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_BATCH_NORM_FORWARD_INFERENCE,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnBatchNormalizationBackward(cudnnHandle_t handle,
@@ -3112,8 +3199,8 @@ cudnnStatus_t cudnnBatchNormalizationBackward(cudnnHandle_t handle,
     req.savedMean = (uint64_t)(uintptr_t)savedMean;
     req.savedInvVariance = (uint64_t)(uintptr_t)savedInvVariance;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_BATCH_NORM_BACKWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_BATCH_NORM_BACKWARD,
+                                           &req, sizeof(req));
 }
 
 /* ---- Softmax ---- */
@@ -3148,8 +3235,8 @@ cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t handle,
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
     req.y = (uint64_t)(uintptr_t)y;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SOFTMAX_FORWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SOFTMAX_FORWARD,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t handle,
@@ -3187,8 +3274,8 @@ cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t handle,
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
     req.dx = (uint64_t)(uintptr_t)dx;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SOFTMAX_BACKWARD,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SOFTMAX_BACKWARD,
+                                           &req, sizeof(req));
 }
 
 /* ---- Dropout ---- */
@@ -3223,14 +3310,14 @@ cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t dropoutDesc,
     req.stateSizeInBytes = (uint64_t)stateSizeInBytes;
     req.seed = (uint64_t)seed;
 
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_SET_DROPOUT_DESCRIPTOR,
-                                     &req, sizeof(req), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_DROPOUT_DESCRIPTOR,
+                                           &req, sizeof(req));
 }
 
 cudnnStatus_t cudnnDestroyDropoutDescriptor(cudnnDropoutDescriptor_t dropoutDesc) {
     uint64_t h = (uint64_t)(uintptr_t)dropoutDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_DROPOUT_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_DROPOUT_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 /* ---- RNN Descriptor (stub lifecycle) ---- */
@@ -3247,8 +3334,8 @@ cudnnStatus_t cudnnCreateRNNDescriptor(cudnnRNNDescriptor_t *rnnDesc) {
 
 cudnnStatus_t cudnnDestroyRNNDescriptor(cudnnRNNDescriptor_t rnnDesc) {
     uint64_t h = (uint64_t)(uintptr_t)rnnDesc;
-    return (cudnnStatus_t)chidori_rpc(CHIDORI_CUDNN_DESTROY_RNN_DESCRIPTOR,
-                                     &h, sizeof(h), NULL, NULL);
+    return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_DESTROY_RNN_DESCRIPTOR,
+                                           &h, sizeof(h));
 }
 
 /*
