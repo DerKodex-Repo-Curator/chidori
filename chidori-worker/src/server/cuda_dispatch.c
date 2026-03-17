@@ -1235,9 +1235,82 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_FUNC_GET_ATTRIBUTES: {
-        /* Stub: return zeroed attributes with success */
-        char attr_buf[64];
+        /*
+         * Client sends: func_handle(8)
+         * Server returns: cudaFuncAttributes blob (64 bytes)
+         *
+         * Layout (matches cudaFuncAttributes struct on x86_64):
+         *   offset 0:  sharedSizeBytes (size_t, 8)
+         *   offset 8:  constSizeBytes  (size_t, 8)
+         *   offset 16: localSizeBytes  (size_t, 8)
+         *   offset 24: maxThreadsPerBlock (int, 4)
+         *   offset 28: numRegs (int, 4)
+         *   offset 32: ptxVersion (int, 4)
+         *   offset 36: binaryVersion (int, 4)
+         *   offset 40: cacheModeCA (int, 4)
+         *   offset 44: maxDynamicSharedSizeBytes (int, 4)
+         *   offset 48: preferredShmemCarveout (int, 4)
+         */
+        uint8_t attr_buf[64];
         memset(attr_buf, 0, sizeof(attr_buf));
+
+        if (req->payload_size < 8) {
+            /* No func handle — return defaults */
+            int mtp = 1024;
+            memcpy(attr_buf + 24, &mtp, 4);
+            return chidori_send_response(fd, req->seq_num, (int32_t)cudaSuccess, attr_buf, sizeof(attr_buf));
+        }
+
+        uint64_t func_handle = 0;
+        memcpy(&func_handle, payload, 8);
+        CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
+        if (!func) {
+            /* Unknown handle — return defaults */
+            int mtp = 1024;
+            memcpy(attr_buf + 24, &mtp, 4);
+            return chidori_send_response(fd, req->seq_num, (int32_t)cudaSuccess, attr_buf, sizeof(attr_buf));
+        }
+
+        /* Query each attribute via cuFuncGetAttribute */
+        int val;
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func) == CUDA_SUCCESS) {
+            size_t v = (size_t)val; memcpy(attr_buf + 0, &v, 8);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, func) == CUDA_SUCCESS) {
+            size_t v = (size_t)val; memcpy(attr_buf + 8, &v, 8);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, func) == CUDA_SUCCESS) {
+            size_t v = (size_t)val; memcpy(attr_buf + 16, &v, 8);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 24, &val, 4);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_NUM_REGS, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 28, &val, 4);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_PTX_VERSION, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 32, &val, 4);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_BINARY_VERSION, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 36, &val, 4);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_CACHE_MODE_CA, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 40, &val, 4);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 44, &val, 4);
+        }
+        if (cuFuncGetAttribute(&val, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, func) == CUDA_SUCCESS) {
+            memcpy(attr_buf + 48, &val, 4);
+        }
+
+        if (s_verbose) {
+            int mtp = 0;
+            memcpy(&mtp, attr_buf + 24, 4);
+            fprintf(stderr, "[cuda_dispatch] FuncGetAttributes handle=0x%llx maxThreadsPerBlock=%d\n",
+                    (unsigned long long)func_handle, mtp);
+        }
+
         return chidori_send_response(fd, req->seq_num, (int32_t)cudaSuccess, attr_buf, sizeof(attr_buf));
     }
 

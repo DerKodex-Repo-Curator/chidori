@@ -1352,19 +1352,7 @@ cudaError_t cudaDeviceCanAccessPeer(int *canAccess, int device, int peerDevice) 
     return r;
 }
 
-cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
-    /*
-     * Stub: cudaFuncAttributes is ~60 bytes. Most callers can tolerate
-     * zeroed-out attributes. A full implementation would require the server
-     * to look up the function pointer, which is non-trivial for host-side
-     * function pointers in the Runtime API.
-     */
-    (void)func;
-    if (attr)
-        memset(attr, 0, 64); /* sizeof(cudaFuncAttributes) ~= 56-64 bytes */
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
-}
+/* cudaFuncGetAttributes — implemented after g_registered_functions is defined (see below) */
 
 /*
  * ============================================================================
@@ -3980,6 +3968,35 @@ cudaError_t cudaFuncSetAttribute(const void *func, int attr, int value) {
     (void)func; (void)attr; (void)value;
     g_last_error = cudaSuccess;
     return cudaSuccess;
+}
+
+cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
+    if (!attr) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
+    memset(attr, 0, 64);
+
+    /* Find and lazy-register the function on the server */
+    uint64_t func_handle = 0;
+    for (int i = 0; i < g_registered_function_count; i++) {
+        if (g_registered_functions[i].hostFun == func) {
+            func_handle = lazy_register_function(i);
+            break;
+        }
+    }
+
+    if (func_handle == 0) {
+        /* Can't find function — return reasonable defaults so grid calc doesn't get 0 */
+        int mtp = 1024;
+        memcpy((char *)attr + 24, &mtp, 4);  /* maxThreadsPerBlock */
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+
+    /* RPC to server: send func_handle(8), receive cudaFuncAttributes blob */
+    size_t out_len = 64;
+    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_FUNC_GET_ATTRIBUTES,
+                                              &func_handle, 8, attr, &out_len);
+    g_last_error = r;
+    return r;
 }
 
 cudaError_t cudaFuncSetCacheConfig(const void *func, int cacheConfig) {
