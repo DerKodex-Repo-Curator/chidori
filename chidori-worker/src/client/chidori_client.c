@@ -1331,11 +1331,15 @@ cudaError_t cudaDeviceReset(void) {
 
 cudaError_t cudaGetLastError(void) {
     cudaError_t r = g_last_error;
+    if (r != 0)
+        fprintf(stderr, "[chidori] cudaGetLastError() returning %d\n", r);
     g_last_error = cudaSuccess;
     return r;
 }
 
 cudaError_t cudaPeekAtLastError(void) {
+    if (g_last_error != 0)
+        fprintf(stderr, "[chidori] cudaPeekAtLastError() returning %d\n", g_last_error);
     return g_last_error;
 }
 
