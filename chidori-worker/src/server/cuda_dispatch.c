@@ -645,6 +645,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
         }
 
+        /* Grid with any zero dimension = empty launch (no-op) */
+        if (gridX == 0 || gridY == 0 || gridZ == 0) {
+            return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS, NULL, 0);
+        }
+
         CUstream stream = NULL;
         if (stream_handle != 0) {
             stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
@@ -1357,6 +1362,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
         if (!func) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
+        }
+
+        /* Grid with any zero dimension = empty launch (no-op) */
+        if (gridX == 0 || gridY == 0 || gridZ == 0) {
+            return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS, NULL, 0);
         }
 
         CUstream stream = NULL;
