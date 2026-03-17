@@ -648,6 +648,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         CUstream stream = NULL;
         if (stream_handle != 0) {
             stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+            if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         }
 
         /* Parse kernel parameters if present */
@@ -753,9 +754,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
         CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, handle);
         if (stream) {
             res = cuStreamDestroy(stream);
             hmap_remove(&g_streams, handle);
+            hmap_remove(&g_rt_streams, handle);
         } else {
             res = CUDA_SUCCESS; /* Already destroyed or default stream */
         }
@@ -770,6 +773,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             res = cuCtxSynchronize(); /* Default stream */
         } else {
             CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, handle);
+            if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, handle);
             res = stream ? cuStreamSynchronize(stream) : CUDA_SUCCESS;
         }
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
@@ -780,6 +784,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
         CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, handle);
         res = stream ? cuStreamQuery(stream) : CUDA_SUCCESS;
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -793,6 +798,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&flags, (char *)payload + 16, 4);
         }
         CUstream stream = stream_handle ? (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle) : NULL;
+        if (!stream && stream_handle) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         CUevent event = (CUevent)(uintptr_t)hmap_get(&g_events, event_handle);
         res = event ? cuStreamWaitEvent(stream, event, flags) : CUDA_ERROR_INVALID_HANDLE;
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
@@ -837,6 +843,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         }
         CUevent event = (CUevent)(uintptr_t)hmap_get(&g_events, event_handle);
         CUstream stream = stream_handle ? (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle) : NULL;
+        if (!stream && stream_handle) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         res = event ? cuEventRecord(event, stream) : CUDA_ERROR_INVALID_HANDLE;
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -1043,8 +1050,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             const void *data = (char *)payload + 28;
 
             cudaStream_t stream = NULL;
-            if (stream_handle != 0)
+            if (stream_handle != 0) {
                 stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+                if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, stream_handle);
+            }
 
             cudaError_t err = cudaMemcpyAsync((void *)(uintptr_t)dst_ptr, data,
                                                (size_t)size, cudaMemcpyHostToDevice, stream);
@@ -1060,8 +1069,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&stream_handle, (char *)payload + 28, 8);
 
             cudaStream_t stream = NULL;
-            if (stream_handle != 0)
+            if (stream_handle != 0) {
                 stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+                if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, stream_handle);
+            }
 
             if (kind == cudaMemcpyDeviceToHost) {
                 void *buf = malloc((size_t)size);
@@ -1123,10 +1134,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
         cudaStream_t stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, handle);
+        if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, handle);
         cudaError_t err = cudaSuccess;
         if (stream) {
             err = cudaStreamDestroy(stream);
             hmap_remove(&g_rt_streams, handle);
+            hmap_remove(&g_streams, handle);
         }
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
     }
@@ -1140,6 +1153,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             err = cudaDeviceSynchronize(); /* Default stream */
         } else {
             cudaStream_t stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, handle);
+            if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, handle);
             err = stream ? cudaStreamSynchronize(stream) : cudaSuccess;
         }
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
@@ -1165,8 +1179,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         }
         cudaEvent_t event = (cudaEvent_t)(uintptr_t)hmap_get(&g_rt_events, event_handle);
         cudaStream_t stream = NULL;
-        if (stream_handle != 0)
+        if (stream_handle != 0) {
             stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+            if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        }
         cudaError_t err = event ? cudaEventRecord(event, stream) : cudaErrorInvalidResourceHandle;
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
     }
