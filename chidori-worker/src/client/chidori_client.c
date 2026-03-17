@@ -3832,8 +3832,26 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
     }
 
     if (func_handle == 0 || func_idx < 0) {
+        /* Diagnostic: find closest registered function to understand the mismatch */
         fprintf(stderr, "[chidori-launch] UNREGISTERED func=%p (%d functions registered)\n",
                 func, g_registered_function_count);
+        uintptr_t target = (uintptr_t)func;
+        uintptr_t closest_dist = (uintptr_t)-1;
+        int closest_idx = -1;
+        for (int i = 0; i < g_registered_function_count; i++) {
+            uintptr_t addr = (uintptr_t)g_registered_functions[i].hostFun;
+            uintptr_t dist = (target > addr) ? (target - addr) : (addr - target);
+            if (dist < closest_dist) {
+                closest_dist = dist;
+                closest_idx = i;
+            }
+        }
+        if (closest_idx >= 0) {
+            fprintf(stderr, "[chidori-launch]   closest: %p '%s' (delta=%ld)\n",
+                    g_registered_functions[closest_idx].hostFun,
+                    g_registered_functions[closest_idx].deviceName,
+                    (long)(target - (uintptr_t)g_registered_functions[closest_idx].hostFun));
+        }
         g_last_error = cudaErrorInvalidDeviceFunction;
         return cudaErrorInvalidDeviceFunction;
     }
