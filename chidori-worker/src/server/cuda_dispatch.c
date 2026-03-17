@@ -966,137 +966,98 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
     case CHIDORI_CUDA_MEMCPY: {
         /*
-         * Direction-dependent layout from client:
-         *   HtoD: dst_ptr(8) + size(8) + kind(4) + data(size)
-         *   DtoH: dst_ptr(8) + src_ptr(8) + size(8) + kind(4)
-         *   DtoD: dst_ptr(8) + src_ptr(8) + size(8) + kind(4)
-         *
-         * Detect direction by reading kind at offset 16.
-         * If kind == 1 (HtoD), data follows at offset 20.
-         * Otherwise it's the DtoH/DtoD layout with kind at offset 24.
-         */
-        if (req->payload_size < 20) {
-            return chidori_send_response(fd, req->seq_num, (int32_t)cudaErrorInvalidValue, NULL, 0);
-        }
-
-        /* Peek at kind at offset 16 to determine layout */
-        int32_t kind_peek = 0;
-        memcpy(&kind_peek, (char *)payload + 16, 4);
-
-        if (kind_peek == cudaMemcpyHostToDevice) {
-            /* HtoD: dst_ptr(8) + size(8) + kind(4) + data(size) */
-            uint64_t dst_ptr = 0, size = 0;
-            memcpy(&dst_ptr, payload, 8);
-            memcpy(&size, (char *)payload + 8, 8);
-            const void *data = (char *)payload + 20;
-
-            cudaError_t err = cudaMemcpy((void *)(uintptr_t)dst_ptr, data,
-                                          (size_t)size, cudaMemcpyHostToDevice);
-            return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
-        } else {
-            /* DtoH or DtoD: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
-            uint64_t dst_ptr = 0, src_ptr = 0, size = 0;
-            int32_t kind = 0;
-            memcpy(&dst_ptr, payload, 8);
-            memcpy(&src_ptr, (char *)payload + 8, 8);
-            memcpy(&size, (char *)payload + 16, 8);
-            memcpy(&kind, (char *)payload + 24, 4);
-
-            if (kind == cudaMemcpyDeviceToHost) {
-                /* Read from device memory, send data back to client */
-                void *buf = malloc((size_t)size);
-                if (!buf) {
-                    return chidori_send_response(fd, req->seq_num,
-                                                (int32_t)cudaErrorMemoryAllocation, NULL, 0);
-                }
-                cudaError_t err = cudaMemcpy(buf, (void *)(uintptr_t)src_ptr,
-                                              (size_t)size, cudaMemcpyDeviceToHost);
-                int rc = chidori_send_response(fd, req->seq_num, (int32_t)err, buf, (size_t)size);
-                free(buf);
-                return rc;
-            } else if (kind == cudaMemcpyDeviceToDevice) {
-                /* No data transfer over wire */
-                cudaError_t err = cudaMemcpy((void *)(uintptr_t)dst_ptr,
-                                              (void *)(uintptr_t)src_ptr,
-                                              (size_t)size, cudaMemcpyDeviceToDevice);
-                return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
-            } else {
-                return chidori_send_response(fd, req->seq_num,
-                                            (int32_t)cudaErrorInvalidMemcpyDirection, NULL, 0);
-            }
-        }
-    }
-
-    case CHIDORI_CUDA_MEMCPY_ASYNC: {
-        /*
-         * Same layout as CHIDORI_CUDA_MEMCPY but with stream handle appended.
-         * HtoD: dst_ptr(8) + size(8) + kind(4) + stream(8) + data(size)
-         * DtoH: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) + stream(8)
-         * DtoD: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) + stream(8)
+         * Unified layout — kind is always at offset 24:
+         *   All: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) [+ data(size) for HtoD]
+         *   HtoD src_ptr is 0 (data follows after header at offset 28).
          */
         if (req->payload_size < 28) {
             return chidori_send_response(fd, req->seq_num, (int32_t)cudaErrorInvalidValue, NULL, 0);
         }
 
-        int32_t kind_peek = 0;
-        memcpy(&kind_peek, (char *)payload + 16, 4);
+        uint64_t dst_ptr = 0, src_ptr = 0, size = 0;
+        int32_t kind = 0;
+        memcpy(&dst_ptr, payload, 8);
+        memcpy(&src_ptr, (char *)payload + 8, 8);
+        memcpy(&size, (char *)payload + 16, 8);
+        memcpy(&kind, (char *)payload + 24, 4);
 
-        if (kind_peek == cudaMemcpyHostToDevice) {
-            /* HtoD: dst_ptr(8) + size(8) + kind(4) + stream(8) + data(size) */
-            uint64_t dst_ptr = 0, size = 0, stream_handle = 0;
-            memcpy(&dst_ptr, payload, 8);
-            memcpy(&size, (char *)payload + 8, 8);
-            memcpy(&stream_handle, (char *)payload + 20, 8);
+        if (kind == cudaMemcpyHostToDevice) {
             const void *data = (char *)payload + 28;
-
-            cudaStream_t stream = NULL;
-            if (stream_handle != 0) {
-                stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
-                if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, stream_handle);
+            cudaError_t err = cudaMemcpy((void *)(uintptr_t)dst_ptr, data,
+                                          (size_t)size, cudaMemcpyHostToDevice);
+            return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
+        } else if (kind == cudaMemcpyDeviceToHost) {
+            void *buf = malloc((size_t)size);
+            if (!buf) {
+                return chidori_send_response(fd, req->seq_num,
+                                            (int32_t)cudaErrorMemoryAllocation, NULL, 0);
             }
+            cudaError_t err = cudaMemcpy(buf, (void *)(uintptr_t)src_ptr,
+                                          (size_t)size, cudaMemcpyDeviceToHost);
+            int rc = chidori_send_response(fd, req->seq_num, (int32_t)err, buf, (size_t)size);
+            free(buf);
+            return rc;
+        } else if (kind == cudaMemcpyDeviceToDevice) {
+            cudaError_t err = cudaMemcpy((void *)(uintptr_t)dst_ptr,
+                                          (void *)(uintptr_t)src_ptr,
+                                          (size_t)size, cudaMemcpyDeviceToDevice);
+            return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
+        } else {
+            return chidori_send_response(fd, req->seq_num,
+                                        (int32_t)cudaErrorInvalidMemcpyDirection, NULL, 0);
+        }
+    }
 
+    case CHIDORI_CUDA_MEMCPY_ASYNC: {
+        /*
+         * Unified layout — kind always at offset 24, stream at offset 28:
+         *   All: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) + stream(8) [+ data for HtoD]
+         *   HtoD src_ptr is 0 (data follows after header at offset 36).
+         */
+        if (req->payload_size < 36) {
+            return chidori_send_response(fd, req->seq_num, (int32_t)cudaErrorInvalidValue, NULL, 0);
+        }
+
+        uint64_t dst_ptr = 0, src_ptr = 0, size = 0, stream_handle = 0;
+        int32_t kind = 0;
+        memcpy(&dst_ptr, payload, 8);
+        memcpy(&src_ptr, (char *)payload + 8, 8);
+        memcpy(&size, (char *)payload + 16, 8);
+        memcpy(&kind, (char *)payload + 24, 4);
+        memcpy(&stream_handle, (char *)payload + 28, 8);
+
+        cudaStream_t stream = NULL;
+        if (stream_handle != 0) {
+            stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+            if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        }
+
+        if (kind == cudaMemcpyHostToDevice) {
+            const void *data = (char *)payload + 36;
             cudaError_t err = cudaMemcpyAsync((void *)(uintptr_t)dst_ptr, data,
                                                (size_t)size, cudaMemcpyHostToDevice, stream);
             return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
-        } else {
-            /* DtoH or DtoD: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) + stream(8) */
-            uint64_t dst_ptr = 0, src_ptr = 0, size = 0, stream_handle = 0;
-            int32_t kind = 0;
-            memcpy(&dst_ptr, payload, 8);
-            memcpy(&src_ptr, (char *)payload + 8, 8);
-            memcpy(&size, (char *)payload + 16, 8);
-            memcpy(&kind, (char *)payload + 24, 4);
-            memcpy(&stream_handle, (char *)payload + 28, 8);
-
-            cudaStream_t stream = NULL;
-            if (stream_handle != 0) {
-                stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
-                if (!stream) stream = (cudaStream_t)(uintptr_t)hmap_get(&g_streams, stream_handle);
-            }
-
-            if (kind == cudaMemcpyDeviceToHost) {
-                void *buf = malloc((size_t)size);
-                if (!buf) {
-                    return chidori_send_response(fd, req->seq_num,
-                                                (int32_t)cudaErrorMemoryAllocation, NULL, 0);
-                }
-                cudaError_t err = cudaMemcpyAsync(buf, (void *)(uintptr_t)src_ptr,
-                                                   (size_t)size, cudaMemcpyDeviceToHost, stream);
-                /* Must synchronize to ensure data is ready before sending */
-                if (err == cudaSuccess)
-                    cudaStreamSynchronize(stream);
-                int rc = chidori_send_response(fd, req->seq_num, (int32_t)err, buf, (size_t)size);
-                free(buf);
-                return rc;
-            } else if (kind == cudaMemcpyDeviceToDevice) {
-                cudaError_t err = cudaMemcpyAsync((void *)(uintptr_t)dst_ptr,
-                                                   (void *)(uintptr_t)src_ptr,
-                                                   (size_t)size, cudaMemcpyDeviceToDevice, stream);
-                return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
-            } else {
+        } else if (kind == cudaMemcpyDeviceToHost) {
+            void *buf = malloc((size_t)size);
+            if (!buf) {
                 return chidori_send_response(fd, req->seq_num,
-                                            (int32_t)cudaErrorInvalidMemcpyDirection, NULL, 0);
+                                            (int32_t)cudaErrorMemoryAllocation, NULL, 0);
             }
+            cudaError_t err = cudaMemcpyAsync(buf, (void *)(uintptr_t)src_ptr,
+                                               (size_t)size, cudaMemcpyDeviceToHost, stream);
+            if (err == cudaSuccess)
+                cudaStreamSynchronize(stream);
+            int rc = chidori_send_response(fd, req->seq_num, (int32_t)err, buf, (size_t)size);
+            free(buf);
+            return rc;
+        } else if (kind == cudaMemcpyDeviceToDevice) {
+            cudaError_t err = cudaMemcpyAsync((void *)(uintptr_t)dst_ptr,
+                                               (void *)(uintptr_t)src_ptr,
+                                               (size_t)size, cudaMemcpyDeviceToDevice, stream);
+            return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
+        } else {
+            return chidori_send_response(fd, req->seq_num,
+                                        (int32_t)cudaErrorInvalidMemcpyDirection, NULL, 0);
         }
     }
 

@@ -1080,18 +1080,22 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
 
     switch (kind) {
     case cudaMemcpyHostToDevice: {
-        /* Payload: dst_ptr(8) + size(8) + kind(4) + data(count) */
-        size_t payload_len = 8 + 8 + 4 + count;
+        /* Payload: dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + data(count)
+         * Same header layout as DtoH/DtoD so kind is always at offset 24. */
+        size_t payload_len = 8 + 8 + 8 + 4 + count;
         void *payload = malloc(payload_len);
         if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
 
         uint64_t dst64 = (uint64_t)(uintptr_t)dst;
+        uint64_t src64 = 0;
         uint64_t size64 = (uint64_t)count;
         int32_t kind32 = kind;
-        memcpy(payload, &dst64, 8);
-        memcpy((char *)payload + 8, &size64, 8);
-        memcpy((char *)payload + 16, &kind32, 4);
-        memcpy((char *)payload + 20, src, count);
+        char *p = (char *)payload;
+        memcpy(p, &dst64, 8); p += 8;
+        memcpy(p, &src64, 8); p += 8;
+        memcpy(p, &size64, 8); p += 8;
+        memcpy(p, &kind32, 4); p += 4;
+        memcpy(p, src, count);
 
         r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_MEMCPY, payload, payload_len);
         free(payload);
@@ -1147,17 +1151,20 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 
     switch (kind) {
     case cudaMemcpyHostToDevice: {
-        /* Payload: dst_ptr(8) + size(8) + kind(4) + stream(8) + data(count) */
-        size_t payload_len = 8 + 8 + 4 + 8 + count;
+        /* Payload: dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + stream(8) + data(count)
+         * Same header layout as DtoH/DtoD so kind is always at offset 24. */
+        size_t payload_len = 8 + 8 + 8 + 4 + 8 + count;
         void *payload = malloc(payload_len);
         if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
 
         uint64_t dst64 = (uint64_t)(uintptr_t)dst;
+        uint64_t src64 = 0; /* No device source for HtoD — data is in payload */
         uint64_t size64 = (uint64_t)count;
         int32_t kind32 = kind;
         uint64_t stream64 = (uint64_t)(uintptr_t)stream;
         char *p = (char *)payload;
         memcpy(p, &dst64, 8); p += 8;
+        memcpy(p, &src64, 8); p += 8;
         memcpy(p, &size64, 8); p += 8;
         memcpy(p, &kind32, 4); p += 4;
         memcpy(p, &stream64, 8); p += 8;
