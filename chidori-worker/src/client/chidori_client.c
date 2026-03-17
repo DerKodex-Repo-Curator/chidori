@@ -3907,6 +3907,57 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
     return r;
 }
 
+/*
+ * cudaLaunchKernelExC — CUDA 12.x extended launch (cluster dims, etc.)
+ * Extract grid/block from the config struct and delegate to cudaLaunchKernel.
+ *
+ * cudaLaunchConfig_t layout (CUDA 12.x):
+ *   dim3 gridDim;       // offset 0, 12 bytes
+ *   dim3 blockDim;      // offset 12, 12 bytes
+ *   size_t dynamicSmemBytes;  // offset 24, 8 bytes
+ *   cudaStream_t stream;     // offset 32, 8 bytes
+ *   ...attrs after offset 40
+ */
+typedef struct {
+    dim3 gridDim;
+    dim3 blockDim;
+    size_t dynamicSmemBytes;
+    void *stream;
+    /* remaining fields ignored */
+} chidori_launch_config_t;
+
+cudaError_t cudaLaunchKernelExC(const chidori_launch_config_t *config,
+                                 const void *func, void **args) {
+    return cudaLaunchKernel(func, config->gridDim, config->blockDim,
+                            args, config->dynamicSmemBytes, config->stream);
+}
+
+/*
+ * __cudaPushCallConfiguration / __cudaPopCallConfiguration
+ * Used by nvcc-compiled code for <<<>>> kernel launch syntax.
+ */
+static __thread dim3 s_push_grid, s_push_block;
+static __thread size_t s_push_shared;
+static __thread void *s_push_stream;
+
+unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim,
+                                      size_t sharedMem, void *stream) {
+    s_push_grid = gridDim;
+    s_push_block = blockDim;
+    s_push_shared = sharedMem;
+    s_push_stream = stream;
+    return 0; /* success */
+}
+
+cudaError_t __cudaPopCallConfiguration(dim3 *gridDim, dim3 *blockDim,
+                                        size_t *sharedMem, void **stream) {
+    if (gridDim) *gridDim = s_push_grid;
+    if (blockDim) *blockDim = s_push_block;
+    if (sharedMem) *sharedMem = s_push_shared;
+    if (stream) *stream = s_push_stream;
+    return cudaSuccess;
+}
+
 cudaError_t cudaFuncSetAttribute(const void *func, int attr, int value) {
     (void)func; (void)attr; (void)value;
     g_last_error = cudaSuccess;
