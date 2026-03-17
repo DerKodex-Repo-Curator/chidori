@@ -647,6 +647,8 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         /* Grid with any zero dimension = empty launch (no-op) */
         if (gridX == 0 || gridY == 0 || gridZ == 0) {
+            if (s_verbose)
+                fprintf(stderr, "[cuda_dispatch] SKIP grid=(%u,%u,%u) zero dim\n", gridX, gridY, gridZ);
             return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS, NULL, 0);
         }
 
@@ -1439,6 +1441,8 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         /* Grid with any zero dimension = empty launch (no-op) */
         if (gridX == 0 || gridY == 0 || gridZ == 0) {
+            if (s_verbose)
+                fprintf(stderr, "[cuda_dispatch] SKIP grid=(%u,%u,%u) zero dim\n", gridX, gridY, gridZ);
             return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS, NULL, 0);
         }
 

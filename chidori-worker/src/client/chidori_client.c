@@ -1020,17 +1020,118 @@ cudaError_t cudaSetDevice(int device) {
     return r;
 }
 
+/* Forward declaration — defined later in this file */
+cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device);
+
 cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     /*
-     * cudaDeviceProp is ~700 bytes. We send the device ordinal and receive
-     * the full serialized struct from the server.
+     * cudaDeviceProp struct layout varies between CUDA versions.
+     * The server may run a different CUDA version than the application.
+     * We fill the struct using individual cudaDeviceGetAttribute calls
+     * at CUDA 12.x offsets (the dominant PyTorch runtime version).
+     *
+     * CUDA 12.x layout (first ~420 bytes):
+     *   0:   char name[256]
+     *   288: size_t totalGlobalMem
+     *   296: size_t sharedMemPerBlock
+     *   304: int regsPerBlock
+     *   308: int warpSize
+     *   312: size_t memPitch
+     *   320: int maxThreadsPerBlock
+     *   324: int maxThreadsDim[3]
+     *   336: int maxGridSize[3]
+     *   348: int clockRate
+     *   352: size_t totalConstMem
+     *   360: int major
+     *   364: int minor
+     *   368: size_t textureAlignment
+     *   376: size_t texturePitchAlignment
+     *   384: int deviceOverlap
+     *   388: int multiProcessorCount
+     *   392: int kernelExecTimeoutEnabled
+     *   396: int integrated
+     *   400: int canMapHostMemory
+     *   404: int computeMode
      */
-    int32_t dev = device;
-    size_t len = 1024; /* cudaDeviceProp is large; allow generous buffer */
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_GET_DEVICE_PROPERTIES,
-                                            &dev, sizeof(dev), prop, &len);
-    g_last_error = r;
-    return r;
+    if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
+    memset(prop, 0, 1032);
+
+    char *p = (char *)prop;
+    int val;
+
+    /* name: use cuDeviceGetName via the server */
+    {
+        /* Get name from a raw properties RPC, only use the first 256 bytes (name field) */
+        char tmp[1024];
+        int32_t dev = device;
+        size_t len = sizeof(tmp);
+        if (chidori_rpc(CHIDORI_CUDA_GET_DEVICE_PROPERTIES, &dev, sizeof(dev), tmp, &len) == 0 && len >= 256) {
+            memcpy(p, tmp, 256);  /* name is at offset 0 in ALL CUDA versions */
+        }
+    }
+
+    /* totalGlobalMem at offset 288 (size_t = 8) — use cuDeviceTotalMem */
+    {
+        int32_t dev = device;
+        uint64_t total = 0;
+        size_t len = sizeof(total);
+        chidori_rpc(CHIDORI_CU_DEVICE_TOTAL_MEM, &dev, sizeof(dev), &total, &len);
+        memcpy(p + 288, &total, 8);
+    }
+
+    /* Helper macro: query a Runtime API device attribute and write to the struct */
+    #define SET_INT(offset, cuda_attr) do { \
+        val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); \
+        memcpy(p + (offset), &val, 4); \
+    } while(0)
+
+    #define SET_SIZE_T(offset, cuda_attr) do { \
+        val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); \
+        size_t sv = (size_t)val; memcpy(p + (offset), &sv, 8); \
+    } while(0)
+
+    /* cudaDevAttr enum values (stable across CUDA versions) */
+    SET_SIZE_T(296, 8);   /* sharedMemPerBlock = cudaDevAttrMaxSharedMemoryPerBlock */
+    SET_INT(304, 12);     /* regsPerBlock = cudaDevAttrMaxRegistersPerBlock */
+    SET_INT(308, 10);     /* warpSize = cudaDevAttrWarpSize */
+    SET_SIZE_T(312, 11);  /* memPitch = cudaDevAttrMaxPitch */
+    SET_INT(320, 1);      /* maxThreadsPerBlock = cudaDevAttrMaxThreadsPerBlock */
+    SET_INT(324, 2);      /* maxThreadsDim[0] = cudaDevAttrMaxBlockDimX */
+    SET_INT(328, 3);      /* maxThreadsDim[1] = cudaDevAttrMaxBlockDimY */
+    SET_INT(332, 4);      /* maxThreadsDim[2] = cudaDevAttrMaxBlockDimZ */
+    SET_INT(336, 5);      /* maxGridSize[0] = cudaDevAttrMaxGridDimX */
+    SET_INT(340, 6);      /* maxGridSize[1] = cudaDevAttrMaxGridDimY */
+    SET_INT(344, 7);      /* maxGridSize[2] = cudaDevAttrMaxGridDimZ */
+    SET_INT(348, 13);     /* clockRate = cudaDevAttrClockRate */
+    SET_SIZE_T(352, 9);   /* totalConstMem = cudaDevAttrTotalConstantMemory */
+    SET_INT(360, 75);     /* major = cudaDevAttrComputeCapabilityMajor */
+    SET_INT(364, 76);     /* minor = cudaDevAttrComputeCapabilityMinor */
+    SET_SIZE_T(368, 14);  /* textureAlignment = cudaDevAttrTextureAlignment */
+    SET_SIZE_T(376, 52);  /* texturePitchAlignment = cudaDevAttrTexturePitchAlignment */
+    SET_INT(384, 15);     /* deviceOverlap = cudaDevAttrGpuOverlap */
+    SET_INT(388, 16);     /* multiProcessorCount = cudaDevAttrMultiProcessorCount */
+    SET_INT(392, 17);     /* kernelExecTimeoutEnabled = cudaDevAttrKernelExecTimeout */
+    SET_INT(396, 18);     /* integrated = cudaDevAttrIntegrated */
+    SET_INT(400, 19);     /* canMapHostMemory = cudaDevAttrCanMapHostMemory */
+    SET_INT(404, 20);     /* computeMode = cudaDevAttrComputeMode */
+    SET_INT(408, 21);     /* maxTexture1D = cudaDevAttrMaxTexture1DWidth */
+    SET_INT(424, 35);     /* concurrentKernels = cudaDevAttrConcurrentKernels */
+    SET_INT(432, 36);     /* ECCEnabled = cudaDevAttrEccEnabled */
+    SET_INT(436, 33);     /* pciBusID = cudaDevAttrPciBusId */
+    SET_INT(440, 34);     /* pciDeviceID = cudaDevAttrPciDeviceId */
+    SET_INT(448, 37);     /* memoryClockRate = cudaDevAttrMemoryClockRate */
+    SET_INT(452, 38);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth */
+    SET_INT(456, 39);     /* l2CacheSize = cudaDevAttrL2CacheSize */
+    SET_INT(460, 40);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
+    SET_INT(464, 41);     /* asyncEngineCount = cudaDevAttrAsyncEngineCount */
+    SET_INT(472, 56);     /* managedMemory = cudaDevAttrManagedMemory */
+    SET_INT(476, 57);     /* isMultiGpuBoard = cudaDevAttrIsMultiGpuBoard */
+
+    #undef SET_INT
+    #undef SET_SIZE_T
+
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
 }
 
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
@@ -3952,6 +4053,11 @@ unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim,
     s_push_block = blockDim;
     s_push_shared = sharedMem;
     s_push_stream = stream;
+    if (g_verbose)
+        fprintf(stderr, "[chidori-push] grid=(%u,%u,%u) block=(%u,%u,%u) shared=%zu stream=%p\n",
+                gridDim.x, gridDim.y, gridDim.z,
+                blockDim.x, blockDim.y, blockDim.z,
+                sharedMem, stream);
     return 0; /* success */
 }
 
