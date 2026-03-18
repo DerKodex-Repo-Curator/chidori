@@ -12,7 +12,7 @@ CFLAGS = -Wall -Wextra -O2 -fPIC -I include
 
 CUDA_PATH ?= /usr/local/cuda
 CUDA_CFLAGS = -I$(CUDA_PATH)/include
-CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcuda -lcudart -lcublas -lcudnn
+CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcuda -lcudart -lcublas -lcublasLt -lcudnn
 
 LDFLAGS_SERVER = -lpthread $(CUDA_LDFLAGS)
 LDFLAGS_CLIENT = -lpthread -ldl -shared
