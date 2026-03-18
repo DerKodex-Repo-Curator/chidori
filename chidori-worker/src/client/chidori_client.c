@@ -4606,19 +4606,13 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
                 magic, (unsigned long long)fat_size);
     }
 
-    /* Store a COPY of the fat binary data — the original pointer may be
-     * invalidated after __cudaRegisterFatBinary returns (runtime-managed memory).
-     * Lazy registration sends this copy to the server later on first kernel use. */
+    /* Store pointer to fat binary data for lazy registration.
+     * The data lives in the .nv_fatbin ELF section of the loaded .so — it
+     * remains valid for the lifetime of the process. */
     static int fat_idx_storage[MAX_FAT_BINARIES];
     if (g_fat_binary_count < MAX_FAT_BINARIES) {
         int idx = g_fat_binary_count++;
-        void *copy = malloc(fat_size);
-        if (copy) {
-            memcpy(copy, data, fat_size);
-            g_fat_binaries[idx].data = (const unsigned char *)copy;
-        } else {
-            g_fat_binaries[idx].data = data; /* fallback to pointer if OOM */
-        }
+        g_fat_binaries[idx].data = data;
         g_fat_binaries[idx].size = fat_size;
         g_fat_binaries[idx].server_handle = 0;
         fat_idx_storage[idx] = idx;

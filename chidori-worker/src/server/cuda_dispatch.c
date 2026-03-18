@@ -1328,15 +1328,23 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_REGISTER_FAT_BINARY: {
-        /* Payload is a CUDA fat binary (magic 0xba55ed50).
-         * Must use cuModuleLoadFatBinary, not cuModuleLoadData,
-         * because fat binaries contain multiple arch-specific CUBINs
-         * and need the fat binary loader to select the right one. */
+        /* Payload is a CUDA fat binary. Try cuModuleLoadData first (handles
+         * both fat binaries and raw CUBINs/PTX), then cuModuleLoadFatBinary
+         * as fallback. Log failures for debugging. */
         CUmodule mod;
-        res = cuModuleLoadFatBinary(&mod, payload);
+        uint32_t fb_magic = 0;
+        if (req->payload_size >= 4) memcpy(&fb_magic, payload, 4);
+
+        res = cuModuleLoadData(&mod, payload);
         if (res != CUDA_SUCCESS) {
-            /* Fallback: try cuModuleLoadData for raw CUBINs/PTX */
-            res = cuModuleLoadData(&mod, payload);
+            CUresult res2 = cuModuleLoadFatBinary(&mod, payload);
+            if (res2 == CUDA_SUCCESS) {
+                res = res2;
+            } else if (s_verbose || res != CUDA_SUCCESS) {
+                fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: magic=0x%08x size=%u "
+                        "loadData=%d loadFatBinary=%d\n",
+                        fb_magic, req->payload_size, (int)res, (int)res2);
+            }
         }
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
