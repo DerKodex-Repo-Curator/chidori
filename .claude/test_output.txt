@@ -1,0 +1,132 @@
+=== test_train.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+[chidori] cudaGetLastError() returning 700
+Device: NVIDIA GeForce RTX 4090 Laptop GPU
+============================================================
+
+[LOAD] Uploading 4096x4096 matrices to GPU...
+[LOAD] Done: 0.3s (201 MB transferred)
+
+[COMPUTE] 2000x mm(4096x4096) — ALL data already on GPU
+[COMPUTE] Watch nvidia-smi NOW...
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_train.py", line 39, in <module>
+    torch.cuda.synchronize()
+    ~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/cuda/__init__.py", line 1108, in synchronize
+    return torch._C._cuda_synchronize()
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+torch.AcceleratorError: CUDA error: illegal address
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5736
+EXIT: 0
+=== test_training_fp16.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+[chidori] cudaGetLastError() returning 700
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_training_fp16.py", line 30, in <module>
+    model = MLP(HIDDEN, VOCAB, LAYERS).cuda().half()
+            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1093, in cuda
+    return self._apply(lambda t: t.cuda(device))
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+    module._apply(fn)
+    ~~~~~~~~~~~~~^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 964, in _apply
+    param_applied = fn(param)
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1093, in <lambda>
+    return self._apply(lambda t: t.cuda(device))
+                                 ~~~~~~^^^^^^^^
+torch.AcceleratorError: CUDA error: illegal address
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5736
+EXIT: 0
+=== test_training.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+[chidori] cudaGetLastError() returning 700
+Device: NVIDIA GeForce RTX 4090 Laptop GPU (16.7 GB)
+============================================================
+
+[MODEL] 12 transformer layers, hidden=2048, vocab=32000
+[MODEL] Batch=32, seq=128
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_training.py", line 65, in <module>
+    model = MiniModel().cuda().half()
+            ~~~~~~~~~~~~~~~~^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1093, in cuda
+    return self._apply(lambda t: t.cuda(device))
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+    module._apply(fn)
+    ~~~~~~~~~~~~~^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 964, in _apply
+    param_applied = fn(param)
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1093, in <lambda>
+    return self._apply(lambda t: t.cuda(device))
+                                 ~~~~~~^^^^^^^^
+torch.AcceleratorError: CUDA error: illegal address
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5736
+EXIT: 0
+=== test_inference.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Device: NVIDIA GeForce RTX 4090 Laptop GPU
+VRAM: 16.7 GB
+============================================================
+
+[LOAD] Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
+Loading weights:   0%|          | 0/201 [00:00<?, ?it/s]Loading weights:  32%|███▏      | 64/201 [00:00<00:00, 624.58it/s]Loading weights:  78%|███████▊  | 157/201 [00:00<00:00, 800.10it/s]Loading weights: 100%|██████████| 201/201 [00:00<00:00, 851.62it/s]
+[chidori] cudaGetLastError() returning 700
+[LOAD] CPU load: 1.2s
+[LOAD] Moving to GPU...
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_inference.py", line 28, in <module>
+    model = model.cuda()
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/transformers/modeling_utils.py", line 3526, in cuda
+    return super().cuda(*args, **kwargs)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1093, in cuda
+    return self._apply(lambda t: t.cuda(device))
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+    module._apply(fn)
+    ~~~~~~~~~~~~~^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+    module._apply(fn)
+    ~~~~~~~~~~~~~^^^^
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 964, in _apply
+    param_applied = fn(param)
+  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1093, in <lambda>
+    return self._apply(lambda t: t.cuda(device))
+                                 ~~~~~~^^^^^^^^
+torch.AcceleratorError: CUDA error: illegal address
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5736
+EXIT: 0
+=== DONE ===

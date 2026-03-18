@@ -1337,10 +1337,16 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         res = cuModuleLoadData(&mod, payload);
         if (res != CUDA_SUCCESS) {
+            /* Clear any GPU error state from the failed load */
+            cudaGetLastError();
             CUresult res2 = cuModuleLoadFatBinary(&mod, payload);
             if (res2 == CUDA_SUCCESS) {
                 res = res2;
-            } else if (s_verbose || res != CUDA_SUCCESS) {
+            } else {
+                /* Clear error state again — don't poison the GPU context */
+                cudaGetLastError();
+                cudaDeviceSynchronize();
+                cudaGetLastError();
                 fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: magic=0x%08x size=%u "
                         "loadData=%d loadFatBinary=%d\n",
                         fb_magic, req->payload_size, (int)res, (int)res2);
