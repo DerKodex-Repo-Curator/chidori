@@ -1335,22 +1335,25 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         uint32_t fb_magic = 0;
         if (req->payload_size >= 4) memcpy(&fb_magic, payload, 4);
 
-        res = cuModuleLoadData(&mod, payload);
+        /* Use cuModuleLoadDataEx with JIT error log to get diagnostics.
+         * If the load fails, we need to prevent it from poisoning the GPU context.
+         * Fatal errors (700) from bad fat binaries corrupt the context permanently. */
+        {
+            char jit_error_log[1024] = {0};
+            CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+            void *opt_vals[] = {(void *)jit_error_log, (void *)(uintptr_t)sizeof(jit_error_log)};
+            res = cuModuleLoadDataEx(&mod, payload, 2, opts, opt_vals);
+        }
         if (res != CUDA_SUCCESS) {
-            /* Clear any GPU error state from the failed load */
+            /* Try cuModuleLoadFatBinary as fallback */
+            res = cuModuleLoadFatBinary(&mod, payload);
+        }
+        if (res != CUDA_SUCCESS) {
+            /* Clear Runtime API error state */
             cudaGetLastError();
-            CUresult res2 = cuModuleLoadFatBinary(&mod, payload);
-            if (res2 == CUDA_SUCCESS) {
-                res = res2;
-            } else {
-                /* Clear error state again — don't poison the GPU context */
-                cudaGetLastError();
-                cudaDeviceSynchronize();
-                cudaGetLastError();
-                fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: magic=0x%08x size=%u "
-                        "loadData=%d loadFatBinary=%d\n",
-                        fb_magic, req->payload_size, (int)res, (int)res2);
-            }
+            if (s_verbose)
+                fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: magic=0x%08x size=%u res=%d\n",
+                        fb_magic, req->payload_size, (int)res);
         }
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();

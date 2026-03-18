@@ -1,3 +1,13 @@
+From github.com:fpolica91/chidori
+   6dfeb22..c4df43d  main       -> origin/main
+Updating 6dfeb22..c4df43d
+Fast-forward
+ .claude/test_output.txt                   | 132 ++++++++++++++++++++++++++++++
+ chidori-worker/src/server/cuda_dispatch.c |   8 +-
+ 2 files changed, 139 insertions(+), 1 deletion(-)
+ create mode 100644 .claude/test_output.txt
+rm -rf build
+      |            ^~~~~~~~~~~~~~~~~~~~~
 === test_train.py ===
 [chidori] Direct connect to gpu-worker at 127.0.0.1:43211
 [chidori] Socket fd=500
@@ -97,9 +107,9 @@ VRAM: 16.7 GB
 ============================================================
 
 [LOAD] Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
-Loading weights:   0%|          | 0/201 [00:00<?, ?it/s]Loading weights:  32%|███▏      | 64/201 [00:00<00:00, 624.58it/s]Loading weights:  78%|███████▊  | 157/201 [00:00<00:00, 800.10it/s]Loading weights: 100%|██████████| 201/201 [00:00<00:00, 851.62it/s]
+Loading weights:   0%|          | 0/201 [00:00<?, ?it/s]Loading weights:  64%|██████▎   | 128/201 [00:00<00:00, 1264.09it/s]Loading weights: 100%|██████████| 201/201 [00:00<00:00, 1307.38it/s]
 [chidori] cudaGetLastError() returning 700
-[LOAD] CPU load: 1.2s
+[LOAD] CPU load: 1.0s
 [LOAD] Moving to GPU...
 Traceback (most recent call last):
   File "/home/fabricio/chidori/chidori-worker/tests/test_inference.py", line 28, in <module>

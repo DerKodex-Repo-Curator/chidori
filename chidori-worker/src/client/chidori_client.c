@@ -4566,19 +4566,18 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
 
     uint64_t fat_size = 0;
     if (magic == 0xba55ed50) {
-        /* New CUDA fat binary header (__cudaFatBinaryHeader):
-         *   magic(4) version(2) headerSize(2) fatSize(8) ...
-         * fatSize at offset 8 is the total binary size */
+        /* __cudaFatBinaryHeader: magic(4) version(2) headerSize(2) fatSize(8)
+         * The fatSize includes the header itself. */
+        uint16_t version = 0, headerSize = 0;
+        memcpy(&version, data + 4, 2);
+        memcpy(&headerSize, data + 6, 2);
         memcpy(&fat_size, data + 8, 8);
+
+        /* Sanity: if fatSize is 0 or absurd, use headerSize as minimum */
         if (fat_size == 0 || fat_size > 256*1024*1024) {
-            /* Try alternative: some versions put size as uint32 at offset 8 */
-            uint32_t fat_size32 = 0;
-            memcpy(&fat_size32, data + 8, 4);
-            fprintf(stderr, "[chidori] fat_binary 0xba55ed50: fat_size64=%llu fat_size32=%u hdr_bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                    (unsigned long long)fat_size, fat_size32,
-                    data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
-            if (fat_size32 > 0 && fat_size32 < 256*1024*1024)
-                fat_size = fat_size32;
+            fat_size = headerSize > 0 ? headerSize : 4096;
+            fprintf(stderr, "[chidori] fat_binary: bad fatSize=%llu, using %llu (v=%u hdr=%u)\n",
+                    (unsigned long long)fat_size, (unsigned long long)fat_size, version, headerSize);
         }
     } else if (magic == 0x466243b1) {
         /* Old FATBIN — size at offset 8 */
