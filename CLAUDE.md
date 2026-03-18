@@ -97,3 +97,48 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
 2. Add client-side serialization in `src/client/chidori_client.c`
 3. Add server-side dispatch case in `src/server/cuda_dispatch.c`
 4. If the function returns handles, add handle mapping in the dispatch case using `handle_map.h`
+
+
+
+## Rules
+
+### Testing — Mandatory After Every Change
+
+1. Before running tests, ALWAYS delete the output file first:
+   `rm -f .claude/test_output.txt`
+
+2. Run the FULL test suite on the Lenovo loopback — never a subset:
+   ```bash
+   ssh fabricio@lenovo.local 'cd ~/chidori/chidori-worker && \
+     kill $(pgrep chidori-worker) 2>/dev/null; sleep 1; \
+     nohup build/chidori-worker --standalone 43211 > /tmp/server.log 2>&1 & sleep 1; \
+     ENV="CHIDORI_DIRECT_CONNECT=1 CHIDORI_CFG_OVERRIDE={\"id\":\"test\",\"servers\":[\"127.0.0.1:43211\"]} LD_PRELOAD=build/libcuda.so.1 LD_LIBRARY_PATH=build" && \
+     echo "=== run_training_test.sh ===" && ./tests/run_training_test.sh && \
+     echo "=== test_train.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_train.py && \
+     echo "=== test_training_fp16.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_training_fp16.py && \
+     echo "=== test_training.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_training.py && \
+     echo "=== test_inference.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_inference.py && \
+     echo "=== ALL TESTS PASSED ==="' 2>&1 | tee .claude/test_output.txt
+   ```
+   Before pushing code, ALWAYS: `git push origin main` then on Lenovo `git pull && make clean && make all CUDA_PATH=/opt/cuda && cd build && ln -sf libchidori.so libcuda.so.1`
+
+3. The test command is NON-BLOCKING — wait for it to fully complete
+   before reading the output. Do not proceed while tests are running.
+
+4. Read `.claude/test_output.txt` in full after every run.
+
+5. If ANY test fails:
+   - Identify ALL failures in the file before touching any code
+   - Fix ALL identified failures
+   - Delete `.claude/test_output.txt`
+   - Re-run the full suite from step 1
+   - Repeat until the file shows zero failures
+
+6. NEVER report success until you have read the output file and 
+   confirmed zero failures. Do not assume — read the file.
+
+7. NEVER fix one test and re-run — always fix all visible failures
+   before the next run.
+
+8. If the same failure repeats 3 times unchanged, STOP and report 
+   the full contents of `.claude/test_output.txt` to me — do not loop forever.
