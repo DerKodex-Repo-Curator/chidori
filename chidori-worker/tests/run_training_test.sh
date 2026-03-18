@@ -56,12 +56,10 @@ P = sum(p.numel() for p in model.parameters())
 print(f"Model: {P/1e6:.1f}M params (FP32, bias=True, ReLU)")
 
 opt = torch.optim.SGD(model.parameters(), lr=0.01)
-loss_fn = nn.MSELoss()
 
 # Warmup
 x = torch.randn(16, 256).cuda()
-t = torch.randn(16, 256).cuda()
-opt.zero_grad(); loss_fn(model(x), t).backward(); opt.step()
+opt.zero_grad(); model(x).sum().backward(); opt.step()
 torch.cuda.synchronize()
 print("Warmup done\n")
 
@@ -69,10 +67,9 @@ t0 = time.time()
 losses = []
 for step in range(20):
     x = torch.randn(16, 256).cuda()
-    target = torch.randn(16, 256).cuda()
     opt.zero_grad()
     y = model(x)
-    loss = loss_fn(y, target)
+    loss = y.sum()
     loss.backward()
     opt.step()
     if step % 5 == 0:
