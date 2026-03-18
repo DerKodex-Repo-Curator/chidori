@@ -1328,32 +1328,15 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_REGISTER_FAT_BINARY: {
-        /* Payload is a CUDA fat binary. Try cuModuleLoadData first (handles
-         * both fat binaries and raw CUBINs/PTX), then cuModuleLoadFatBinary
-         * as fallback. Log failures for debugging. */
+        /* Payload is raw fat binary data. Use cuModuleLoadData which handles
+         * both fat binaries (0xba55ed50) and raw CUBINs/PTX. */
         CUmodule mod;
-        uint32_t fb_magic = 0;
-        if (req->payload_size >= 4) memcpy(&fb_magic, payload, 4);
-
-        /* Use cuModuleLoadDataEx with JIT error log to get diagnostics.
-         * If the load fails, we need to prevent it from poisoning the GPU context.
-         * Fatal errors (700) from bad fat binaries corrupt the context permanently. */
-        {
-            char jit_error_log[1024] = {0};
-            CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
-            void *opt_vals[] = {(void *)jit_error_log, (void *)(uintptr_t)sizeof(jit_error_log)};
-            res = cuModuleLoadDataEx(&mod, payload, 2, opts, opt_vals);
-        }
+        res = cuModuleLoadData(&mod, payload);
         if (res != CUDA_SUCCESS) {
-            /* Try cuModuleLoadFatBinary as fallback */
-            res = cuModuleLoadFatBinary(&mod, payload);
-        }
-        if (res != CUDA_SUCCESS) {
-            /* Clear Runtime API error state */
-            cudaGetLastError();
-            if (s_verbose)
-                fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: magic=0x%08x size=%u res=%d\n",
-                        fb_magic, req->payload_size, (int)res);
+            /* Log the failure but DON'T try alternative loaders — they can
+             * fatally poison the GPU context with error 700. */
+            fprintf(stderr, "[cuda_dispatch] cuModuleLoadData FAILED: size=%u res=%d\n",
+                    req->payload_size, (int)res);
         }
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
