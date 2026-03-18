@@ -8,10 +8,11 @@
 #define CHIDORI_HANDLE_MAP_H
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define HANDLE_MAP_MAX 1024
+#define HANDLE_MAP_MAX 8192
 
 typedef struct {
   uint64_t keys[HANDLE_MAP_MAX];
@@ -22,8 +23,11 @@ typedef struct {
 static inline void hmap_init(handle_map_t *m) { memset(m, 0, sizeof(*m)); }
 
 static inline int hmap_put(handle_map_t *m, uint64_t key, uint64_t val) {
-  if (m->count >= HANDLE_MAP_MAX)
+  if (m->count >= HANDLE_MAP_MAX) {
+    fprintf(stderr, "[handle_map] FULL (%d/%d) — cannot insert key=0x%llx\n",
+            m->count, HANDLE_MAP_MAX, (unsigned long long)key);
     return -1;
+  }
   m->keys[m->count] = key;
   m->vals[m->count] = val;
   m->count++;

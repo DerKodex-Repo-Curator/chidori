@@ -19,7 +19,7 @@ PROMPT = "Explain how GPU-over-IP works in simple terms:"
 print(f"\n[LOAD] Loading {MODEL}...")
 t0 = time.time()
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
-model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16, attn_implementation="eager")
+model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, attn_implementation="eager")
 load_cpu_dt = time.time() - t0
 print(f"[LOAD] CPU load: {load_cpu_dt:.1f}s")
 

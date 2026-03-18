@@ -119,6 +119,26 @@ Response [12B]: msg_len(4) | seq_num(4) | result(4)
 
 `cuMemcpyDtoD(dst, src, 16MB)` sends only 24 bytes over the network. The actual copy happens entirely on the remote GPU. This is why ML workloads perform well — most data movement is GPU-internal.
 
+## Benchmarks
+
+Tested on Tesla V100-SXM3-32GB server, TinyLlama 1.1B (inference), 23M-param MLP (training).
+
+| Workload | Chidori Loopback | Native | Overhead |
+|----------|-----------------|--------|----------|
+| FP32 matmul (2000x 4096x4096) | 14.6 TFLOPS | 15.25 TFLOPS | ~0% |
+| Training (FP16, 50 steps) | 321K tok/s | 330K tok/s | 2.9% |
+| Inference (TinyLlama 1.1B) | 10.2 tok/s | ~54 tok/s | 5x (sync RPC bound) |
+
+Cross-machine over WAN (39ms RTT):
+
+| Workload | Throughput | Notes |
+|----------|-----------|-------|
+| Training | 14.2K tok/s | Compute-bound, latency hidden by async RPCs |
+| Inference | 0.8 tok/s | 3 sync RPCs/token x 39ms = sequential bottleneck |
+| Matmul compute | 14.6 TFLOPS | Identical to native once data loaded |
+
+Training is near-native because GEMM operations are fire-and-forget async RPCs. Inference is latency-bound because each token requires synchronization.
+
 ## Status
 
 | Component | Status |
@@ -129,9 +149,12 @@ Response [12B]: msg_len(4) | seq_num(4) | result(4)
 | cuDNN | Working (~47 functions) |
 | Symbol stubs | Working (~150 functions) |
 | Multi-GPU (8x H100) | Working |
-| PyTorch | Working (tensor ops, matmul) |
+| PyTorch inference | Working (TinyLlama 1.1B, cross-machine) |
+| PyTorch training | Working (FP16, bias=False linears) |
 | Agent-mediated mode | Working (with socket fix) |
-| GPU isolation | Not yet |
+| FP32 training with bias | Blocked (cublasLt heuristic) |
+| Flash/SDPA attention | Blocked (CUTLASS kernels) |
+| Partial GPU offloading | Planned |
 | NCCL | Not yet |
 | TLS | Not yet |
 

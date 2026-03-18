@@ -295,6 +295,11 @@ static int standalone_mode(const char *pcibus, int port) {
         int flag = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
+        /* Large socket buffers for WAN throughput */
+        int bufsize = 16 * 1024 * 1024;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
         fprintf(stderr, "[chidori-worker] Client connected (fd=%d)\n", client_fd);
         dispatch_loop(client_fd);
         fprintf(stderr, "[chidori-worker] Client disconnected\n");

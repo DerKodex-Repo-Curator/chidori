@@ -25,6 +25,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 
 #include "chidori_protocol.h"
 
@@ -41,6 +42,152 @@ typedef unsigned long long CUdeviceptr;
 #define CUDA_SUCCESS 0
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_VALUE 1
+
+/*
+ * ============================================================================
+ * Partial Offloading — Real CUDA passthrough for local GPU devices.
+ *
+ * When CHIDORI_LOCAL_DEVICES is set (e.g., "0"), device 0 uses the real
+ * CUDA driver (loaded via dlsym) and all other devices route to the remote
+ * Chidori server. When unset, ALL devices route to the remote server
+ * (original behavior).
+ * ============================================================================
+ */
+
+/* Real CUDA function dispatch table — loaded lazily via dlsym */
+static void *g_real_cuda_handle = NULL;   /* dlopen handle for real libcuda.so */
+static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so */
+static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
+static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
+static int g_local_device_count = 0;      /* number of local GPUs */
+static int g_remote_device_count = 0;     /* number of remote GPUs (from server) */
+static __thread int g_routing_local = 0;  /* per-thread: 1 = current device is local */
+
+/* Real CUDA function pointers (populated by init_real_cuda) */
+static struct {
+    /* Driver API */
+    CUresult (*cuInit)(unsigned int);
+    CUresult (*cuDeviceGetCount)(int *);
+    CUresult (*cuDeviceGet)(CUdevice *, int);
+    CUresult (*cuDeviceGetName)(char *, int, CUdevice);
+    CUresult (*cuDeviceTotalMem_v2)(size_t *, CUdevice);
+    CUresult (*cuDeviceGetAttribute)(int *, int, CUdevice);
+    CUresult (*cuCtxGetCurrent)(CUcontext *);
+    CUresult (*cuMemAlloc_v2)(CUdeviceptr *, size_t);
+    CUresult (*cuMemFree_v2)(CUdeviceptr);
+    CUresult (*cuMemcpyHtoD_v2)(CUdeviceptr, const void *, size_t);
+    CUresult (*cuMemcpyDtoH_v2)(void *, CUdeviceptr, size_t);
+    CUresult (*cuLaunchKernel)(CUfunction, unsigned int, unsigned int, unsigned int,
+                               unsigned int, unsigned int, unsigned int,
+                               unsigned int, CUstream, void **, void **);
+    CUresult (*cuStreamSynchronize)(CUstream);
+    /* Runtime API */
+    int (*cudaSetDevice)(int);
+    int (*cudaGetDevice)(int *);
+    int (*cudaGetDeviceCount)(int *);
+    int (*cudaMalloc)(void **, size_t);
+    int (*cudaFree)(void *);
+    int (*cudaMemcpy)(void *, const void *, size_t, int);
+    int (*cudaDeviceSynchronize)(void);
+    int (*cudaStreamSynchronize)(void *);
+    int (*cudaLaunchKernel)(const void *, unsigned int, unsigned int, unsigned int,
+                            unsigned int, unsigned int, unsigned int,
+                            void **, size_t, void *);
+    /* Fat binary / kernel registration */
+    void **(*__cudaRegisterFatBinary)(void *);
+    void (*__cudaRegisterFatBinaryEnd)(void **);
+    void (*__cudaUnregisterFatBinary)(void **);
+    void (*__cudaRegisterFunction)(void **, const char *, char *, const char *,
+                                   int, void *, void *, void *, void *, int *);
+} g_real = {0};
+
+static int g_real_cuda_initialized = 0;
+
+static void init_real_cuda(void) {
+    if (g_real_cuda_initialized) return;
+    g_real_cuda_initialized = 1;
+
+    const char *env = getenv("CHIDORI_LOCAL_DEVICES");
+    if (!env) return; /* No partial offloading — all remote */
+
+    g_partial_offload = 1;
+
+    /* Parse local device mask (e.g., "0" or "0,1") */
+    const char *p = env;
+    while (*p) {
+        int dev = atoi(p);
+        if (dev >= 0 && dev < 32)
+            g_local_device_mask |= (1u << dev);
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+
+    /* Load real CUDA driver */
+    const char *cuda_path = getenv("CHIDORI_REAL_CUDA_PATH");
+    if (!cuda_path) cuda_path = "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
+    g_real_cuda_handle = dlopen(cuda_path, RTLD_LAZY | RTLD_LOCAL);
+    if (!g_real_cuda_handle) {
+        fprintf(stderr, "[chidori] WARNING: Failed to load real CUDA driver from %s: %s\n",
+                cuda_path, dlerror());
+        fprintf(stderr, "[chidori] Set CHIDORI_REAL_CUDA_PATH to the real libcuda.so.1 path\n");
+        g_partial_offload = 0;
+        return;
+    }
+
+    /* Load real CUDA runtime */
+    const char *cudart_path = getenv("CHIDORI_REAL_CUDART_PATH");
+    g_real_cudart_handle = dlopen(cudart_path ?: "libcudart.so.12", RTLD_LAZY | RTLD_LOCAL);
+
+    /* Populate dispatch table */
+    #define LOAD_SYM(handle, name) g_real.name = dlsym(handle, #name)
+    #define LOAD_CUDA(name) LOAD_SYM(g_real_cuda_handle, name)
+    #define LOAD_CUDART(name) if (g_real_cudart_handle) LOAD_SYM(g_real_cudart_handle, name)
+
+    LOAD_CUDA(cuInit);
+    LOAD_CUDA(cuDeviceGetCount);
+    LOAD_CUDA(cuDeviceGet);
+    LOAD_CUDA(cuDeviceGetName);
+    LOAD_CUDA(cuDeviceTotalMem_v2);
+    LOAD_CUDA(cuDeviceGetAttribute);
+    LOAD_CUDA(cuCtxGetCurrent);
+    LOAD_CUDA(cuMemAlloc_v2);
+    LOAD_CUDA(cuMemFree_v2);
+    LOAD_CUDA(cuMemcpyHtoD_v2);
+    LOAD_CUDA(cuMemcpyDtoH_v2);
+    LOAD_CUDA(cuLaunchKernel);
+    LOAD_CUDA(cuStreamSynchronize);
+    LOAD_CUDART(cudaSetDevice);
+    LOAD_CUDART(cudaGetDevice);
+    LOAD_CUDART(cudaGetDeviceCount);
+    LOAD_CUDART(cudaMalloc);
+    LOAD_CUDART(cudaFree);
+    LOAD_CUDART(cudaMemcpy);
+    LOAD_CUDART(cudaDeviceSynchronize);
+    LOAD_CUDART(cudaStreamSynchronize);
+    LOAD_CUDART(cudaLaunchKernel);
+    LOAD_CUDART(__cudaRegisterFatBinary);
+    LOAD_CUDART(__cudaRegisterFatBinaryEnd);
+    LOAD_CUDART(__cudaUnregisterFatBinary);
+    LOAD_CUDART(__cudaRegisterFunction);
+
+    #undef LOAD_SYM
+    #undef LOAD_CUDA
+    #undef LOAD_CUDART
+
+    /* Initialize real CUDA and count local devices */
+    if (g_real.cuInit) {
+        g_real.cuInit(0);
+        if (g_real.cuDeviceGetCount)
+            g_real.cuDeviceGetCount(&g_local_device_count);
+    }
+
+    fprintf(stderr, "[chidori] Partial offload: local_devices=%s (%d local GPUs)\n",
+            env, g_local_device_count);
+}
+
+static inline int is_local_device(int device) {
+    return g_partial_offload && ((g_local_device_mask >> device) & 1);
+}
 
 /* Client state */
 static int g_server_fd = -1;
@@ -110,6 +257,12 @@ static int tcp_connect(const char *host, int port) {
 
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    /* Large socket buffers for WAN throughput (BDP = bandwidth * RTT).
+     * At 1Gbps / 55ms RTT, BDP = 6.875MB. We set 16MB to fill the pipe. */
+    int bufsize = 16 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         perror("[chidori] connect");
@@ -546,13 +699,18 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
 
 CUresult cuInit(unsigned int flags) {
     (void)flags;
+    init_real_cuda(); /* Initialize partial offload if CHIDORI_LOCAL_DEVICES is set */
     g_initialized = 1;
     return chidori_rpc(CHIDORI_CU_INIT, &flags, sizeof(flags), NULL, NULL);
 }
 
+static int g_driver_version_cached = 0;
+static int g_driver_version = 0;
 CUresult cuDriverGetVersion(int *version) {
+    if (g_driver_version_cached) { *version = g_driver_version; return 0; }
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DRIVER_GET_VERSION, NULL, 0, version, &len);
+    if (r == 0) { g_driver_version = *version; g_driver_version_cached = 1; }
     return r;
 }
 
@@ -1012,6 +1170,9 @@ cudaError_t cudaGetDevice(int *device) {
 }
 
 cudaError_t cudaSetDevice(int device) {
+    /* Short-circuit: skip RPC if already on this device (hot path) */
+    if (device == g_current_device)
+        return cudaSuccess;
     int32_t dev = device;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &dev, sizeof(dev), NULL, NULL);
     if (r == cudaSuccess)
@@ -1204,7 +1365,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     }
     case cudaMemcpyDeviceToHost: {
         /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
-        struct __attribute__((packed)) {
+        struct {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1221,7 +1382,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     }
     case cudaMemcpyDeviceToDevice: {
         /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
-        struct __attribute__((packed)) {
+        struct {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1276,7 +1437,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
         break;
     }
     case cudaMemcpyDeviceToHost: {
-        struct __attribute__((packed)) {
+        struct {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1294,7 +1455,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
         break;
     }
     case cudaMemcpyDeviceToDevice: {
-        struct __attribute__((packed)) {
+        struct {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1322,7 +1483,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 }
 
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
-    struct __attribute__((packed)) {
+    struct {
         uint64_t ptr;
         int32_t  value;
         uint64_t count;
@@ -1398,16 +1559,24 @@ cudaError_t cudaEventDestroy(void *event) {
     return r;
 }
 
+static int g_runtime_version_cached = 0;
+static int g_runtime_version = 0;
 cudaError_t cudaRuntimeGetVersion(int *version) {
+    if (g_runtime_version_cached) { *version = g_runtime_version; return cudaSuccess; }
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_RUNTIME_GET_VERSION, NULL, 0, version, &len);
+    if (r == cudaSuccess) { g_runtime_version = *version; g_runtime_version_cached = 1; }
     g_last_error = r;
     return r;
 }
 
+static int g_cuda_driver_version_cached = 0;
+static int g_cuda_driver_version = 0;
 cudaError_t cudaDriverGetVersion(int *version) {
+    if (g_cuda_driver_version_cached) { *version = g_cuda_driver_version; return cudaSuccess; }
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DRIVER_GET_VERSION, NULL, 0, version, &len);
+    if (r == cudaSuccess) { g_cuda_driver_version = *version; g_cuda_driver_version_cached = 1; }
     g_last_error = r;
     return r;
 }
@@ -1493,12 +1662,15 @@ static size_t chidori_cublas_scalar_size(int dtype) {
     }
 }
 
+static uint64_t g_last_cublas_handle = 0; /* Track last cuBLAS handle for cublasLt translation */
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
     uint64_t h = 0;
     size_t len = sizeof(uint64_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_CREATE, NULL, 0, &h, &len);
-    if (r == CUBLAS_STATUS_SUCCESS)
+    if (r == CUBLAS_STATUS_SUCCESS) {
         *handle = (cublasHandle_t)(uintptr_t)h;
+        g_last_cublas_handle = h;
+    }
     return r;
 }
 
@@ -1507,20 +1679,40 @@ cublasStatus_t cublasDestroy_v2(cublasHandle_t handle) {
     return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DESTROY, &h, sizeof(h), NULL, NULL);
 }
 
+/* Client-side cuBLAS state tracking — avoid sync RPCs for get calls */
+static uint64_t g_cublas_cached_stream_handle = 0;
+static CUstream g_cublas_cached_stream = NULL;
+static uint64_t g_cublas_cached_mode_handle = 0;
+static int32_t  g_cublas_cached_mode = 0;
+static int      g_cublas_mode_valid = 0;
+static int      g_cublas_stream_valid = 0;
+
 cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, CUstream stream) {
     struct { uint64_t handle; uint64_t stream; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.stream = (uint64_t)(uintptr_t)stream;
-    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &req, sizeof(req));
+    cublasStatus_t r = (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &req, sizeof(req));
+    g_cublas_cached_stream_handle = req.handle;
+    g_cublas_cached_stream = stream;
+    g_cublas_stream_valid = 1;
+    return r;
 }
 
 cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
     uint64_t h = (uint64_t)(uintptr_t)handle;
+    if (g_cublas_stream_valid && g_cublas_cached_stream_handle == h) {
+        *stream = g_cublas_cached_stream;
+        return CUBLAS_STATUS_SUCCESS;
+    }
     uint64_t s = 0;
     size_t len = sizeof(uint64_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_GET_STREAM, &h, sizeof(h), &s, &len);
-    if (r == CUBLAS_STATUS_SUCCESS)
+    if (r == CUBLAS_STATUS_SUCCESS) {
         *stream = (CUstream)(uintptr_t)s;
+        g_cublas_cached_stream_handle = h;
+        g_cublas_cached_stream = *stream;
+        g_cublas_stream_valid = 1;
+    }
     return r;
 }
 
@@ -1528,11 +1720,19 @@ cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
     struct { uint64_t handle; int32_t mode; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.mode = (int32_t)mode;
-    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_MATH_MODE, &req, sizeof(req));
+    cublasStatus_t r = (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_MATH_MODE, &req, sizeof(req));
+    g_cublas_cached_mode_handle = req.handle;
+    g_cublas_cached_mode = (int32_t)mode;
+    g_cublas_mode_valid = 1;
+    return r;
 }
 
 cublasStatus_t cublasGetMathMode(cublasHandle_t handle, cublasMath_t *mode) {
     uint64_t h = (uint64_t)(uintptr_t)handle;
+    if (g_cublas_mode_valid && g_cublas_cached_mode_handle == h) {
+        *mode = (cublasMath_t)g_cublas_cached_mode;
+        return CUBLAS_STATUS_SUCCESS;
+    }
     int32_t m = 0;
     size_t len = sizeof(int32_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_GET_MATH_MODE, &h, sizeof(h), &m, &len);
@@ -1541,13 +1741,15 @@ cublasStatus_t cublasGetMathMode(cublasHandle_t handle, cublasMath_t *mode) {
     return r;
 }
 
+static int g_cublas_version_cached = 0;
+static int g_cublas_version = 0;
 cublasStatus_t cublasGetVersion_v2(cublasHandle_t handle, int *version) {
+    if (g_cublas_version_cached) { *version = g_cublas_version; return CUBLAS_STATUS_SUCCESS; }
     uint64_t h = (uint64_t)(uintptr_t)handle;
     int32_t v = 0;
     size_t len = sizeof(int32_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_GET_VERSION, &h, sizeof(h), &v, &len);
-    if (r == CUBLAS_STATUS_SUCCESS)
-        *version = (int)v;
+    if (r == CUBLAS_STATUS_SUCCESS) { *version = (int)v; g_cublas_version = (int)v; g_cublas_version_cached = 1; }
     return r;
 }
 
@@ -1569,7 +1771,7 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
     const float *beta,
     void *C, int ldc) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1612,7 +1814,7 @@ cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
     const double *beta,
     void *C, int ldc) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1655,7 +1857,7 @@ cublasStatus_t cublasHgemm(cublasHandle_t handle,
     const void *beta,
     void *C, int ldc) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1697,7 +1899,7 @@ cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
     const float *beta,
     void *C, int Ctype, int ldc) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1749,7 +1951,7 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1799,7 +2001,7 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
     const float *beta,
     void *y, int incy) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  trans;
         int32_t  m, n;
@@ -1837,7 +2039,7 @@ cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
     const double *beta,
     void *y, int incy) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  trans;
         int32_t  m, n;
@@ -1874,7 +2076,7 @@ cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
     const void *x, int incx,
     void *y, int incy) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         float    alpha;
@@ -1900,7 +2102,7 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
     const void *x, int incx,
     void *y, int incy) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         double   alpha;
@@ -1928,7 +2130,7 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
 cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
     int n, const void *x, int incx, float *result) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -1947,7 +2149,7 @@ cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
 cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle,
     int n, const void *x, int incx, double *result) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -1970,7 +2172,7 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
     int n, const void *x, int incx,
     const void *y, int incy, float *result) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -1994,7 +2196,7 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
     int n, const void *x, int incx,
     const void *y, int incy, double *result) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2020,7 +2222,7 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
 cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
     int n, const float *alpha, void *x, int incx) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         float    alpha;
@@ -2040,7 +2242,7 @@ cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
 cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
     int n, const double *alpha, void *x, int incx) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         double   alpha;
@@ -2063,7 +2265,7 @@ cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
 cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
     int n, const void *x, int incx, void *y, int incy) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2085,7 +2287,7 @@ cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
 cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
     int n, const void *x, int incx, void *y, int incy) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2184,7 +2386,7 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
     void *C, int ldc, long long int strideC,
     int batchCount) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -2235,7 +2437,7 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
     void *C, int Ctype, int ldc, long long int strideC,
     int batchCount, int computeType, int algo) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -2344,11 +2546,16 @@ cudnnStatus_t cudnnSetStream(cudnnHandle_t handle, CUstream stream) {
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_STREAM, &req, sizeof(req));
 }
 
+static size_t g_cudnn_version_cached = 0;
+static size_t g_cudnn_version = 0;
 size_t cudnnGetVersion(void) {
+    if (g_cudnn_version_cached) return g_cudnn_version;
     uint64_t version = 0;
     size_t len = sizeof(uint64_t);
     chidori_rpc(CHIDORI_CUDNN_GET_VERSION, NULL, 0, &version, &len);
-    return (size_t)version;
+    g_cudnn_version = (size_t)version;
+    g_cudnn_version_cached = 1;
+    return g_cudnn_version;
 }
 
 /* ---- Tensor Descriptor ---- */
@@ -2367,7 +2574,7 @@ cudnnStatus_t cudnnSetTensor4dDescriptor(cudnnTensorDescriptor_t tensorDesc,
     cudnnTensorFormat_t format, cudnnDataType_t dataType,
     int n, int c, int h, int w) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t desc;
         int32_t  format;
         int32_t  dataType;
@@ -2461,7 +2668,7 @@ cudnnStatus_t cudnnSetFilter4dDescriptor(cudnnFilterDescriptor_t filterDesc,
     cudnnDataType_t dataType, cudnnTensorFormat_t format,
     int k, int c, int h, int w) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t desc;
         int32_t  dataType;
         int32_t  format;
@@ -2537,7 +2744,7 @@ cudnnStatus_t cudnnSetConvolution2dDescriptor(cudnnConvolutionDescriptor_t convD
     int pad_h, int pad_w, int u, int v, int dilation_h, int dilation_w,
     cudnnConvolutionMode_t mode, cudnnDataType_t computeType) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t desc;
         int32_t  pad_h, pad_w;
         int32_t  u, v;
@@ -2624,7 +2831,7 @@ cudnnStatus_t cudnnGetConvolutionForwardAlgorithm_v7(cudnnHandle_t handle,
     int requestedAlgoCount, int *returnedAlgoCount,
     void *perfResults) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t xDesc;
         uint64_t wDesc;
@@ -2669,7 +2876,7 @@ cudnnStatus_t cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle_t handle,
     cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t yDesc,
     cudnnConvolutionFwdAlgo_t algo, size_t *sizeInBytes) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t xDesc;
         uint64_t wDesc;
@@ -2700,7 +2907,7 @@ cudnnStatus_t cudnnGetConvolutionBackwardDataWorkspaceSize(cudnnHandle_t handle,
     cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t dxDesc,
     cudnnConvolutionBwdDataAlgo_t algo, size_t *sizeInBytes) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t wDesc;
         uint64_t dyDesc;
@@ -2731,7 +2938,7 @@ cudnnStatus_t cudnnGetConvolutionBackwardFilterWorkspaceSize(cudnnHandle_t handl
     cudnnConvolutionDescriptor_t convDesc, cudnnFilterDescriptor_t gradDesc,
     cudnnConvolutionBwdFilterAlgo_t algo, size_t *sizeInBytes) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t xDesc;
         uint64_t dyDesc;
@@ -2777,7 +2984,7 @@ cudnnStatus_t cudnnConvolutionForward(cudnnHandle_t handle,
      *
      * alpha/beta sent as 8 bytes (double-sized buffer, covers float and double).
      */
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint8_t  alpha[8];
         uint64_t xDesc;
@@ -2824,7 +3031,7 @@ cudnnStatus_t cudnnConvolutionBackwardData(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint8_t  alpha[8];
         uint64_t wDesc;
@@ -2871,7 +3078,7 @@ cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t handle,
     const void *beta,
     cudnnFilterDescriptor_t dwDesc, void *dw) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint8_t  alpha[8];
         uint64_t xDesc;
@@ -2922,7 +3129,7 @@ cudnnStatus_t cudnnSetActivationDescriptor(cudnnActivationDescriptor_t activatio
     cudnnActivationMode_t mode, cudnnNanPropagation_t reluNanOpt,
     double coef) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t desc;
         int32_t  mode;
         int32_t  reluNanOpt;
@@ -2951,7 +3158,7 @@ cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t yDesc, void *y) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t activationDesc;
         uint8_t  alpha[8];
@@ -2985,7 +3192,7 @@ cudnnStatus_t cudnnActivationBackward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t activationDesc;
         uint8_t  alpha[8];
@@ -3036,7 +3243,7 @@ cudnnStatus_t cudnnSetPooling2dDescriptor(cudnnPoolingDescriptor_t poolingDesc,
     int verticalPadding, int horizontalPadding,
     int verticalStride, int horizontalStride) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t desc;
         int32_t  mode;
         int32_t  maxpoolingNanOpt;
@@ -3072,7 +3279,7 @@ cudnnStatus_t cudnnPoolingForward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t yDesc, void *y) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t poolingDesc;
         uint8_t  alpha[8];
@@ -3106,7 +3313,7 @@ cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         uint64_t poolingDesc;
         uint8_t  alpha[8];
@@ -3153,7 +3360,7 @@ cudnnStatus_t cudnnBatchNormalizationForwardTraining(cudnnHandle_t handle,
     double epsilon,
     void *resultSaveMean, void *resultSaveInvVariance) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  mode;
         uint8_t  alpha[8];
@@ -3206,7 +3413,7 @@ cudnnStatus_t cudnnBatchNormalizationForwardInference(cudnnHandle_t handle,
     const void *estimatedMean, const void *estimatedVariance,
     double epsilon) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  mode;
         uint8_t  alpha[8];
@@ -3256,7 +3463,7 @@ cudnnStatus_t cudnnBatchNormalizationBackward(cudnnHandle_t handle,
     double epsilon,
     const void *savedMean, const void *savedInvVariance) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  mode;
         uint8_t  alphaDataDiff[8];
@@ -3312,7 +3519,7 @@ cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t yDesc, void *y) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  algo;
         int32_t  mode;
@@ -3347,7 +3554,7 @@ cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t handle;
         int32_t  algo;
         int32_t  mode;
@@ -3394,7 +3601,7 @@ cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t dropoutDesc,
     cudnnHandle_t handle, float dropout,
     void *states, size_t stateSizeInBytes, unsigned long long seed) {
 
-    struct __attribute__((packed)) {
+    struct {
         uint64_t desc;
         uint64_t handle;
         float    dropout;
@@ -4076,8 +4283,23 @@ cudaError_t cudaFuncSetAttribute(const void *func, int attr, int value) {
     return cudaSuccess;
 }
 
+/* Cache for cudaFuncGetAttributes — attributes are immutable per function */
+#define FUNC_ATTR_CACHE_SIZE 256
+static struct { const void *func; char attr[64]; int valid; } g_func_attr_cache[FUNC_ATTR_CACHE_SIZE];
+static int g_func_attr_cache_count = 0;
+
 cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
     if (!attr) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
+
+    /* Check cache first */
+    for (int i = 0; i < g_func_attr_cache_count; i++) {
+        if (g_func_attr_cache[i].func == func && g_func_attr_cache[i].valid) {
+            memcpy(attr, g_func_attr_cache[i].attr, 64);
+            g_last_error = cudaSuccess;
+            return cudaSuccess;
+        }
+    }
+
     memset(attr, 0, 64);
 
     /* Find and lazy-register the function on the server */
@@ -4101,6 +4323,13 @@ cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
     size_t out_len = 64;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_FUNC_GET_ATTRIBUTES,
                                               &func_handle, 8, attr, &out_len);
+    /* Cache the result */
+    if (r == cudaSuccess && g_func_attr_cache_count < FUNC_ATTR_CACHE_SIZE) {
+        g_func_attr_cache[g_func_attr_cache_count].func = func;
+        memcpy(g_func_attr_cache[g_func_attr_cache_count].attr, attr, 64);
+        g_func_attr_cache[g_func_attr_cache_count].valid = 1;
+        g_func_attr_cache_count++;
+    }
     g_last_error = r;
     return r;
 }
@@ -4816,7 +5045,7 @@ CUresult cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
 }
 
 CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
-    struct __attribute__((packed)) {
+    struct {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
     req.ptr = (uint64_t)dstDevice; req.value = (int32_t)uc; req.count = N;
@@ -4829,7 +5058,7 @@ CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUst
 }
 
 CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
-    struct __attribute__((packed)) {
+    struct {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
     req.ptr = (uint64_t)dstDevice; req.value = (int32_t)ui; req.count = N;
@@ -4960,9 +5189,9 @@ cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle,
  */
 typedef void *cublasLtHandle_t;
 
+static int g_lt_handle_storage;
 cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
-    static int fake_lt;
-    if (lightHandle) *lightHandle = (cublasLtHandle_t)&fake_lt;
+    if (lightHandle) *lightHandle = (cublasLtHandle_t)&g_lt_handle_storage;
     return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -4971,23 +5200,169 @@ cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
     return CUBLAS_STATUS_SUCCESS;
 }
 
+/*
+ * ============================================================================
+ * cublasLt — Lightweight descriptors that track matrix params so we can
+ *            translate cublasLtMatmul into cublasGemmEx RPCs.
+ * ============================================================================
+ */
+
+/* cublasLt attribute IDs we care about */
+#define CUBLASLT_MATMUL_DESC_TRANSA  0
+#define CUBLASLT_MATMUL_DESC_TRANSB  1
+#define CUBLASLT_MATRIX_LAYOUT_TYPE  0
+#define CUBLASLT_MATRIX_LAYOUT_ROWS  2
+#define CUBLASLT_MATRIX_LAYOUT_COLS  3
+#define CUBLASLT_MATRIX_LAYOUT_LD    4
+#define CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT 6
+#define CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET 7
+
+typedef struct {
+    int computeType;
+    int scaleType;
+    int transa;  /* 0=N, 1=T */
+    int transb;
+} lt_matmul_desc_t;
+
+typedef struct {
+    int dtype;       /* CUDA_R_32F=0, CUDA_R_16F=2, CUDA_R_16BF=14 */
+    uint64_t rows;
+    uint64_t cols;
+    int64_t ld;
+    int64_t batch_count;
+    int64_t strided_batch_offset;
+} lt_matrix_layout_t;
+
+#define LT_DESC_POOL 1024
+static lt_matmul_desc_t g_lt_descs[LT_DESC_POOL];
+static int g_lt_desc_count = 0;
+static lt_matrix_layout_t g_lt_layouts[LT_DESC_POOL * 4];
+static int g_lt_layout_count = 0;
+
 cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     void *computeDesc, const void *alpha,
     const void *A, void *Adesc, const void *B, void *Bdesc,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
-    (void)lightHandle; (void)computeDesc; (void)alpha;
-    (void)A; (void)Adesc; (void)B; (void)Bdesc;
-    (void)beta; (void)C; (void)Cdesc; (void)D; (void)Ddesc;
-    (void)algo; (void)workspace; (void)workspaceSizeInBytes; (void)stream;
-    return CUBLAS_STATUS_SUCCESS;
+    (void)lightHandle; (void)algo; (void)workspace; (void)workspaceSizeInBytes;
+
+    lt_matmul_desc_t *desc = (lt_matmul_desc_t *)computeDesc;
+    lt_matrix_layout_t *layA = (lt_matrix_layout_t *)Adesc;
+    lt_matrix_layout_t *layB = (lt_matrix_layout_t *)Bdesc;
+    lt_matrix_layout_t *layC = (lt_matrix_layout_t *)Cdesc;
+    lt_matrix_layout_t *layD = (lt_matrix_layout_t *)Ddesc;
+    (void)layC;
+
+    if (!layA || !layB || !layD) {
+        fprintf(stderr, "[chidori] cublasLtMatmul: NULL layout descriptor\n");
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    if (g_last_cublas_handle == 0) {
+        fprintf(stderr, "[chidori] cublasLtMatmul: no cuBLAS handle available\n");
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+    }
+
+    /* Extract dimensions: for GEMM C = alpha * op(A) * op(B) + beta * C
+     * op(A) is m x k, op(B) is k x n, C/D is m x n */
+    int transa = desc ? desc->transa : 0;
+    int transb = desc ? desc->transb : 0;
+    uint64_t m = layD ? layD->rows : (layA ? (transa ? layA->cols : layA->rows) : 0);
+    uint64_t n = layD ? layD->cols : (layB ? (transb ? layB->rows : layB->cols) : 0);
+    uint64_t k = layA ? (transa ? layA->rows : layA->cols) : 0;
+    int64_t lda = layA ? layA->ld : (int64_t)m;
+    int64_t ldb = layB ? layB->ld : (int64_t)k;
+    int64_t ldc = layD ? layD->ld : (int64_t)m;
+
+    /* Determine data type */
+    int Atype = layA ? layA->dtype : 0;
+    int Btype = layB ? layB->dtype : 0;
+    int Ctype = layD ? layD->dtype : 0;
+    int computeType_val = desc ? desc->computeType : 0;
+
+    /* Check for batched */
+    int64_t batchA = layA ? layA->batch_count : 0;
+    int64_t batchB = layB ? layB->batch_count : 0;
+    int64_t batch = (batchA > 1) ? batchA : ((batchB > 1) ? batchB : 0);
+
+    if (batch > 1) {
+        int64_t strideA = layA ? layA->strided_batch_offset : 0;
+        int64_t strideB = layB ? layB->strided_batch_offset : 0;
+        int64_t strideC = layD ? layD->strided_batch_offset : 0;
+
+        /* Use cublasGemmStridedBatchedEx */
+        struct {
+            uint64_t handle; int32_t transa; int32_t transb;
+            int32_t m; int32_t n; int32_t k;
+            float alpha; uint64_t A; int32_t Atype; int32_t lda; int64_t strideA;
+            uint64_t B; int32_t Btype; int32_t ldb; int64_t strideB;
+            float beta; uint64_t C; int32_t Ctype; int32_t ldc; int64_t strideC;
+            int32_t batchCount; int32_t computeType; int32_t algo;
+        } req;
+        memset(&req, 0, sizeof(req));
+        req.handle = g_last_cublas_handle;
+        req.transa = transa; req.transb = transb;
+        req.m = (int32_t)m; req.n = (int32_t)n; req.k = (int32_t)k;
+        req.alpha = alpha ? *(const float *)alpha : 1.0f;
+        req.A = (uint64_t)(uintptr_t)A; req.Atype = Atype; req.lda = (int32_t)lda; req.strideA = strideA;
+        req.B = (uint64_t)(uintptr_t)B; req.Btype = Btype; req.ldb = (int32_t)ldb; req.strideB = strideB;
+        req.beta = beta ? *(const float *)beta : 0.0f;
+        req.C = (uint64_t)(uintptr_t)D; req.Ctype = Ctype; req.ldc = (int32_t)ldc; req.strideC = strideC;
+        req.batchCount = (int32_t)batch;
+        req.computeType = computeType_val;
+        req.algo = 0; /* CUBLAS_GEMM_DEFAULT */
+
+        uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
+        /* Set stream first */
+        struct { uint64_t handle; uint64_t stream; } ss;
+        ss.handle = req.handle; ss.stream = stream_handle;
+        chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &ss, sizeof(ss));
+        return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_GEMM_STRIDED_BATCHED_EX, &req, sizeof(req));
+    }
+
+    /* Non-batched: use cublasGemmEx — struct must match wire format (uint8_t alpha[8]) */
+    struct {
+        uint64_t handle;
+        int32_t  transa, transb;
+        int32_t  m, n, k;
+        uint8_t  alpha_bytes[8];
+        uint64_t A;
+        int32_t  Atype, lda;
+        uint64_t B;
+        int32_t  Btype, ldb;
+        uint8_t  beta_bytes[8];
+        uint64_t C;
+        int32_t  Ctype, ldc;
+        int32_t  computeType;
+        int32_t  algo;
+    } req;
+    memset(&req, 0, sizeof(req));
+    req.handle = g_last_cublas_handle;
+    req.transa = transa; req.transb = transb;
+    req.m = (int32_t)m; req.n = (int32_t)n; req.k = (int32_t)k;
+    if (alpha) memcpy(req.alpha_bytes, alpha, 4);
+    else { float one = 1.0f; memcpy(req.alpha_bytes, &one, 4); }
+    req.A = (uint64_t)(uintptr_t)A; req.Atype = Atype; req.lda = (int32_t)lda;
+    req.B = (uint64_t)(uintptr_t)B; req.Btype = Btype; req.ldb = (int32_t)ldb;
+    if (beta) memcpy(req.beta_bytes, beta, 4);
+    req.C = (uint64_t)(uintptr_t)D; req.Ctype = Ctype; req.ldc = (int32_t)ldc;
+    req.computeType = computeType_val;
+    req.algo = 0; /* CUBLAS_GEMM_DEFAULT */
+
+    uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
+    struct { uint64_t handle; uint64_t stream; } ss;
+    ss.handle = req.handle; ss.stream = stream_handle;
+    chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &ss, sizeof(ss));
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_GEMM_EX, &req, sizeof(req));
 }
 
 cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
-    (void)computeType; (void)scaleType;
-    static int fake_desc;
-    if (matmulDesc) *matmulDesc = (void *)&fake_desc;
+    if (g_lt_desc_count >= LT_DESC_POOL) { if (matmulDesc) *matmulDesc = NULL; return CUBLAS_STATUS_ALLOC_FAILED; }
+    lt_matmul_desc_t *d = &g_lt_descs[g_lt_desc_count++];
+    memset(d, 0, sizeof(*d));
+    d->computeType = computeType;
+    d->scaleType = scaleType;
+    if (matmulDesc) *matmulDesc = (void *)d;
     return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -4998,24 +5373,37 @@ cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
 
 cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
                                                 const void *buf, size_t sizeInBytes) {
-    (void)matmulDesc; (void)attr; (void)buf; (void)sizeInBytes;
+    lt_matmul_desc_t *d = (lt_matmul_desc_t *)matmulDesc;
+    if (!d || !buf) return CUBLAS_STATUS_SUCCESS;
+    if (attr == CUBLASLT_MATMUL_DESC_TRANSA && sizeInBytes >= 4) d->transa = *(const int *)buf;
+    if (attr == CUBLASLT_MATMUL_DESC_TRANSB && sizeInBytes >= 4) d->transb = *(const int *)buf;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
                                                 void *buf, size_t sizeInBytes,
                                                 size_t *sizeWritten) {
-    (void)matmulDesc; (void)attr;
+    lt_matmul_desc_t *d = (lt_matmul_desc_t *)matmulDesc;
     if (buf) memset(buf, 0, sizeInBytes);
+    if (d && buf) {
+        if (attr == CUBLASLT_MATMUL_DESC_TRANSA && sizeInBytes >= 4) *(int *)buf = d->transa;
+        if (attr == CUBLASLT_MATMUL_DESC_TRANSB && sizeInBytes >= 4) *(int *)buf = d->transb;
+    }
     if (sizeWritten) *sizeWritten = sizeInBytes;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
                                             uint64_t rows, uint64_t cols, int64_t ld) {
-    (void)type; (void)rows; (void)cols; (void)ld;
-    static int fake_layout;
-    if (matLayout) *matLayout = (void *)&fake_layout;
+    if (g_lt_layout_count >= LT_DESC_POOL * 4) { if (matLayout) *matLayout = NULL; return CUBLAS_STATUS_ALLOC_FAILED; }
+    lt_matrix_layout_t *l = &g_lt_layouts[g_lt_layout_count++];
+    memset(l, 0, sizeof(*l));
+    l->dtype = type;
+    l->rows = rows;
+    l->cols = cols;
+    l->ld = ld;
+    l->batch_count = 1;
+    if (matLayout) *matLayout = (void *)l;
     return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -5026,15 +5414,26 @@ cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
 
 cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
                                                   const void *buf, size_t sizeInBytes) {
-    (void)matLayout; (void)attr; (void)buf; (void)sizeInBytes;
+    lt_matrix_layout_t *l = (lt_matrix_layout_t *)matLayout;
+    if (!l || !buf) return CUBLAS_STATUS_SUCCESS;
+    if (attr == CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT && sizeInBytes >= 4)
+        l->batch_count = *(const int32_t *)buf;
+    if (attr == CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET && sizeInBytes >= 8)
+        l->strided_batch_offset = *(const int64_t *)buf;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
                                                   void *buf, size_t sizeInBytes,
                                                   size_t *sizeWritten) {
-    (void)matLayout; (void)attr;
+    lt_matrix_layout_t *l = (lt_matrix_layout_t *)matLayout;
     if (buf) memset(buf, 0, sizeInBytes);
+    if (l && buf) {
+        if (attr == CUBLASLT_MATRIX_LAYOUT_ROWS && sizeInBytes >= 8) *(uint64_t *)buf = l->rows;
+        if (attr == CUBLASLT_MATRIX_LAYOUT_COLS && sizeInBytes >= 8) *(uint64_t *)buf = l->cols;
+        if (attr == CUBLASLT_MATRIX_LAYOUT_LD && sizeInBytes >= 8) *(int64_t *)buf = l->ld;
+        if (attr == CUBLASLT_MATRIX_LAYOUT_TYPE && sizeInBytes >= 4) *(int *)buf = l->dtype;
+    }
     if (sizeWritten) *sizeWritten = sizeInBytes;
     return CUBLAS_STATUS_SUCCESS;
 }
@@ -5066,6 +5465,66 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     if (returnAlgoCount) *returnAlgoCount = 0;
     return CUBLAS_STATUS_SUCCESS;
 }
+
+/* Additional cublasLt stubs that PyTorch may call after getting heuristic results */
+cublasStatus_t cublasLtMatmulAlgoInit(cublasLtHandle_t lightHandle,
+    int computeType, int scaleType, int Atype, int Btype, int Ctype, int Dtype,
+    int algoId, void *algo) {
+    (void)lightHandle; (void)computeType; (void)scaleType;
+    (void)Atype; (void)Btype; (void)Ctype; (void)Dtype; (void)algoId;
+    if (algo) memset(algo, 0, 64);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulAlgoConfigSetAttribute(void *algo, int attr,
+    const void *buf, size_t sizeInBytes) {
+    (void)algo; (void)attr; (void)buf; (void)sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulAlgoConfigGetAttribute(const void *algo, int attr,
+    void *buf, size_t sizeInBytes, size_t *sizeWritten) {
+    (void)algo; (void)attr;
+    if (buf) memset(buf, 0, sizeInBytes);
+    if (sizeWritten) *sizeWritten = sizeInBytes;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulAlgoCheck(cublasLtHandle_t lightHandle,
+    void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
+    const void *algo, void *result) {
+    (void)lightHandle; (void)operationDesc; (void)Adesc; (void)Bdesc;
+    (void)Cdesc; (void)Ddesc; (void)algo;
+    if (result) memset(result, 0, 280);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulAlgoGetIds(cublasLtHandle_t lightHandle,
+    int computeType, int scaleType, int Atype, int Btype, int Ctype, int Dtype,
+    int requestedAlgoCount, int *algoIdsArray, int *returnAlgoCount) {
+    (void)lightHandle; (void)computeType; (void)scaleType;
+    (void)Atype; (void)Btype; (void)Ctype; (void)Dtype;
+    (void)requestedAlgoCount; (void)algoIdsArray;
+    if (returnAlgoCount) *returnAlgoCount = 0;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+size_t cublasLtGetCudartVersion(void) { return 12040; }
+cublasStatus_t cublasLtGetStatusName(cublasStatus_t status, const char **str) {
+    (void)status; if (str) *str = "CUBLAS_STATUS_SUCCESS"; return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasLtGetStatusString(cublasStatus_t status, const char **str) {
+    (void)status; if (str) *str = "success"; return CUBLAS_STATUS_SUCCESS;
+}
+size_t cublasLtGetVersion(void) { return 120405; }
+cublasStatus_t cublasLtGetProperty(int type, int *value) {
+    if (value) *value = (type == 0) ? 12 : (type == 1) ? 4 : 5;
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasLtLoggerSetCallback(void *callback) { (void)callback; return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasLtLoggerSetLevel(int level) { (void)level; return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasLtLoggerSetMask(int mask) { (void)mask; return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasLtLoggerSetFile(void *file) { (void)file; return CUBLAS_STATUS_SUCCESS; }
 
 /*
  * ============================================================================
