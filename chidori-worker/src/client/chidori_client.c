@@ -939,7 +939,7 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
 #define CHIDORI_CU_LAUNCH_PARAM_END            ((void *)0x00)
 
 CUresult cuFuncGetAttribute(int *pi, int attrib, CUfunction hfunc) {
-    struct { int32_t attrib; uint64_t func; } req;
+    struct __attribute__((packed)) { int32_t attrib; uint64_t func; } req;
     req.attrib = attrib;
     req.func = (uint64_t)(uintptr_t)hfunc;
     size_t len = sizeof(int32_t);
@@ -1369,7 +1369,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     }
     case cudaMemcpyDeviceToHost: {
         /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
-        struct {
+        struct __attribute__((packed)) {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1386,7 +1386,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     }
     case cudaMemcpyDeviceToDevice: {
         /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
-        struct {
+        struct __attribute__((packed)) {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1441,7 +1441,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
         break;
     }
     case cudaMemcpyDeviceToHost: {
-        struct {
+        struct __attribute__((packed)) {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1459,7 +1459,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
         break;
     }
     case cudaMemcpyDeviceToDevice: {
-        struct {
+        struct __attribute__((packed)) {
             uint64_t dst;
             uint64_t src;
             uint64_t size;
@@ -1487,7 +1487,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 }
 
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
-    struct {
+    struct __attribute__((packed)) {
         uint64_t ptr;
         int32_t  value;
         uint64_t count;
@@ -1721,7 +1721,7 @@ cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
 }
 
 cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
-    struct { uint64_t handle; int32_t mode; } req;
+    struct __attribute__((packed)) { uint64_t handle; int32_t mode; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.mode = (int32_t)mode;
     cublasStatus_t r = (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SET_MATH_MODE, &req, sizeof(req));
@@ -1775,7 +1775,7 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
     const float *beta,
     void *C, int ldc) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1818,7 +1818,7 @@ cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
     const double *beta,
     void *C, int ldc) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1861,7 +1861,7 @@ cublasStatus_t cublasHgemm(cublasHandle_t handle,
     const void *beta,
     void *C, int ldc) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1903,7 +1903,7 @@ cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
     const float *beta,
     void *C, int Ctype, int ldc) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -1955,7 +1955,7 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -2005,7 +2005,7 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
     const float *beta,
     void *y, int incy) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  trans;
         int32_t  m, n;
@@ -2043,7 +2043,7 @@ cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
     const double *beta,
     void *y, int incy) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  trans;
         int32_t  m, n;
@@ -2080,7 +2080,7 @@ cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
     const void *x, int incx,
     void *y, int incy) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         float    alpha;
@@ -2106,7 +2106,7 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
     const void *x, int incx,
     void *y, int incy) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         double   alpha;
@@ -2134,7 +2134,7 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
 cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
     int n, const void *x, int incx, float *result) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2153,7 +2153,7 @@ cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
 cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle,
     int n, const void *x, int incx, double *result) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2176,7 +2176,7 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
     int n, const void *x, int incx,
     const void *y, int incy, float *result) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2200,7 +2200,7 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
     int n, const void *x, int incx,
     const void *y, int incy, double *result) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2226,7 +2226,7 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
 cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
     int n, const float *alpha, void *x, int incx) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         float    alpha;
@@ -2246,7 +2246,7 @@ cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
 cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
     int n, const double *alpha, void *x, int incx) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         double   alpha;
@@ -2269,7 +2269,7 @@ cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
 cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
     int n, const void *x, int incx, void *y, int incy) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2291,7 +2291,7 @@ cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
 cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
     int n, const void *x, int incx, void *y, int incy) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
         uint64_t x;
@@ -2390,7 +2390,7 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
     void *C, int ldc, long long int strideC,
     int batchCount) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -2441,7 +2441,7 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
     void *C, int Ctype, int ldc, long long int strideC,
     int batchCount, int computeType, int algo) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
         int32_t  m, n, k;
@@ -2578,7 +2578,7 @@ cudnnStatus_t cudnnSetTensor4dDescriptor(cudnnTensorDescriptor_t tensorDesc,
     cudnnTensorFormat_t format, cudnnDataType_t dataType,
     int n, int c, int h, int w) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t desc;
         int32_t  format;
         int32_t  dataType;
@@ -2672,7 +2672,7 @@ cudnnStatus_t cudnnSetFilter4dDescriptor(cudnnFilterDescriptor_t filterDesc,
     cudnnDataType_t dataType, cudnnTensorFormat_t format,
     int k, int c, int h, int w) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t desc;
         int32_t  dataType;
         int32_t  format;
@@ -2748,7 +2748,7 @@ cudnnStatus_t cudnnSetConvolution2dDescriptor(cudnnConvolutionDescriptor_t convD
     int pad_h, int pad_w, int u, int v, int dilation_h, int dilation_w,
     cudnnConvolutionMode_t mode, cudnnDataType_t computeType) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t desc;
         int32_t  pad_h, pad_w;
         int32_t  u, v;
@@ -2811,7 +2811,7 @@ cudnnStatus_t cudnnDestroyConvolutionDescriptor(cudnnConvolutionDescriptor_t con
 
 cudnnStatus_t cudnnSetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc,
     cudnnMathType_t mathType) {
-    struct { uint64_t desc; int32_t mathType; } req;
+    struct __attribute__((packed)) { uint64_t desc; int32_t mathType; } req;
     req.desc = (uint64_t)(uintptr_t)convDesc;
     req.mathType = (int32_t)mathType;
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_CONVOLUTION_MATH_TYPE,
@@ -2820,7 +2820,7 @@ cudnnStatus_t cudnnSetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc,
 
 cudnnStatus_t cudnnSetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDesc,
     int groupCount) {
-    struct { uint64_t desc; int32_t groupCount; } req;
+    struct __attribute__((packed)) { uint64_t desc; int32_t groupCount; } req;
     req.desc = (uint64_t)(uintptr_t)convDesc;
     req.groupCount = groupCount;
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SET_CONVOLUTION_GROUP_COUNT,
@@ -2835,7 +2835,7 @@ cudnnStatus_t cudnnGetConvolutionForwardAlgorithm_v7(cudnnHandle_t handle,
     int requestedAlgoCount, int *returnedAlgoCount,
     void *perfResults) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t xDesc;
         uint64_t wDesc;
@@ -2880,7 +2880,7 @@ cudnnStatus_t cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle_t handle,
     cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t yDesc,
     cudnnConvolutionFwdAlgo_t algo, size_t *sizeInBytes) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t xDesc;
         uint64_t wDesc;
@@ -2911,7 +2911,7 @@ cudnnStatus_t cudnnGetConvolutionBackwardDataWorkspaceSize(cudnnHandle_t handle,
     cudnnConvolutionDescriptor_t convDesc, cudnnTensorDescriptor_t dxDesc,
     cudnnConvolutionBwdDataAlgo_t algo, size_t *sizeInBytes) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t wDesc;
         uint64_t dyDesc;
@@ -2942,7 +2942,7 @@ cudnnStatus_t cudnnGetConvolutionBackwardFilterWorkspaceSize(cudnnHandle_t handl
     cudnnConvolutionDescriptor_t convDesc, cudnnFilterDescriptor_t gradDesc,
     cudnnConvolutionBwdFilterAlgo_t algo, size_t *sizeInBytes) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t xDesc;
         uint64_t dyDesc;
@@ -2988,7 +2988,7 @@ cudnnStatus_t cudnnConvolutionForward(cudnnHandle_t handle,
      *
      * alpha/beta sent as 8 bytes (double-sized buffer, covers float and double).
      */
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint8_t  alpha[8];
         uint64_t xDesc;
@@ -3035,7 +3035,7 @@ cudnnStatus_t cudnnConvolutionBackwardData(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint8_t  alpha[8];
         uint64_t wDesc;
@@ -3082,7 +3082,7 @@ cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t handle,
     const void *beta,
     cudnnFilterDescriptor_t dwDesc, void *dw) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint8_t  alpha[8];
         uint64_t xDesc;
@@ -3133,7 +3133,7 @@ cudnnStatus_t cudnnSetActivationDescriptor(cudnnActivationDescriptor_t activatio
     cudnnActivationMode_t mode, cudnnNanPropagation_t reluNanOpt,
     double coef) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t desc;
         int32_t  mode;
         int32_t  reluNanOpt;
@@ -3162,7 +3162,7 @@ cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t yDesc, void *y) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t activationDesc;
         uint8_t  alpha[8];
@@ -3196,7 +3196,7 @@ cudnnStatus_t cudnnActivationBackward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t activationDesc;
         uint8_t  alpha[8];
@@ -3247,7 +3247,7 @@ cudnnStatus_t cudnnSetPooling2dDescriptor(cudnnPoolingDescriptor_t poolingDesc,
     int verticalPadding, int horizontalPadding,
     int verticalStride, int horizontalStride) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t desc;
         int32_t  mode;
         int32_t  maxpoolingNanOpt;
@@ -3283,7 +3283,7 @@ cudnnStatus_t cudnnPoolingForward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t yDesc, void *y) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t poolingDesc;
         uint8_t  alpha[8];
@@ -3317,7 +3317,7 @@ cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         uint64_t poolingDesc;
         uint8_t  alpha[8];
@@ -3364,7 +3364,7 @@ cudnnStatus_t cudnnBatchNormalizationForwardTraining(cudnnHandle_t handle,
     double epsilon,
     void *resultSaveMean, void *resultSaveInvVariance) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  mode;
         uint8_t  alpha[8];
@@ -3417,7 +3417,7 @@ cudnnStatus_t cudnnBatchNormalizationForwardInference(cudnnHandle_t handle,
     const void *estimatedMean, const void *estimatedVariance,
     double epsilon) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  mode;
         uint8_t  alpha[8];
@@ -3467,7 +3467,7 @@ cudnnStatus_t cudnnBatchNormalizationBackward(cudnnHandle_t handle,
     double epsilon,
     const void *savedMean, const void *savedInvVariance) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  mode;
         uint8_t  alphaDataDiff[8];
@@ -3523,7 +3523,7 @@ cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t yDesc, void *y) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  algo;
         int32_t  mode;
@@ -3558,7 +3558,7 @@ cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t handle,
     const void *beta,
     cudnnTensorDescriptor_t dxDesc, void *dx) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  algo;
         int32_t  mode;
@@ -3605,7 +3605,7 @@ cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t dropoutDesc,
     cudnnHandle_t handle, float dropout,
     void *states, size_t stateSizeInBytes, unsigned long long seed) {
 
-    struct {
+    struct __attribute__((packed)) {
         uint64_t desc;
         uint64_t handle;
         float    dropout;
@@ -4044,7 +4044,7 @@ static struct {
     uint64_t server_handle;     /* 0 = not yet registered on server */
     int32_t total_param_size;   /* total parameter buffer size */
     int32_t num_params;         /* number of kernel parameters */
-    struct { int32_t offset; int32_t size; } params[MAX_KERNEL_PARAMS];
+    struct __attribute__((packed)) { int32_t offset; int32_t size; } params[MAX_KERNEL_PARAMS];
 } g_registered_functions[MAX_REGISTERED_FUNCTIONS];
 static int g_registered_function_count = 0;
 
@@ -5106,7 +5106,7 @@ CUresult cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
 }
 
 CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
-    struct {
+    struct __attribute__((packed)) {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
     req.ptr = (uint64_t)dstDevice; req.value = (int32_t)uc; req.count = N;
@@ -5119,7 +5119,7 @@ CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUst
 }
 
 CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
-    struct {
+    struct __attribute__((packed)) {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
     req.ptr = (uint64_t)dstDevice; req.value = (int32_t)ui; req.count = N;

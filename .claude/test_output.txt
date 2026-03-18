@@ -1,16 +1,8 @@
-From github.com:fpolica91/chidori
-   eb44d5b..d87319a  main       -> origin/main
-Updating eb44d5b..d87319a
-Fast-forward
- .claude/test_output.txt                   | 117 ++----------------------------
- chidori-worker/src/server/cuda_dispatch.c |  31 ++------
- 2 files changed, 14 insertions(+), 134 deletions(-)
-rm -rf build
-      |            ^~~~~~~~~~~~~~~~~~~~~
 === test_train.py ===
 [chidori] Direct connect to gpu-worker at 127.0.0.1:43211
 [chidori] Socket fd=500
 [chidori] Connected directly to GPU worker
+[chidori-rpc] func=0x0106 returned error 700
 [chidori] cudaGetLastError() returning 700
 Device: NVIDIA GeForce RTX 4090 Laptop GPU
 ============================================================
@@ -33,6 +25,36 @@ CUDA kernel errors might be asynchronously reported at some other API call, so t
 For debugging consider passing CUDA_LAUNCH_BLOCKING=1
 Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
 
-[chidori] SOCKET CLOSED at src/client/chidori_client.c:5735
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5739
+EXIT: 0
+=== test_training_fp16.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] connect: Connection refused
+[chidori] cudaGetLastError() returning 3
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_training_fp16.py", line 5, in <module>
+    torch._C._cuda_init()
+    ~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: CUDA driver initialization failed, you might not have a CUDA gpu.
+EXIT: 0
+=== test_training.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] connect: Connection refused
+[chidori] cudaGetLastError() returning 3
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_training.py", line 7, in <module>
+    torch._C._cuda_init()
+    ~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: CUDA driver initialization failed, you might not have a CUDA gpu.
+EXIT: 0
+=== test_inference.py ===
+[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
+[chidori] connect: Connection refused
+[chidori] cudaGetLastError() returning 3
+Traceback (most recent call last):
+  File "/home/fabricio/chidori/chidori-worker/tests/test_inference.py", line 6, in <module>
+    torch._C._cuda_init()
+    ~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: CUDA driver initialization failed, you might not have a CUDA gpu.
 EXIT: 0
 === DONE ===
