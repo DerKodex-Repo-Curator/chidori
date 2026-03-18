@@ -4055,6 +4055,13 @@ static uint64_t lazy_register_fat_binary(int idx) {
                              g_fat_binaries[idx].data,
                              (size_t)g_fat_binaries[idx].size,
                              &handle, &out_len);
+    if (r != 0 || handle == 0) {
+        const unsigned char *d = (const unsigned char *)g_fat_binaries[idx].data;
+        uint32_t mag = 0;
+        memcpy(&mag, d, 4);
+        fprintf(stderr, "[chidori] fat_binary[%d] FAILED: size=%zu r=%d handle=%llu magic=0x%08x\n",
+                idx, (size_t)g_fat_binaries[idx].size, r, (unsigned long long)handle, mag);
+    }
     if (r == 0 && handle != 0)
         g_fat_binaries[idx].server_handle = handle;
     return handle;
@@ -4542,12 +4549,61 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
     struct __fatBinC_Wrapper *wrapper = (struct __fatBinC_Wrapper *)fatCubin;
     const unsigned char *data = (const unsigned char *)wrapper->data;
 
-    /* Read fat binary size from the header at offset 8 */
-    uint64_t fat_size = 0;
-    memcpy(&fat_size, data + 8, 8);
+    /* Determine fat binary size from the header.
+     *
+     * NVIDIA fat binary formats:
+     *   Magic 0xba55ed50 (__cudaFatBinaryHeader):
+     *     offset 0: magic(4) version(4) headerSize(8) fatSize(8)
+     *     fatSize at offset 16 (8 bytes) is the total size
+     *   Magic 0x466243b1 (old FATBIN):
+     *     offset 0: magic(4) version(4) size(8)
+     *     size at offset 8 is the total
+     *   ELF (0x7f454c46):
+     *     Read e_shoff + e_shnum * e_shentsize for actual size
+     */
+    uint32_t magic = 0;
+    memcpy(&magic, data, 4);
 
-    if (fat_size == 0 || fat_size > 100*1024*1024) {
-        fat_size = 4096;
+    uint64_t fat_size = 0;
+    if (magic == 0xba55ed50) {
+        /* New CUDA fat binary header (__cudaFatBinaryHeader):
+         *   magic(4) version(2) headerSize(2) fatSize(8) ...
+         * fatSize at offset 8 is the total binary size */
+        memcpy(&fat_size, data + 8, 8);
+        if (fat_size == 0 || fat_size > 256*1024*1024) {
+            /* Try alternative: some versions put size as uint32 at offset 8 */
+            uint32_t fat_size32 = 0;
+            memcpy(&fat_size32, data + 8, 4);
+            fprintf(stderr, "[chidori] fat_binary 0xba55ed50: fat_size64=%llu fat_size32=%u hdr_bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                    (unsigned long long)fat_size, fat_size32,
+                    data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
+            if (fat_size32 > 0 && fat_size32 < 256*1024*1024)
+                fat_size = fat_size32;
+        }
+    } else if (magic == 0x466243b1) {
+        /* Old FATBIN — size at offset 8 */
+        memcpy(&fat_size, data + 8, 8);
+    } else if (magic == 0x464c457f || (data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F')) {
+        /* ELF — parse header for actual size */
+        uint64_t e_shoff = 0;
+        uint16_t e_shnum = 0, e_shentsize = 0;
+        memcpy(&e_shoff, data + 40, 8);    /* e_shoff at offset 40 in ELF64 */
+        memcpy(&e_shentsize, data + 58, 2); /* e_shentsize at offset 58 */
+        memcpy(&e_shnum, data + 60, 2);     /* e_shnum at offset 60 */
+        fat_size = e_shoff + (uint64_t)e_shnum * e_shentsize;
+    } else {
+        /* Unknown format — try offset 8 as generic size field */
+        memcpy(&fat_size, data + 8, 8);
+    }
+
+    if (fat_size == 0 || fat_size > 256*1024*1024) {
+        /* Last resort fallback */
+        fat_size = 256 * 1024;
+        fprintf(stderr, "[chidori] fat_binary: unknown format magic=0x%08x, using fallback size=%llu\n",
+                magic, (unsigned long long)fat_size);
+    } else if (g_verbose) {
+        fprintf(stderr, "[chidori] fat_binary: magic=0x%08x size=%llu\n",
+                magic, (unsigned long long)fat_size);
     }
 
     /* Store locally — NO RPC */
