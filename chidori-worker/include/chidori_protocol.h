@@ -222,6 +222,11 @@ typedef enum {
     /* Utility (0x0290 - 0x029F) */
     CHIDORI_CUBLAS_GET_VERSION           = 0x0290,
 
+    /* cublasLt (0x02A0 - 0x02AF) */
+    CHIDORI_CUBLAS_LT_CREATE                 = 0x02A0,
+    CHIDORI_CUBLAS_LT_MATMUL                 = 0x02A1,
+    CHIDORI_CUBLAS_LT_MATMUL_ALGO_HEURISTIC  = 0x02A2,
+
     /* cuDNN (0x0300 - 0x03FF) — Phase 5 */
     CHIDORI_CUDNN_CREATE                              = 0x0300,
     CHIDORI_CUDNN_DESTROY                             = 0x0301,

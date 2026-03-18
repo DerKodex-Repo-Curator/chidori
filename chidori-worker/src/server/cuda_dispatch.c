@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cudnn.h>
 #include <string.h>
 #include <stdio.h>
@@ -2157,6 +2158,192 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             (const void *)(uintptr_t)B, (cudaDataType)Btype, ldb, (long long)strideB,
             beta_buf, (void *)(uintptr_t)C, (cudaDataType)Ctype, ldc, (long long)strideC,
             batchCount, (cublasComputeType_t)computeType, (cublasGemmAlgo_t)algo);
+        return chidori_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ================================================================
+     * cublasLt API (0x02A0 - 0x02AF)
+     * ================================================================ */
+
+    case CHIDORI_CUBLAS_LT_MATMUL_ALGO_HEURISTIC: {
+        /*
+         * Server-side cublasLt heuristic: receive raw descriptor fields,
+         * create real descriptors, call real heuristic, return algo bytes.
+         *
+         * Payload (176 bytes):
+         *   transa(4) transb(4) computeType(4) scaleType(4) = 16
+         *   For each of A, B, C, D (x4):
+         *     dtype(4) rows(8) cols(8) ld(8) batch(4) stride(8) = 40
+         *   Total: 16 + 4*40 = 176
+         */
+        if (req->payload_size < 188) {
+            int32_t zero = 0;
+            return chidori_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, &zero, 4);
+        }
+
+        int32_t transa, transb, computeType, scaleType, epilogue;
+        uint64_t bias_ptr;
+        struct { int32_t dtype; uint64_t rows, cols; int64_t ld; int32_t batch; int64_t stride; } mat[4];
+
+        const char *p = (const char *)payload;
+        memcpy(&transa, p, 4); p += 4;
+        memcpy(&transb, p, 4); p += 4;
+        memcpy(&computeType, p, 4); p += 4;
+        memcpy(&scaleType, p, 4); p += 4;
+        memcpy(&epilogue, p, 4); p += 4;
+        memcpy(&bias_ptr, p, 8); p += 8;
+        for (int i = 0; i < 4; i++) {
+            memcpy(&mat[i].dtype, p, 4); p += 4;
+            memcpy(&mat[i].rows, p, 8); p += 8;
+            memcpy(&mat[i].cols, p, 8); p += 8;
+            memcpy(&mat[i].ld, p, 8); p += 8;
+            memcpy(&mat[i].batch, p, 4); p += 4;
+            memcpy(&mat[i].stride, p, 8); p += 8;
+        }
+
+        fprintf(stderr, "[cublas_lt] heuristic: transa=%d transb=%d compute=%d scale=%d "
+                "A(%d,%lu,%lu,ld=%ld) B(%d,%lu,%lu,ld=%ld) C(%d,%lu,%lu,ld=%ld) D(%d,%lu,%lu,ld=%ld) batch=%d\n",
+                transa, transb, computeType, scaleType,
+                mat[0].dtype, mat[0].rows, mat[0].cols, mat[0].ld,
+                mat[1].dtype, mat[1].rows, mat[1].cols, mat[1].ld,
+                mat[2].dtype, mat[2].rows, mat[2].cols, mat[2].ld,
+                mat[3].dtype, mat[3].rows, mat[3].cols, mat[3].ld, mat[0].batch);
+
+        cublasLtHandle_t ltHandle;
+        cublasLtCreate(&ltHandle);
+
+        cublasLtMatmulDesc_t opDesc;
+        cublasLtMatmulDescCreate(&opDesc, (cublasComputeType_t)computeType, (cudaDataType_t)scaleType);
+        cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
+        cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
+        if (epilogue)
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
+        if (bias_ptr) {
+            void *bp = (void *)(uintptr_t)bias_ptr;
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp));
+        }
+
+        cublasLtMatrixLayout_t descs[4];
+        for (int i = 0; i < 4; i++) {
+            cublasLtMatrixLayoutCreate(&descs[i], (cudaDataType_t)mat[i].dtype,
+                                       mat[i].rows, mat[i].cols, mat[i].ld);
+            if (mat[i].batch > 1) {
+                cublasLtMatrixLayoutSetAttribute(descs[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                  &mat[i].batch, sizeof(mat[i].batch));
+                cublasLtMatrixLayoutSetAttribute(descs[i], CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                                  &mat[i].stride, sizeof(mat[i].stride));
+            }
+        }
+
+        cublasLtMatmulPreference_t pref;
+        cublasLtMatmulPreferenceCreate(&pref);
+
+        cublasLtMatmulHeuristicResult_t result;
+        int returnAlgoCount = 0;
+        cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+            ltHandle, opDesc, descs[0], descs[1], descs[2], descs[3],
+            pref, 1, &result, &returnAlgoCount);
+
+        cublasLtMatmulPreferenceDestroy(pref);
+        for (int i = 0; i < 4; i++) cublasLtMatrixLayoutDestroy(descs[i]);
+        cublasLtMatmulDescDestroy(opDesc);
+        cublasLtDestroy(ltHandle);
+
+        uint8_t resp[4 + sizeof(cublasLtMatmulHeuristicResult_t)];
+        memcpy(resp, &returnAlgoCount, 4);
+        if (returnAlgoCount > 0)
+            memcpy(resp + 4, &result, sizeof(result));
+        return chidori_send_response(fd, req->seq_num, (int32_t)st,
+                                      resp, 4 + (returnAlgoCount > 0 ? sizeof(result) : 0));
+    }
+
+    case CHIDORI_CUBLAS_LT_MATMUL: {
+        /*
+         * Server-side cublasLtMatmul: same descriptor format as heuristic,
+         * plus alpha/beta/pointers/algo.
+         *
+         * Payload (296 bytes):
+         *   176 (descriptors, same as heuristic)
+         *   + alpha(8) beta(8) A_ptr(8) B_ptr(8) C_ptr(8) D_ptr(8) stream(8) algo(64)
+         */
+        if (req->payload_size < 308) {
+            return chidori_send_response(fd, req->seq_num, CUBLAS_STATUS_INVALID_VALUE, NULL, 0);
+        }
+
+        int32_t transa, transb, computeType, scaleType, epilogue;
+        uint64_t bias_ptr;
+        struct { int32_t dtype; uint64_t rows, cols; int64_t ld; int32_t batch; int64_t stride; } mat[4];
+        uint8_t alpha_bytes[8], beta_bytes[8];
+        uint64_t A_ptr, B_ptr, C_ptr, D_ptr, stream_wire;
+        uint8_t algo_bytes[64];
+
+        const char *p = (const char *)payload;
+        memcpy(&transa, p, 4); p += 4;
+        memcpy(&transb, p, 4); p += 4;
+        memcpy(&computeType, p, 4); p += 4;
+        memcpy(&scaleType, p, 4); p += 4;
+        memcpy(&epilogue, p, 4); p += 4;
+        memcpy(&bias_ptr, p, 8); p += 8;
+        for (int i = 0; i < 4; i++) {
+            memcpy(&mat[i].dtype, p, 4); p += 4;
+            memcpy(&mat[i].rows, p, 8); p += 8;
+            memcpy(&mat[i].cols, p, 8); p += 8;
+            memcpy(&mat[i].ld, p, 8); p += 8;
+            memcpy(&mat[i].batch, p, 4); p += 4;
+            memcpy(&mat[i].stride, p, 8); p += 8;
+        }
+        memcpy(alpha_bytes, p, 8); p += 8;
+        memcpy(beta_bytes, p, 8); p += 8;
+        memcpy(&A_ptr, p, 8); p += 8;
+        memcpy(&B_ptr, p, 8); p += 8;
+        memcpy(&C_ptr, p, 8); p += 8;
+        memcpy(&D_ptr, p, 8); p += 8;
+        memcpy(&stream_wire, p, 8); p += 8;
+        memcpy(algo_bytes, p, 64);
+
+        cublasLtHandle_t ltHandle;
+        cublasLtCreate(&ltHandle);
+
+        cublasLtMatmulDesc_t opDesc;
+        cublasLtMatmulDescCreate(&opDesc, (cublasComputeType_t)computeType, (cudaDataType_t)scaleType);
+        cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
+        cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
+        if (epilogue)
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue));
+        if (bias_ptr) {
+            void *bp = (void *)(uintptr_t)bias_ptr;
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp));
+        }
+
+        cublasLtMatrixLayout_t descs[4];
+        for (int i = 0; i < 4; i++) {
+            cublasLtMatrixLayoutCreate(&descs[i], (cudaDataType_t)mat[i].dtype,
+                                       mat[i].rows, mat[i].cols, mat[i].ld);
+            if (mat[i].batch > 1) {
+                cublasLtMatrixLayoutSetAttribute(descs[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                  &mat[i].batch, sizeof(mat[i].batch));
+                cublasLtMatrixLayoutSetAttribute(descs[i], CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                                  &mat[i].stride, sizeof(mat[i].stride));
+            }
+        }
+
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_wire);
+        if (!stream && stream_wire)
+            stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_wire);
+
+        cublasLtMatmulAlgo_t *algo = (cublasLtMatmulAlgo_t *)algo_bytes;
+
+        cublasStatus_t st = cublasLtMatmul(ltHandle, opDesc,
+            alpha_bytes, (void *)(uintptr_t)A_ptr, descs[0],
+            (void *)(uintptr_t)B_ptr, descs[1],
+            beta_bytes, (void *)(uintptr_t)C_ptr, descs[2],
+            (void *)(uintptr_t)D_ptr, descs[3],
+            algo, NULL, 0, (cudaStream_t)stream);
+
+        for (int i = 0; i < 4; i++) cublasLtMatrixLayoutDestroy(descs[i]);
+        cublasLtMatmulDescDestroy(opDesc);
+        cublasLtDestroy(ltHandle);
+
         return chidori_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
     }
 

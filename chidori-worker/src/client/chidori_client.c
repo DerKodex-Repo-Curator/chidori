@@ -5207,9 +5207,11 @@ cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
  * ============================================================================
  */
 
-/* cublasLt attribute IDs we care about */
-#define CUBLASLT_MATMUL_DESC_TRANSA  0
-#define CUBLASLT_MATMUL_DESC_TRANSB  1
+/* cublasLt attribute IDs (CUDA 12.x actual enum values) */
+#define CUBLASLT_MATMUL_DESC_TRANSA      3
+#define CUBLASLT_MATMUL_DESC_TRANSB      4
+#define CUBLASLT_MATMUL_DESC_EPILOGUE    7
+#define CUBLASLT_MATMUL_DESC_BIAS_POINTER 8
 #define CUBLASLT_MATRIX_LAYOUT_TYPE  0
 #define CUBLASLT_MATRIX_LAYOUT_ROWS  2
 #define CUBLASLT_MATRIX_LAYOUT_COLS  3
@@ -5222,6 +5224,8 @@ typedef struct {
     int scaleType;
     int transa;  /* 0=N, 1=T */
     int transb;
+    int epilogue; /* CUBLASLT_EPILOGUE_* */
+    uint64_t bias_pointer;
 } lt_matmul_desc_t;
 
 typedef struct {
@@ -5245,115 +5249,74 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
-    (void)lightHandle; (void)algo; (void)workspace; (void)workspaceSizeInBytes;
+    (void)lightHandle; (void)workspace; (void)workspaceSizeInBytes; (void)C;
 
     lt_matmul_desc_t *desc = (lt_matmul_desc_t *)computeDesc;
     lt_matrix_layout_t *layA = (lt_matrix_layout_t *)Adesc;
     lt_matrix_layout_t *layB = (lt_matrix_layout_t *)Bdesc;
     lt_matrix_layout_t *layC = (lt_matrix_layout_t *)Cdesc;
     lt_matrix_layout_t *layD = (lt_matrix_layout_t *)Ddesc;
-    (void)layC;
 
     if (!layA || !layB || !layD) {
         fprintf(stderr, "[chidori] cublasLtMatmul: NULL layout descriptor\n");
         return CUBLAS_STATUS_INVALID_VALUE;
     }
-    if (g_last_cublas_handle == 0) {
-        fprintf(stderr, "[chidori] cublasLtMatmul: no cuBLAS handle available\n");
-        return CUBLAS_STATUS_NOT_INITIALIZED;
+
+    /* Build payload: 188 (header+descriptors) + 16 (alpha+beta) + 40 (5 ptrs) + 64 (algo) = 308 */
+    uint8_t payload[308];
+    char *p = (char *)payload;
+
+    /* 28 bytes: transa, transb, computeType, scaleType, epilogue, bias_ptr */
+    int32_t transa_v = desc ? desc->transa : 0;
+    int32_t transb_v = desc ? desc->transb : 0;
+    int32_t computeType_v = desc ? desc->computeType : 0;
+    int32_t scaleType_v = desc ? desc->scaleType : 0;
+    int32_t epilogue_v = desc ? desc->epilogue : 0;
+    uint64_t bias_ptr_v = desc ? desc->bias_pointer : 0;
+    memcpy(p, &transa_v, 4); p += 4;
+    memcpy(p, &transb_v, 4); p += 4;
+    memcpy(p, &computeType_v, 4); p += 4;
+    memcpy(p, &scaleType_v, 4); p += 4;
+    memcpy(p, &epilogue_v, 4); p += 4;
+    memcpy(p, &bias_ptr_v, 8); p += 8;
+
+    /* 160 bytes: 4 matrix descriptors (A, B, C, D) */
+    lt_matrix_layout_t *mats[4] = {layA, layB, layC, layD};
+    for (int i = 0; i < 4; i++) {
+        lt_matrix_layout_t *l = mats[i] ? mats[i] : layD;
+        int32_t dtype = l->dtype;
+        uint64_t rows = l->rows, cols = l->cols;
+        int64_t ld = l->ld;
+        int32_t batch = (int32_t)l->batch_count;
+        int64_t stride = l->strided_batch_offset;
+        memcpy(p, &dtype, 4); p += 4;
+        memcpy(p, &rows, 8); p += 8;
+        memcpy(p, &cols, 8); p += 8;
+        memcpy(p, &ld, 8); p += 8;
+        memcpy(p, &batch, 4); p += 4;
+        memcpy(p, &stride, 8); p += 8;
     }
+    /* 16 bytes: alpha(8) + beta(8) */
+    memset(p, 0, 8);
+    if (alpha) memcpy(p, alpha, 4);
+    else { float one = 1.0f; memcpy(p, &one, 4); }
+    p += 8;
+    memset(p, 0, 8);
+    if (beta) memcpy(p, beta, 4);
+    p += 8;
+    /* 40 bytes: A_ptr B_ptr C_ptr D_ptr stream */
+    uint64_t ptrs[5];
+    ptrs[0] = (uint64_t)(uintptr_t)A;
+    ptrs[1] = (uint64_t)(uintptr_t)B;
+    ptrs[2] = (uint64_t)(uintptr_t)(layC ? C : D);
+    ptrs[3] = (uint64_t)(uintptr_t)D;
+    ptrs[4] = (uint64_t)(uintptr_t)stream;
+    memcpy(p, ptrs, 40); p += 40;
+    /* 64 bytes: algo */
+    if (algo) memcpy(p, algo, 64);
+    else memset(p, 0, 64);
 
-    /* Extract dimensions: for GEMM C = alpha * op(A) * op(B) + beta * C
-     * op(A) is m x k, op(B) is k x n, C/D is m x n */
-    int transa = desc ? desc->transa : 0;
-    int transb = desc ? desc->transb : 0;
-    uint64_t m = layD ? layD->rows : (layA ? (transa ? layA->cols : layA->rows) : 0);
-    uint64_t n = layD ? layD->cols : (layB ? (transb ? layB->rows : layB->cols) : 0);
-    uint64_t k = layA ? (transa ? layA->rows : layA->cols) : 0;
-    int64_t lda = layA ? layA->ld : (int64_t)m;
-    int64_t ldb = layB ? layB->ld : (int64_t)k;
-    int64_t ldc = layD ? layD->ld : (int64_t)m;
-
-    /* Determine data type */
-    int Atype = layA ? layA->dtype : 0;
-    int Btype = layB ? layB->dtype : 0;
-    int Ctype = layD ? layD->dtype : 0;
-    int computeType_val = desc ? desc->computeType : 0;
-
-    /* Check for batched */
-    int64_t batchA = layA ? layA->batch_count : 0;
-    int64_t batchB = layB ? layB->batch_count : 0;
-    int64_t batch = (batchA > 1) ? batchA : ((batchB > 1) ? batchB : 0);
-
-    if (batch > 1) {
-        int64_t strideA = layA ? layA->strided_batch_offset : 0;
-        int64_t strideB = layB ? layB->strided_batch_offset : 0;
-        int64_t strideC = layD ? layD->strided_batch_offset : 0;
-
-        /* Use cublasGemmStridedBatchedEx */
-        struct {
-            uint64_t handle; int32_t transa; int32_t transb;
-            int32_t m; int32_t n; int32_t k;
-            float alpha; uint64_t A; int32_t Atype; int32_t lda; int64_t strideA;
-            uint64_t B; int32_t Btype; int32_t ldb; int64_t strideB;
-            float beta; uint64_t C; int32_t Ctype; int32_t ldc; int64_t strideC;
-            int32_t batchCount; int32_t computeType; int32_t algo;
-        } req;
-        memset(&req, 0, sizeof(req));
-        req.handle = g_last_cublas_handle;
-        req.transa = transa; req.transb = transb;
-        req.m = (int32_t)m; req.n = (int32_t)n; req.k = (int32_t)k;
-        req.alpha = alpha ? *(const float *)alpha : 1.0f;
-        req.A = (uint64_t)(uintptr_t)A; req.Atype = Atype; req.lda = (int32_t)lda; req.strideA = strideA;
-        req.B = (uint64_t)(uintptr_t)B; req.Btype = Btype; req.ldb = (int32_t)ldb; req.strideB = strideB;
-        req.beta = beta ? *(const float *)beta : 0.0f;
-        req.C = (uint64_t)(uintptr_t)D; req.Ctype = Ctype; req.ldc = (int32_t)ldc; req.strideC = strideC;
-        req.batchCount = (int32_t)batch;
-        req.computeType = computeType_val;
-        req.algo = 0; /* CUBLAS_GEMM_DEFAULT */
-
-        uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
-        /* Set stream first */
-        struct { uint64_t handle; uint64_t stream; } ss;
-        ss.handle = req.handle; ss.stream = stream_handle;
-        chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &ss, sizeof(ss));
-        return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_GEMM_STRIDED_BATCHED_EX, &req, sizeof(req));
-    }
-
-    /* Non-batched: use cublasGemmEx — struct must match wire format (uint8_t alpha[8]) */
-    struct {
-        uint64_t handle;
-        int32_t  transa, transb;
-        int32_t  m, n, k;
-        uint8_t  alpha_bytes[8];
-        uint64_t A;
-        int32_t  Atype, lda;
-        uint64_t B;
-        int32_t  Btype, ldb;
-        uint8_t  beta_bytes[8];
-        uint64_t C;
-        int32_t  Ctype, ldc;
-        int32_t  computeType;
-        int32_t  algo;
-    } req;
-    memset(&req, 0, sizeof(req));
-    req.handle = g_last_cublas_handle;
-    req.transa = transa; req.transb = transb;
-    req.m = (int32_t)m; req.n = (int32_t)n; req.k = (int32_t)k;
-    if (alpha) memcpy(req.alpha_bytes, alpha, 4);
-    else { float one = 1.0f; memcpy(req.alpha_bytes, &one, 4); }
-    req.A = (uint64_t)(uintptr_t)A; req.Atype = Atype; req.lda = (int32_t)lda;
-    req.B = (uint64_t)(uintptr_t)B; req.Btype = Btype; req.ldb = (int32_t)ldb;
-    if (beta) memcpy(req.beta_bytes, beta, 4);
-    req.C = (uint64_t)(uintptr_t)D; req.Ctype = Ctype; req.ldc = (int32_t)ldc;
-    req.computeType = computeType_val;
-    req.algo = 0; /* CUBLAS_GEMM_DEFAULT */
-
-    uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
-    struct { uint64_t handle; uint64_t stream; } ss;
-    ss.handle = req.handle; ss.stream = stream_handle;
-    chidori_rpc_async(CHIDORI_CUBLAS_SET_STREAM, &ss, sizeof(ss));
-    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_GEMM_EX, &req, sizeof(req));
+    return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_LT_MATMUL, payload, 308);
 }
 
 cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
@@ -5377,6 +5340,8 @@ cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
     if (!d || !buf) return CUBLAS_STATUS_SUCCESS;
     if (attr == CUBLASLT_MATMUL_DESC_TRANSA && sizeInBytes >= 4) d->transa = *(const int *)buf;
     if (attr == CUBLASLT_MATMUL_DESC_TRANSB && sizeInBytes >= 4) d->transb = *(const int *)buf;
+    if (attr == CUBLASLT_MATMUL_DESC_EPILOGUE && sizeInBytes >= 4) d->epilogue = *(const int *)buf;
+    if (attr == CUBLASLT_MATMUL_DESC_BIAS_POINTER && sizeInBytes >= 8) d->bias_pointer = *(const uint64_t *)buf;
     return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -5459,11 +5424,64 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
     void *preference, int requestedAlgoCount, void *heuristicResultsArray,
     int *returnAlgoCount) {
-    (void)lightHandle; (void)operationDesc; (void)Adesc; (void)Bdesc;
-    (void)Cdesc; (void)Ddesc; (void)preference; (void)requestedAlgoCount;
-    (void)heuristicResultsArray;
-    if (returnAlgoCount) *returnAlgoCount = 0;
-    return CUBLAS_STATUS_SUCCESS;
+    (void)lightHandle; (void)preference; (void)requestedAlgoCount;
+
+    lt_matmul_desc_t *desc = (lt_matmul_desc_t *)operationDesc;
+    lt_matrix_layout_t *layA = (lt_matrix_layout_t *)Adesc;
+    lt_matrix_layout_t *layB = (lt_matrix_layout_t *)Bdesc;
+    lt_matrix_layout_t *layC = (lt_matrix_layout_t *)Cdesc;
+    lt_matrix_layout_t *layD = (lt_matrix_layout_t *)Ddesc;
+
+    if (!desc || !layA || !layB || !layD) {
+        if (returnAlgoCount) *returnAlgoCount = 0;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+
+    /* Build payload with raw descriptor fields (188 bytes):
+     * transa(4) transb(4) computeType(4) scaleType(4) epilogue(4) bias_ptr(8) = 28
+     * For each A,B,C,D: dtype(4) rows(8) cols(8) ld(8) batch(4) stride(8) = 40 x 4 = 160 */
+    uint8_t payload[188];
+    char *p = (char *)payload;
+    int32_t transa_v = desc->transa, transb_v = desc->transb;
+    int32_t computeType_v = desc->computeType, scaleType_v = desc->scaleType;
+    int32_t epilogue_v = desc->epilogue;
+    uint64_t bias_ptr_v = desc->bias_pointer;
+    memcpy(p, &transa_v, 4); p += 4;
+    memcpy(p, &transb_v, 4); p += 4;
+    memcpy(p, &computeType_v, 4); p += 4;
+    memcpy(p, &scaleType_v, 4); p += 4;
+    memcpy(p, &epilogue_v, 4); p += 4;
+    memcpy(p, &bias_ptr_v, 8); p += 8;
+
+    lt_matrix_layout_t *mats[4] = {layA, layB, layC, layD};
+    for (int i = 0; i < 4; i++) {
+        lt_matrix_layout_t *l = mats[i] ? mats[i] : layD; /* fallback to D if C is NULL */
+        int32_t dtype = l->dtype;
+        uint64_t rows = l->rows, cols = l->cols;
+        int64_t ld = l->ld;
+        int32_t batch = (int32_t)l->batch_count;
+        int64_t stride = l->strided_batch_offset;
+        memcpy(p, &dtype, 4); p += 4;
+        memcpy(p, &rows, 8); p += 8;
+        memcpy(p, &cols, 8); p += 8;
+        memcpy(p, &ld, 8); p += 8;
+        memcpy(p, &batch, 4); p += 4;
+        memcpy(p, &stride, 8); p += 8;
+    }
+
+    /* RPC to server */
+    uint8_t resp[4 + 96]; /* algoCount(4) + cublasLtMatmulHeuristicResult_t (96) */
+    size_t out_len = sizeof(resp);
+    cublasStatus_t st = (cublasStatus_t)chidori_rpc(
+        CHIDORI_CUBLAS_LT_MATMUL_ALGO_HEURISTIC, payload, 188, resp, &out_len);
+
+    int32_t algoCount = 0;
+    if (out_len >= 4) memcpy(&algoCount, resp, 4);
+    if (returnAlgoCount) *returnAlgoCount = algoCount;
+    if (algoCount > 0 && heuristicResultsArray && out_len > 4)
+        memcpy(heuristicResultsArray, resp + 4, out_len - 4);
+
+    return st;
 }
 
 /* Additional cublasLt stubs that PyTorch may call after getting heuristic results */
