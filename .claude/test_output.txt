@@ -1,11 +1,10 @@
 From github.com:fpolica91/chidori
-   c4df43d..eb44d5b  main       -> origin/main
-Updating c4df43d..eb44d5b
+   eb44d5b..d87319a  main       -> origin/main
+Updating eb44d5b..d87319a
 Fast-forward
- .claude/test_output.txt                    | 14 ++++++++++++--
- chidori-worker/src/client/chidori_client.c | 21 ++++++++++----------
- chidori-worker/src/server/cuda_dispatch.c  | 31 ++++++++++++++++--------------
- 3 files changed, 39 insertions(+), 27 deletions(-)
+ .claude/test_output.txt                   | 117 ++----------------------------
+ chidori-worker/src/server/cuda_dispatch.c |  31 ++------
+ 2 files changed, 14 insertions(+), 134 deletions(-)
 rm -rf build
       |            ^~~~~~~~~~~~~~~~~~~~~
 === test_train.py ===

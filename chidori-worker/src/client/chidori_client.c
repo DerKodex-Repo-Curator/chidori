@@ -638,6 +638,10 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
         return CUDA_ERROR_NOT_INITIALIZED;
     }
 
+    if (resp.result != 0 && resp.result != 0 /* always log nonzero */) {
+        fprintf(stderr, "[chidori-rpc] func=0x%04x returned error %d\n", func_id, resp.result);
+    }
+
     /* Read response payload if present */
     size_t resp_payload_len = resp.msg_len - CHIDORI_RESPONSE_HEADER_SIZE;
     if (resp_payload_len > 0 && out_payload != NULL) {
