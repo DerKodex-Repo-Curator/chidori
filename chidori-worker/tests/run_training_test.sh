@@ -1,25 +1,27 @@
 #!/bin/bash
 # Chidori FP32 Training Test
-# Usage: ./run_training_test.sh [server_ip] [port]
-#
-# Runs on the GPU server (loopback) by default.
-# Restarts the server, runs 20 FP32 training steps with bias+ReLU.
+# Usage:
+#   ./run_training_test.sh                    # loopback (starts server locally)
+#   ./run_training_test.sh 66.172.11.7 43211  # remote server (client-only)
 
 SERVER=${1:-127.0.0.1}
 PORT=${2:-43211}
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Kill old server, restart
-kill $(pgrep -f "chidori-worker.*${PORT}") 2>/dev/null
-sleep 1
-nohup "${DIR}/build/chidori-worker" --standalone "$PORT" > /tmp/chidori-server.log 2>&1 &
-sleep 1
-
-if ! pgrep -f "chidori-worker.*${PORT}" > /dev/null; then
-    echo "FAIL: Server didn't start. Check /tmp/chidori-server.log"
-    exit 1
+if [ "$SERVER" = "127.0.0.1" ]; then
+    # Loopback mode: start server locally
+    kill $(pgrep -f "chidori-worker.*${PORT}") 2>/dev/null
+    sleep 1
+    nohup "${DIR}/build/chidori-worker" --standalone "$PORT" > /tmp/chidori-server.log 2>&1 &
+    sleep 1
+    if ! pgrep -f "chidori-worker.*${PORT}" > /dev/null; then
+        echo "FAIL: Server didn't start. Check /tmp/chidori-server.log"
+        exit 1
+    fi
+    echo "Server running locally on port ${PORT}"
+else
+    echo "Connecting to remote server ${SERVER}:${PORT}"
 fi
-echo "Server running on port ${PORT}"
 
 # Run training test
 CHIDORI_DIRECT_CONNECT=1 \
