@@ -23,12 +23,20 @@ else
     echo "Connecting to remote server ${SERVER}:${PORT}"
 fi
 
+# Use venv python if available
+PYTHON=python3
+if [ -f "${DIR}/../.venv/bin/python" ]; then
+    PYTHON="${DIR}/../.venv/bin/python"
+elif [ -f "${HOME}/chidori/.venv/bin/python" ]; then
+    PYTHON="${HOME}/chidori/.venv/bin/python"
+fi
+
 # Run training test
 CHIDORI_DIRECT_CONNECT=1 \
 CHIDORI_CFG_OVERRIDE="{\"id\":\"test\",\"servers\":[\"${SERVER}:${PORT}\"]}" \
 LD_PRELOAD="${DIR}/build/libcuda.so.1" \
 LD_LIBRARY_PATH="${DIR}/build" \
-python3 - << 'PYTHON'
+$PYTHON - << 'PYTHON'
 import torch, torch.nn as nn, time
 torch._C._cuda_init()
 dev = torch.cuda.get_device_name(0)
