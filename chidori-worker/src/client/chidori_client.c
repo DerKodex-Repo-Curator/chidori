@@ -710,6 +710,11 @@ CUresult cuDeviceGetCount(int *count) {
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
+    /* Re-check after RPC (chidori_connect may have run inside chidori_rpc) */
+    if (g_num_servers > 1) {
+        *count = g_num_servers;
+        return CUDA_SUCCESS;
+    }
     if (remote_count <= 0) remote_count = 1;
     g_remote_device_count = remote_count;
     if (g_partial_offload) {
@@ -1216,6 +1221,13 @@ cudaError_t cudaGetDeviceCount(int *count) {
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
+    /* Re-check after RPC (chidori_connect may have established multi-server) */
+    if (g_num_servers > 1) {
+        *count = g_num_servers;
+        g_device_count_cache = *count;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
     if (remote_count <= 0) remote_count = 1;
     *count = remote_count;
     g_device_count_cache = *count;
