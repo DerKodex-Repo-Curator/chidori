@@ -13,6 +13,11 @@ SERVER=${1:-127.0.0.1}
 PORT=${2:-43211}
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_PID=""
+# If server is remote (not loopback) or port != 43211, don't manage the server
+MANAGE_SERVER=1
+if [ "$SERVER" != "127.0.0.1" ] || [ "$PORT" != "43211" ]; then
+    MANAGE_SERVER=0
+fi
 
 # Find Python with PyTorch
 PY=python3
@@ -22,7 +27,7 @@ done
 
 # Loopback mode: start server locally
 start_server() {
-    if [ "$SERVER" = "127.0.0.1" ]; then
+    if [ "$MANAGE_SERVER" = "1" ]; then
         kill $(pgrep -f "chidori-worker.*--standalone.*$PORT") 2>/dev/null
         sleep 1
         "$DIR/build/chidori-worker" --standalone "$PORT" > /dev/null 2>&1 &
@@ -36,7 +41,7 @@ start_server() {
 }
 
 stop_server() {
-    if [ -n "$SERVER_PID" ]; then
+    if [ "$MANAGE_SERVER" = "1" ] && [ -n "$SERVER_PID" ]; then
         kill $SERVER_PID 2>/dev/null
         wait $SERVER_PID 2>/dev/null
         SERVER_PID=""

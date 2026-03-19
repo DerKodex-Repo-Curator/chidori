@@ -1,31 +1,11 @@
-Updating eeece03..f34aa06
-Fast-forward
- .claude/test_output.txt               | 52 ++++++++++++++++++++++++++---------
- chidori-worker/tests/test_training.py | 10 +++----
- 2 files changed, 44 insertions(+), 18 deletions(-)
-From github.com:fpolica91/chidori
-   eeece03..f34aa06  main       -> origin/main
-rm -rf build
-      |                                                             ~~~~~^~~~~~~~~~
 
 === Chidori Test Suite ===
-Server:  127.0.0.1:43211
+Server:  127.0.0.1:43212
 Python:  /home/fabricio/chidori/chidori-worker/../.venv/bin/python
 Build:   /home/fabricio/chidori/chidori-worker/build
 
-  test_pytorch.py (basic ops)         PASS  (2s)
-  test_train.py (matmul 4096)         PASS  (20s)
-  test_training_fp16.py (FP16)        PASS  (4s)
-  test_training.py (FP32 train)       FAIL  (4s, exit=1)
-    ============================================================
-    FAIL: test_training
+  test_pytorch.py (basic ops)         FAIL  (25s, exit=1)
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+    
     [chidori] SOCKET CLOSED at src/client/chidori_client.c:5886
-  test_inference.py (TinyLlama)       PASS  (12s)
-
-=== Results ===
-4/5 passed, 1 failed
-
-Failures:
-  - test_training.py (FP32 train) (exit 1)
-
-SOME TESTS FAILED
+FATAL: Server failed to start
