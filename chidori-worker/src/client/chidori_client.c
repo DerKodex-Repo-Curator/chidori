@@ -761,10 +761,6 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
-    {
-        int tmpfd = open("/tmp/chidori_trace.txt", O_WRONLY|O_CREAT|O_APPEND, 0644);
-        if (tmpfd >= 0) { write(tmpfd, "cuDeviceGetCount\n", 17); close(tmpfd); }
-    }
     /* For partial offload: NEVER forward to real driver (it only sees local GPUs).
      * Always return our merged count. Only forward when inside real CUDA AND
      * not in partial offload mode. */
@@ -777,8 +773,6 @@ CUresult cuDeviceGetCount(int *count) {
     g_remote_device_count = remote_count;
     if (g_partial_offload) {
         *count = g_local_device_count + remote_count;
-        fprintf(stderr, "[chidori] cuDeviceGetCount: local=%d remote=%d total=%d\n",
-                g_local_device_count, remote_count, *count);
     } else {
         *count = remote_count;
     }
@@ -1453,10 +1447,6 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
     /* For partial offload: route local device queries to real CUDA */
     init_real_cuda(); /* ensure g_partial_offload is set */
-    if (g_partial_offload) {
-        fprintf(stderr, "[DEBUG] cudaDeviceGetAttribute: dev=%d local=%d mask=0x%x\n",
-                device, is_local_device(device), g_local_device_mask);
-    }
     if (g_partial_offload && is_local_device(device) && g_real.cuDeviceGetAttribute) {
         ensure_real_cuda_init();
         g_in_real_cuda = 1;

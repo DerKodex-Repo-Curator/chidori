@@ -162,4 +162,11 @@ When facing a hard technical problem:
 4. Implement it properly or not at all
 </rule>
 
+<rule name="version-matching">
+All PyTorch, CUDA, and Python versions MUST match between client and all GPU servers.
+Current standard: PyTorch 2.10.0+cu128.
+Before testing, always verify versions match on both machines.
+Version mismatches cause subtle symbol resolution differences that waste debugging time.
+</rule>
+
 9. <rule> you will always test from client server local to whichever gpu server you are given access to, testing on loopback is no longer considered a valid test. <rule>
