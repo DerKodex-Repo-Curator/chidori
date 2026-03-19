@@ -1224,13 +1224,33 @@ static cudaError_t g_last_error = 0;
 static int g_device_count_cache = -1;
 
 cudaError_t cudaGetDeviceCount(int *count) {
-    fprintf(stderr, "[chidori] cudaGetDeviceCount: cache=%d num_servers=%d\n", g_device_count_cache, g_num_servers);
     if (g_device_count_cache >= 0) {
         *count = g_device_count_cache;
         return cudaSuccess;
     }
-    /* Multi-server: each server has 1 GPU (device), total = num_servers.
-     * For single-server backward compat, query the server's count. */
+
+    /* Pre-connect: check how many servers are configured BEFORE connecting.
+     * This ensures the first cudaGetDeviceCount call returns the right count
+     * even before chidori_connect runs. */
+    if (g_num_servers == 0) {
+        const char *cfg = getenv("CHIDORI_CFG_OVERRIDE");
+        if (cfg) {
+            /* Count commas in servers array as proxy for server count */
+            const char *arr = strstr(cfg, "\"servers\":[");
+            if (arr) {
+                int n = 1;
+                for (const char *p = arr; *p && *p != ']'; p++)
+                    if (*p == ',') n++;
+                if (n > 1) {
+                    *count = n;
+                    g_device_count_cache = n;
+                    return cudaSuccess;
+                }
+            }
+        }
+    }
+
+    /* Multi-server: each server has 1 GPU (device), total = num_servers. */
     if (g_num_servers > 1) {
         *count = g_num_servers;
         g_device_count_cache = *count;
