@@ -69,22 +69,42 @@ static __thread int g_in_real_cuda = 0;   /* reentrance guard: 1 = inside real C
 
 /* Real CUDA function pointers (populated by init_real_cuda) */
 static struct {
-    /* Driver API */
+    /* Driver API — all functions that real cudart may call internally */
     CUresult (*cuInit)(unsigned int);
+    CUresult (*cuDriverGetVersion)(int *);
     CUresult (*cuDeviceGetCount)(int *);
     CUresult (*cuDeviceGet)(CUdevice *, int);
     CUresult (*cuDeviceGetName)(char *, int, CUdevice);
     CUresult (*cuDeviceTotalMem_v2)(size_t *, CUdevice);
     CUresult (*cuDeviceGetAttribute)(int *, int, CUdevice);
+    CUresult (*cuCtxCreate_v2)(CUcontext *, unsigned int, CUdevice);
+    CUresult (*cuCtxDestroy_v2)(CUcontext);
+    CUresult (*cuCtxSetCurrent)(CUcontext);
     CUresult (*cuCtxGetCurrent)(CUcontext *);
+    CUresult (*cuCtxSynchronize)(void);
+    CUresult (*cuDevicePrimaryCtxRetain)(CUcontext *, CUdevice);
+    CUresult (*cuDevicePrimaryCtxRelease_v2)(CUdevice);
     CUresult (*cuMemAlloc_v2)(CUdeviceptr *, size_t);
     CUresult (*cuMemFree_v2)(CUdeviceptr);
     CUresult (*cuMemcpyHtoD_v2)(CUdeviceptr, const void *, size_t);
     CUresult (*cuMemcpyDtoH_v2)(void *, CUdeviceptr, size_t);
+    CUresult (*cuMemcpyDtoD_v2)(CUdeviceptr, CUdeviceptr, size_t);
+    CUresult (*cuMemGetInfo_v2)(size_t *, size_t *);
+    CUresult (*cuModuleLoadData)(CUmodule *, const void *);
+    CUresult (*cuModuleUnload)(CUmodule);
+    CUresult (*cuModuleGetFunction)(CUfunction *, CUmodule, const char *);
+    CUresult (*cuFuncGetAttribute)(int *, int, CUfunction);
     CUresult (*cuLaunchKernel)(CUfunction, unsigned int, unsigned int, unsigned int,
                                unsigned int, unsigned int, unsigned int,
                                unsigned int, CUstream, void **, void **);
+    CUresult (*cuStreamCreate)(CUstream *, unsigned int);
+    CUresult (*cuStreamDestroy_v2)(CUstream);
     CUresult (*cuStreamSynchronize)(CUstream);
+    CUresult (*cuEventCreate)(CUevent *, unsigned int);
+    CUresult (*cuEventDestroy_v2)(CUevent);
+    CUresult (*cuEventRecord)(CUevent, CUstream);
+    CUresult (*cuEventSynchronize)(CUevent);
+    CUresult (*cuEventElapsedTime)(float *, CUevent, CUevent);
     /* Runtime API */
     int (*cudaSetDevice)(int);
     int (*cudaGetDevice)(int *);
@@ -94,7 +114,6 @@ static struct {
     int (*cudaMemcpy)(void *, const void *, size_t, int);
     int (*cudaDeviceSynchronize)(void);
     int (*cudaStreamSynchronize)(void *);
-    /* Real cudaLaunchKernel — loaded by symbol name, called with real dim3 args */
     void *cudaLaunchKernel_ptr; /* raw function pointer, cast at call site */
     /* Fat binary / kernel registration */
     void **(*__cudaRegisterFatBinary)(void *);
@@ -130,9 +149,11 @@ static void init_real_cuda(void) {
     if (!cuda_path) cuda_path = "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
     /* RTLD_DEEPBIND: the loaded library resolves symbols from itself FIRST,
      * preventing our LD_PRELOAD from intercepting the real CUDA's internal calls.
+          g_in_real_cuda = 1;
           * Without this, calling g_real.cudaMalloc causes infinite recursion. */
      g_in_real_cuda = 0;
     g_real_cuda_handle = dlopen(cuda_path, RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
+          g_in_real_cuda = 0;
     if (!g_real_cuda_handle) {
         fprintf(stderr, "[chidori] WARNING: Failed to load real CUDA driver from %s: %s\n",
                 cuda_path, dlerror());
@@ -151,18 +172,38 @@ static void init_real_cuda(void) {
     #define LOAD_CUDART(name) if (g_real_cudart_handle) LOAD_SYM(g_real_cudart_handle, name)
 
     LOAD_CUDA(cuInit);
+    LOAD_CUDA(cuDriverGetVersion);
     LOAD_CUDA(cuDeviceGetCount);
     LOAD_CUDA(cuDeviceGet);
     LOAD_CUDA(cuDeviceGetName);
     LOAD_CUDA(cuDeviceTotalMem_v2);
     LOAD_CUDA(cuDeviceGetAttribute);
+    LOAD_CUDA(cuCtxCreate_v2);
+    LOAD_CUDA(cuCtxDestroy_v2);
+    LOAD_CUDA(cuCtxSetCurrent);
     LOAD_CUDA(cuCtxGetCurrent);
+    LOAD_CUDA(cuCtxSynchronize);
+    LOAD_CUDA(cuDevicePrimaryCtxRetain);
+    LOAD_CUDA(cuDevicePrimaryCtxRelease_v2);
     LOAD_CUDA(cuMemAlloc_v2);
     LOAD_CUDA(cuMemFree_v2);
     LOAD_CUDA(cuMemcpyHtoD_v2);
     LOAD_CUDA(cuMemcpyDtoH_v2);
+    LOAD_CUDA(cuMemcpyDtoD_v2);
+    LOAD_CUDA(cuMemGetInfo_v2);
+    LOAD_CUDA(cuModuleLoadData);
+    LOAD_CUDA(cuModuleUnload);
+    LOAD_CUDA(cuModuleGetFunction);
+    LOAD_CUDA(cuFuncGetAttribute);
     LOAD_CUDA(cuLaunchKernel);
+    LOAD_CUDA(cuStreamCreate);
+    LOAD_CUDA(cuStreamDestroy_v2);
     LOAD_CUDA(cuStreamSynchronize);
+    LOAD_CUDA(cuEventCreate);
+    LOAD_CUDA(cuEventDestroy_v2);
+    LOAD_CUDA(cuEventRecord);
+    LOAD_CUDA(cuEventSynchronize);
+    LOAD_CUDA(cuEventElapsedTime);
     LOAD_CUDART(cudaSetDevice);
     LOAD_CUDART(cudaGetDevice);
     LOAD_CUDART(cudaGetDeviceCount);
@@ -725,6 +766,7 @@ CUresult cuInit(unsigned int flags) {
 static int g_driver_version_cached = 0;
 static int g_driver_version = 0;
 CUresult cuDriverGetVersion(int *version) {
+    if (g_in_real_cuda && g_real.cuDriverGetVersion) return g_real.cuDriverGetVersion(version);
     if (g_driver_version_cached) { *version = g_driver_version; return 0; }
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DRIVER_GET_VERSION, NULL, 0, version, &len);
@@ -733,6 +775,7 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
+    if (g_in_real_cuda && g_real.cuDeviceGetCount) return g_real.cuDeviceGetCount(count);
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
@@ -752,6 +795,7 @@ CUresult cuDeviceGetCount(int *count) {
 static void ensure_real_cuda_init(void);
 
 CUresult cuDeviceGet(CUdevice *device, int ordinal) {
+    if (g_in_real_cuda && g_real.cuDeviceGet) return g_real.cuDeviceGet(device, ordinal);
     if (g_partial_offload && is_local_device(ordinal) && g_real.cuDeviceGet) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGet(device, ordinal);
@@ -762,6 +806,7 @@ CUresult cuDeviceGet(CUdevice *device, int ordinal) {
 }
 
 CUresult cuDeviceGetName(char *name, int len, CUdevice dev) {
+    if (g_in_real_cuda && g_real.cuDeviceGetName) return g_real.cuDeviceGetName(name, len, dev);
     if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceGetName) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGetName(name, len, dev);
@@ -773,6 +818,7 @@ CUresult cuDeviceGetName(char *name, int len, CUdevice dev) {
 }
 
 CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
+    if (g_in_real_cuda && g_real.cuDeviceTotalMem_v2) return g_real.cuDeviceTotalMem_v2(bytes, dev);
     if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceTotalMem_v2) {
         return g_real.cuDeviceTotalMem_v2(bytes, dev);
     }
@@ -795,6 +841,7 @@ static void ensure_real_cuda_init(void) {
 }
 
 CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
+    if (g_in_real_cuda && g_real.cuDeviceGetAttribute) return g_real.cuDeviceGetAttribute(pi, attrib, dev);
     /* For partial offload: route local device queries to real CUDA */
     if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceGetAttribute) {
         ensure_real_cuda_init();
@@ -828,6 +875,7 @@ static CUcontext g_cached_ctx = NULL;
 static int g_cached_ctx_valid = 0;
 
 CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev) {
+    if (g_in_real_cuda && g_real.cuCtxCreate_v2) return g_real.cuCtxCreate_v2(pctx, flags, dev);
     struct { uint32_t flags; int32_t dev; } req = { flags, dev };
     size_t len = sizeof(uint64_t);
     CUresult r = chidori_rpc(CHIDORI_CU_CTX_CREATE, &req, sizeof(req), pctx, &len);
@@ -839,6 +887,7 @@ CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev) {
 }
 
 CUresult cuCtxDestroy_v2(CUcontext ctx) {
+    if (g_in_real_cuda && g_real.cuCtxDestroy_v2) return g_real.cuCtxDestroy_v2(ctx);
     uint64_t handle = (uint64_t)(uintptr_t)ctx;
     return chidori_rpc(CHIDORI_CU_CTX_DESTROY, &handle, sizeof(handle), NULL, NULL);
 }
@@ -872,6 +921,7 @@ CUresult cuCtxSynchronize(void) {
 }
 
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
+    if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
     size_t len = sizeof(uint64_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &dev, sizeof(dev), pctx, &len);
     if (r == CUDA_SUCCESS) {
@@ -882,6 +932,7 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
 }
 
 CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+    if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRelease_v2) return g_real.cuDevicePrimaryCtxRelease_v2(dev);
     return chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RELEASE, &dev, sizeof(dev), NULL, NULL);
 }
 
@@ -940,6 +991,7 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t by
 }
 
 CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
+    if (g_in_real_cuda && g_real.cuMemGetInfo_v2) return g_real.cuMemGetInfo_v2(free, total);
     struct { uint64_t free; uint64_t total; } info;
     size_t len = sizeof(info);
     CUresult r = chidori_rpc(CHIDORI_CU_MEM_GET_INFO, NULL, 0, &info, &len);
@@ -952,6 +1004,7 @@ CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
 
 /* Module */
 CUresult cuModuleLoadData(CUmodule *module, const void *image) {
+    if (g_in_real_cuda && g_real.cuModuleLoadData) return g_real.cuModuleLoadData(module, image);
     /* Determine image size: check for PTX (text) vs CUBIN (binary) */
     size_t image_len;
     const unsigned char *data = (const unsigned char *)image;
@@ -975,11 +1028,13 @@ CUresult cuModuleLoadData(CUmodule *module, const void *image) {
 }
 
 CUresult cuModuleUnload(CUmodule mod) {
+    if (g_in_real_cuda && g_real.cuModuleUnload) return g_real.cuModuleUnload(mod);
     uint64_t handle = (uint64_t)(uintptr_t)mod;
     return chidori_rpc(CHIDORI_CU_MODULE_UNLOAD, &handle, sizeof(handle), NULL, NULL);
 }
 
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name) {
+    if (g_in_real_cuda && g_real.cuModuleGetFunction) return g_real.cuModuleGetFunction(hfunc, hmod, name);
     /* Payload: module_handle(8) + function_name (null-terminated) */
     uint64_t mod_handle = (uint64_t)(uintptr_t)hmod;
     size_t name_len = strlen(name) + 1;
@@ -1008,6 +1063,7 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
 #define CHIDORI_CU_LAUNCH_PARAM_END            ((void *)0x00)
 
 CUresult cuFuncGetAttribute(int *pi, int attrib, CUfunction hfunc) {
+    if (g_in_real_cuda && g_real.cuFuncGetAttribute) return g_real.cuFuncGetAttribute(pi, attrib, hfunc);
     struct __attribute__((packed)) { int32_t attrib; uint64_t func; } req;
     req.attrib = attrib;
     req.func = (uint64_t)(uintptr_t)hfunc;
@@ -1020,6 +1076,7 @@ CUresult cuLaunchKernel(CUfunction f,
                         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                         unsigned int sharedMemBytes, CUstream hStream,
                         void **kernelParams, void **extra) {
+    if (g_in_real_cuda && g_real.cuLaunchKernel) return g_real.cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
     /*
      * Kernel launch serialization — wire format:
      *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
@@ -1195,6 +1252,7 @@ CUresult cuEventSynchronize(CUevent hEvent) {
 }
 
 CUresult cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd) {
+    if (g_in_real_cuda && g_real.cuEventElapsedTime) return g_real.cuEventElapsedTime(pMilliseconds, hStart, hEnd);
     struct { uint64_t start; uint64_t end; } req;
     req.start = (uint64_t)(uintptr_t)hStart;
     req.end = (uint64_t)(uintptr_t)hEnd;
@@ -1269,12 +1327,11 @@ cudaError_t cudaSetDevice(int device) {
         /* Route to local GPU via real CUDA driver */
         ensure_real_cuda_init();
         cudaError_t r = cudaSuccess;
-        g_in_real_cuda = 1;
-        if (g_real.cudaSetDevice)
-        g_in_real_cuda = 0;
+        if (g_real.cudaSetDevice) {
             g_in_real_cuda = 1;
             r = (cudaError_t)g_real.cudaSetDevice(device);
             g_in_real_cuda = 0;
+        }
         if (r == cudaSuccess) {
             g_current_device = device;
             g_routing_local = 1;
@@ -1433,9 +1490,7 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
 }
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    g_in_real_cuda = 1;
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMalloc) {
-    g_in_real_cuda = 0;
         ensure_real_cuda_init();
         g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)g_real.cudaMalloc(devPtr, size);
@@ -1458,7 +1513,9 @@ cudaError_t cudaFree(void *devPtr) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaFree) {
     g_in_real_cuda = 0;
         g_in_real_cuda = 1;
+g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)g_real.cudaFree(devPtr);
+        g_in_real_cuda = 0;
         g_in_real_cuda = 0;
         g_last_error = r;
         return r;
@@ -1475,7 +1532,9 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMemcpy) {
     g_in_real_cuda = 0;
         g_in_real_cuda = 1;
+g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)g_real.cudaMemcpy(dst, src, count, kind);
+        g_in_real_cuda = 0;
         g_in_real_cuda = 0;
         g_last_error = r;
         return r;
@@ -1643,7 +1702,9 @@ cudaError_t cudaDeviceSynchronize(void) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaDeviceSynchronize) {
     g_in_real_cuda = 0;
         g_in_real_cuda = 1;
+g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)g_real.cudaDeviceSynchronize();
+        g_in_real_cuda = 0;
         g_in_real_cuda = 0;
         g_last_error = r;
         return r;
@@ -1675,7 +1736,9 @@ cudaError_t cudaStreamSynchronize(void *stream) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaStreamSynchronize) {
     g_in_real_cuda = 0;
         g_in_real_cuda = 1;
+g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)g_real.cudaStreamSynchronize(stream);
+        g_in_real_cuda = 0;
         g_in_real_cuda = 0;
         g_last_error = r;
         return r;
