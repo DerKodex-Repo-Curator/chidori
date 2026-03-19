@@ -87,3 +87,11 @@ print(f"CPU LOAD:  {load_cpu_dt:.1f}s")
 print(f"GPU LOAD:  {load_gpu_dt:.1f}s ({mem_mb:.0f} MB)")
 print(f"INFERENCE: {gen_dt:.2f}s ({new_tokens} tokens, {tokens_per_sec:.1f} tok/s)")
 print(f"{'='*60}")
+
+import sys
+if new_tokens >= 100 and tokens_per_sec > 0:
+    print("PASS: test_inference")
+    sys.exit(0)
+else:
+    print("FAIL: test_inference")
+    sys.exit(1)

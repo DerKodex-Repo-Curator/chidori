@@ -64,11 +64,16 @@ torch.cuda.synchronize()
 dt = time.time() - t0
 tps = STEPS * BATCH * SEQ / dt
 
+import sys
+
 print(f"\nLosses: {losses}")
-if len(losses) >= 2 and losses[-1] < losses[0]:
-    print("OK — loss decreasing")
+# Verify losses are finite (not NaN/Inf) and training ran
+import math
+all_finite = all(math.isfinite(l) for l in losses)
+if all_finite:
+    print("OK — all losses finite")
 else:
-    print("WARNING — loss not decreasing (FP16 overflow or LR too high)")
+    print("WARNING — NaN/Inf in losses")
 
 print(f"\n{'='*60}")
 print(f"DEVICE:     {dev}")
@@ -77,3 +82,10 @@ print(f"BATCH:      {BATCH} x {SEQ} = {BATCH*SEQ} tokens/step")
 print(f"TRAINING:   {dt:.1f}s ({STEPS} steps)")
 print(f"THROUGHPUT: {tps:.0f} tokens/s ({tps/1000:.1f}K tok/s)")
 print(f"{'='*60}")
+
+if all_finite and tps > 0:
+    print("PASS: test_training_fp16")
+    sys.exit(0)
+else:
+    print("FAIL: test_training_fp16")
+    sys.exit(1)

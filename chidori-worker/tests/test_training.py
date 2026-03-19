@@ -134,3 +134,12 @@ print(f"TRAINING:   {train_dt:.1f}s ({STEPS} steps)")
 print(f"THROUGHPUT: {tps:.0f} tokens/s ({tps/1000:.1f}K tok/s)")
 print(f"TOTAL TOKENS: {total_tokens:,}")
 print(f"{'='*60}")
+
+import sys, math
+all_finite = all(math.isfinite(l) for l in losses)
+if all_finite and tps > 0:
+    print("PASS: test_training")
+    sys.exit(0)
+else:
+    print("FAIL: test_training")
+    sys.exit(1)

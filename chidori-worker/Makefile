@@ -54,5 +54,8 @@ test-e2e: $(BUILD_DIR)/test_e2e_cuda
 	@echo "=== E2E CUDA Tests ==="
 	@./$(BUILD_DIR)/test_e2e_cuda
 
+test-all: all
+	@./tests/run_all.sh
+
 clean:
 	rm -rf $(BUILD_DIR)

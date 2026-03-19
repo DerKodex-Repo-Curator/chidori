@@ -37,5 +37,21 @@ print(f"5. Back on CPU:     {z}")
 # 6. Reductions
 print(f"6. sum={x.sum().item():.1f}  mean={x.mean().item():.1f}")
 
+import sys
+
+# Verify results
+passed = True
+if z[0].item() != 3.0:
+    print(f"FAIL: expected z[0]=3.0, got {z[0].item()}")
+    passed = False
+if abs(x.sum().item() - 15.0) > 0.01:
+    print(f"FAIL: expected sum=15.0, got {x.sum().item()}")
+    passed = False
+
 print()
-print("SUCCESS: PyTorch running on remote A100 over TCP/IP!")
+if passed:
+    print("PASS: test_pytorch")
+    sys.exit(0)
+else:
+    print("FAIL: test_pytorch")
+    sys.exit(1)

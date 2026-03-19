@@ -54,12 +54,17 @@ read_dt = time.time() - t0
 print(f"[READ] Done: {read_dt:.1f}s")
 print(f"[READ] Sum: {result.sum().item():.2f}")
 
+import sys
+
 # Verify data is not garbage
 s = result.sum().item()
+passed = True
 if s == 0.0:
     print("[VERIFY] FAIL: sum is exactly 0 — GPU may not have computed anything")
+    passed = False
 elif abs(s) > 1e15:
     print(f"[VERIFY] FAIL: sum is suspiciously large ({s}) — possible garbage data")
+    passed = False
 else:
     print(f"[VERIFY] OK: sum={s:.2f} looks reasonable for {N}x{N} matmul")
 
@@ -72,3 +77,10 @@ print(f"COMPUTE: {compute_dt:.2f}s ({tflops:.2f} TFLOPS, {ITERS} matmuls)")
 print(f"READ:    {read_dt:.1f}s (network transfer)")
 print(f"TOTAL:   {load_dt + compute_dt + read_dt:.1f}s")
 print(f"{'='*60}")
+
+if passed:
+    print("PASS: test_train")
+    sys.exit(0)
+else:
+    print("FAIL: test_train")
+    sys.exit(1)
