@@ -775,7 +775,10 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
-    write(2, "[cuDeviceGetCount ENTER]\n", 24);
+    {
+        int tmpfd = open("/tmp/chidori_trace.txt", O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (tmpfd >= 0) { write(tmpfd, "cuDeviceGetCount\n", 17); close(tmpfd); }
+    }
     /* For partial offload: NEVER forward to real driver (it only sees local GPUs).
      * Always return our merged count. Only forward when inside real CUDA AND
      * not in partial offload mode. */
