@@ -173,11 +173,15 @@ static void init_real_cuda(void) {
     #undef LOAD_CUDA
     #undef LOAD_CUDART
 
-    /* Initialize real CUDA and count local devices */
-    if (g_real.cuInit) {
-        g_real.cuInit(0);
-        if (g_real.cuDeviceGetCount)
-            g_real.cuDeviceGetCount(&g_local_device_count);
+    /* Count local devices WITHOUT calling cuInit on the real driver.
+     * cuInit will be called lazily when cudaSetDevice(local_device) is first called.
+     * We must NOT call g_real.cuInit here because PyTorch's _cuda_init() hasn't
+     * happened yet, and calling cuInit on the real driver would set PyTorch's
+     * internal device count to just the local GPUs (missing the remote ones). */
+    /* Count local GPUs by checking which bits are set in the mask */
+    for (int i = 0; i < 32; i++) {
+        if (g_local_device_mask & (1u << i))
+            g_local_device_count++;
     }
 
     fprintf(stderr, "[chidori] Partial offload: local_devices=%s (%d local GPUs)\n",
@@ -1200,7 +1204,13 @@ cudaError_t cudaSetDevice(int device) {
         return cudaSuccess;
 
     if (g_partial_offload && is_local_device(device)) {
-        /* Route to local GPU via real CUDA driver */
+        /* Route to local GPU via real CUDA driver.
+         * Lazy-init the real CUDA driver on first local device access. */
+        static int g_real_cuda_inited = 0;
+        if (!g_real_cuda_inited && g_real.cuInit) {
+            g_real.cuInit(0);
+            g_real_cuda_inited = 1;
+        }
         cudaError_t r = cudaSuccess;
         if (g_real.cudaSetDevice)
             r = (cudaError_t)g_real.cudaSetDevice(device);
