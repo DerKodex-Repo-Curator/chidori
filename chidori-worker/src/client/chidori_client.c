@@ -63,8 +63,6 @@ static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
-static int g_remote_device_count = 0;     /* number of remote GPUs (from server) */
-static __thread int g_routing_local = 0;  /* per-thread: 1 = current device is local */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: 1 = inside real CUDA call, forward to real driver */
 
 /* Real CUDA function pointers (populated by init_real_cuda) */
@@ -220,7 +218,6 @@ static void init_real_cuda(void) {
     }
     /* Default device 0: if it's local, set routing accordingly */
     if (g_local_device_mask & 1)
-        g_routing_local = 1;
 
     fprintf(stderr, "[chidori] Partial offload: local_devices=%s (%d local GPUs)\n",
             env, g_local_device_count);
@@ -679,10 +676,6 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
         return CUDA_ERROR_NOT_INITIALIZED;
     }
 
-    if (resp.result != 0 && resp.result != 0 /* always log nonzero */) {
-        fprintf(stderr, "[chidori-rpc] func=0x%04x returned error %d\n", func_id, resp.result);
-    }
-
     /* Read response payload if present */
     size_t resp_payload_len = resp.msg_len - CHIDORI_RESPONSE_HEADER_SIZE;
     if (resp_payload_len > 0 && out_payload != NULL) {
@@ -770,7 +763,6 @@ CUresult cuDeviceGetCount(int *count) {
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
     if (remote_count <= 0) remote_count = 1;
-    g_remote_device_count = remote_count;
     if (g_partial_offload) {
         *count = g_local_device_count + remote_count;
     } else {
@@ -1275,7 +1267,6 @@ static cudaError_t g_last_error = 0;
 static int g_device_count_cache = -1;
 
 cudaError_t cudaGetDeviceCount(int *count) {
-    fprintf(stderr, "[chidori] cudaGetDeviceCount called (cache=%d)\n", g_device_count_cache);
     if (g_device_count_cache >= 0) {
         *count = g_device_count_cache;
         return cudaSuccess;
@@ -1283,11 +1274,10 @@ cudaError_t cudaGetDeviceCount(int *count) {
     /* Get remote device count from server */
     int remote_count = 0;
     size_t len = sizeof(int32_t);
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
+    chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
     /* Accept remote_count even if the result code is non-zero (some servers
      * return error codes but still provide the count) */
     if (remote_count <= 0) remote_count = 1; /* fallback: assume at least 1 remote GPU */
-    g_remote_device_count = remote_count;
     if (g_partial_offload) {
         *count = g_local_device_count + remote_count;
     } else {
@@ -1322,7 +1312,6 @@ cudaError_t cudaSetDevice(int device) {
         }
         if (r == cudaSuccess) {
             g_current_device = device;
-            g_routing_local = 1;
         }
         g_last_error = r;
         return r;
@@ -1333,7 +1322,6 @@ cudaError_t cudaSetDevice(int device) {
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &remote_dev, sizeof(remote_dev), NULL, NULL);
     if (r == cudaSuccess) {
         g_current_device = device;
-        g_routing_local = 0;
     }
     g_last_error = r;
     return r;
