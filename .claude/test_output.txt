@@ -1,19 +1,11 @@
-Updating f5155f4..eeece03
+Updating eeece03..f34aa06
 Fast-forward
- chidori-worker/Makefile                    |   3 +
- chidori-worker/tests/README.md             |  79 +++++++++++++++
- chidori-worker/tests/run_all.sh            | 153 +++++++++++++++++++++++++++++
- chidori-worker/tests/test_inference.py     |   8 ++
- chidori-worker/tests/test_pytorch.py       |  18 +++-
- chidori-worker/tests/test_train.py         |  12 +++
- chidori-worker/tests/test_training.py      |   9 ++
- chidori-worker/tests/test_training_fp16.py |  18 +++-
- 8 files changed, 296 insertions(+), 4 deletions(-)
- create mode 100644 chidori-worker/tests/README.md
- create mode 100755 chidori-worker/tests/run_all.sh
-rm -rf build
+ .claude/test_output.txt               | 52 ++++++++++++++++++++++++++---------
+ chidori-worker/tests/test_training.py | 10 +++----
+ 2 files changed, 44 insertions(+), 18 deletions(-)
 From github.com:fpolica91/chidori
-   f5155f4..eeece03  main       -> origin/main
+   eeece03..f34aa06  main       -> origin/main
+rm -rf build
       |                                                             ~~~~~^~~~~~~~~~
 
 === Chidori Test Suite ===
@@ -24,7 +16,7 @@ Build:   /home/fabricio/chidori/chidori-worker/build
   test_pytorch.py (basic ops)         PASS  (2s)
   test_train.py (matmul 4096)         PASS  (20s)
   test_training_fp16.py (FP16)        PASS  (4s)
-  test_training.py (FP32 train)       FAIL  (20s, exit=1)
+  test_training.py (FP32 train)       FAIL  (4s, exit=1)
     ============================================================
     FAIL: test_training
     [chidori] SOCKET CLOSED at src/client/chidori_client.c:5886

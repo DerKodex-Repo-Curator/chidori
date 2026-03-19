@@ -62,7 +62,7 @@ print(f"\n[MODEL] {LAYERS} transformer layers, hidden={HIDDEN}, vocab={VOCAB}")
 print(f"[MODEL] Batch={BATCH}, seq={SEQ}")
 
 t0 = time.time()
-model = MiniModel().cuda().half()
+model = MiniModel().cuda()  # FP32 — no .half() to avoid NaN
 torch.cuda.synchronize()
 model_dt = time.time() - t0
 
@@ -70,9 +70,8 @@ params = sum(p.numel() for p in model.parameters())
 mem_mb = torch.cuda.memory_allocated() / 1e6
 print(f"[MODEL] {params/1e6:.0f}M params, {mem_mb:.0f} MB VRAM, loaded in {model_dt:.1f}s")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 loss_fn = nn.CrossEntropyLoss()
-scaler = torch.amp.GradScaler('cuda')
 
 # ============================================================
 # TRAINING LOOP
@@ -82,7 +81,7 @@ print(f"\n[TRAIN] Running {STEPS} training steps...")
 # Warmup
 dummy = torch.randint(0, VOCAB, (BATCH, SEQ)).cuda()
 out = model(dummy)
-loss = loss_fn(out.float().view(-1, VOCAB), dummy.view(-1))
+loss = loss_fn(out.view(-1, VOCAB), dummy.view(-1))
 loss.backward()
 optimizer.zero_grad()
 torch.cuda.synchronize()
@@ -95,7 +94,7 @@ for step in range(STEPS):
 
     optimizer.zero_grad()
     logits = model(data)
-    loss = loss_fn(logits.float().view(-1, VOCAB), data.view(-1))
+    loss = loss_fn(logits.view(-1, VOCAB), data.view(-1))
 
     loss.backward()
     optimizer.step()
