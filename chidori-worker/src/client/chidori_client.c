@@ -4083,6 +4083,7 @@ static struct {
     const void *data;       /* raw fat binary data pointer (lives in process memory) */
     uint64_t size;          /* fat binary size */
     uint64_t server_handle; /* 0 = not yet registered on server */
+    void **real_handle;     /* handle from real CUDA runtime (for local execution) */
 } g_fat_binaries[MAX_FAT_BINARIES];
 static int g_fat_binary_count = 0;
 
@@ -4679,6 +4680,14 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
         g_fat_binaries[idx].data = data;
         g_fat_binaries[idx].size = fat_size;
         g_fat_binaries[idx].server_handle = 0;
+        g_fat_binaries[idx].real_handle = NULL;
+
+        /* For partial offload: also register with real CUDA for local execution */
+        init_real_cuda();
+        if (g_partial_offload && g_real.__cudaRegisterFatBinary) {
+            g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
+        }
+
         fat_idx_storage[idx] = idx;
         return (void **)&fat_idx_storage[idx];
     }
@@ -4688,11 +4697,19 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
 }
 
 void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
-    (void)fatCubinHandle;
+    if (g_partial_offload && g_real.__cudaRegisterFatBinaryEnd) {
+        int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
+        if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle)
+            g_real.__cudaRegisterFatBinaryEnd(g_fat_binaries[idx].real_handle);
+    }
 }
 
 void __cudaUnregisterFatBinary(void **fatCubinHandle) {
-    (void)fatCubinHandle;
+    if (g_partial_offload && g_real.__cudaUnregisterFatBinary) {
+        int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
+        if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle)
+            g_real.__cudaUnregisterFatBinary(g_fat_binaries[idx].real_handle);
+    }
 }
 
 void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
@@ -4715,6 +4732,15 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
         g_registered_functions[idx].fat_binary_idx = fat_idx;
         g_registered_functions[idx].deviceName = strdup(name);
         g_registered_functions[idx].server_handle = 0; /* not yet registered */
+    }
+
+    /* For partial offload: also register with real CUDA for local kernel execution */
+    if (g_partial_offload && g_real.__cudaRegisterFunction) {
+        void **real_handle = (fat_idx >= 0 && fat_idx < g_fat_binary_count)
+                             ? g_fat_binaries[fat_idx].real_handle : NULL;
+        if (real_handle)
+            g_real.__cudaRegisterFunction(real_handle, hostFun, deviceFun, deviceName,
+                                          thread_limit, tid, bid, bDim, gDim, wSize);
     }
 }
 
