@@ -1332,13 +1332,13 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * options to enable PTX compilation for cross-architecture support.
          * This allows sm_89 fat binaries (with PTX) to run on sm_120 GPUs. */
         CUmodule mod;
-        CUjit_option opts[] = {
-            CU_JIT_FALLBACK_STRATEGY,
-        };
-        void *opt_vals[] = {
-            (void *)(uintptr_t)CU_PREFER_PTX,
-        };
-        res = cuModuleLoadDataEx(&mod, payload, 1, opts, opt_vals);
+        /* Try cuModuleLoadDataEx first — enables PTX JIT for cross-architecture.
+         * Fall back to cuModuleLoadData if that fails. */
+        res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
+        if (res != CUDA_SUCCESS) {
+            /* Second attempt: plain cuModuleLoadData */
+            res = cuModuleLoadData(&mod, payload);
+        }
         if (res != CUDA_SUCCESS) {
             fprintf(stderr, "[cuda_dispatch] cuModuleLoadDataEx FAILED: size=%u res=%d\n",
                     req->payload_size, (int)res);
