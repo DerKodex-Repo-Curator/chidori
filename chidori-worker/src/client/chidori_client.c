@@ -737,20 +737,37 @@ CUresult cuDeviceGetCount(int *count) {
     return r;
 }
 
+/* Forward declaration — defined after cuDeviceGetAttribute */
+static void ensure_real_cuda_init(void);
+
 CUresult cuDeviceGet(CUdevice *device, int ordinal) {
+    if (g_partial_offload && is_local_device(ordinal) && g_real.cuDeviceGet) {
+        ensure_real_cuda_init();
+        return g_real.cuDeviceGet(device, ordinal);
+    }
+    int remote_ordinal = g_partial_offload ? (ordinal - g_local_device_count) : ordinal;
     size_t len = sizeof(int32_t);
-    return chidori_rpc(CHIDORI_CU_DEVICE_GET, &ordinal, sizeof(ordinal), device, &len);
+    return chidori_rpc(CHIDORI_CU_DEVICE_GET, &remote_ordinal, sizeof(remote_ordinal), device, &len);
 }
 
 CUresult cuDeviceGetName(char *name, int len, CUdevice dev) {
-    struct { int32_t len; int32_t dev; } req = { len, dev };
+    if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceGetName) {
+        ensure_real_cuda_init();
+        return g_real.cuDeviceGetName(name, len, dev);
+    }
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
+    struct __attribute__((packed)) { int32_t len; int32_t dev; } req = { len, remote_dev };
     size_t out_len = (size_t)len;
     return chidori_rpc(CHIDORI_CU_DEVICE_GET_NAME, &req, sizeof(req), name, &out_len);
 }
 
 CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
+    if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceTotalMem_v2) {
+        return g_real.cuDeviceTotalMem_v2(bytes, dev);
+    }
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
     size_t len = sizeof(uint64_t);
-    return chidori_rpc(CHIDORI_CU_DEVICE_TOTAL_MEM, &dev, sizeof(dev), bytes, &len);
+    return chidori_rpc(CHIDORI_CU_DEVICE_TOTAL_MEM, &remote_dev, sizeof(remote_dev), bytes, &len);
 }
 
 /* Device attribute cache — avoids RPC for repeated queries (PyTorch queries 100+ attributes) */
@@ -758,19 +775,35 @@ CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
 static struct { int dev; int attrib; int value; int valid; } g_attr_cache[ATTR_CACHE_SIZE];
 static int g_attr_cache_count = 0;
 
+static int g_real_cuda_inited = 0;
+static void ensure_real_cuda_init(void) {
+    if (!g_real_cuda_inited && g_real.cuInit) {
+        g_real.cuInit(0);
+        g_real_cuda_inited = 1;
+    }
+}
+
 CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
+    /* For partial offload: route local device queries to real CUDA */
+    if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceGetAttribute) {
+        ensure_real_cuda_init();
+        return g_real.cuDeviceGetAttribute(pi, attrib, dev);
+    }
+    /* Remap device for remote */
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
+
     /* Check cache first */
     for (int i = 0; i < g_attr_cache_count; i++) {
-        if (g_attr_cache[i].dev == dev && g_attr_cache[i].attrib == attrib && g_attr_cache[i].valid) {
+        if (g_attr_cache[i].dev == remote_dev && g_attr_cache[i].attrib == attrib && g_attr_cache[i].valid) {
             *pi = g_attr_cache[i].value;
             return CUDA_SUCCESS;
         }
     }
-    struct { int32_t attrib; int32_t dev; } req = { attrib, dev };
+    struct __attribute__((packed)) { int32_t attrib; int32_t dev; } req = { attrib, remote_dev };
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
     if (r == CUDA_SUCCESS && g_attr_cache_count < ATTR_CACHE_SIZE) {
-        g_attr_cache[g_attr_cache_count].dev = dev;
+        g_attr_cache[g_attr_cache_count].dev = remote_dev;
         g_attr_cache[g_attr_cache_count].attrib = attrib;
         g_attr_cache[g_attr_cache_count].value = *pi;
         g_attr_cache[g_attr_cache_count].valid = 1;
@@ -1204,13 +1237,8 @@ cudaError_t cudaSetDevice(int device) {
         return cudaSuccess;
 
     if (g_partial_offload && is_local_device(device)) {
-        /* Route to local GPU via real CUDA driver.
-         * Lazy-init the real CUDA driver on first local device access. */
-        static int g_real_cuda_inited = 0;
-        if (!g_real_cuda_inited && g_real.cuInit) {
-            g_real.cuInit(0);
-            g_real_cuda_inited = 1;
-        }
+        /* Route to local GPU via real CUDA driver */
+        ensure_real_cuda_init();
         cudaError_t r = cudaSuccess;
         if (g_real.cudaSetDevice)
             r = (cudaError_t)g_real.cudaSetDevice(device);
