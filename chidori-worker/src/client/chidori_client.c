@@ -32,6 +32,53 @@
 
 #include "chidori_protocol.h"
 
+/*
+ * ============================================================================
+ * Centralized logging — controlled by environment variables:
+ *   CHIDORI_DEBUG=1    — Connection events, device routing, errors
+ *   CHIDORI_TRACE=1    — Every sync/async RPC with func_id and timing
+ *   CHIDORI_VERBOSE=1  — Per-RPC payload/result details
+ * DEBUG=1 implies VERBOSE=1. All output goes to stderr.
+ * ============================================================================
+ */
+static int g_debug = -1;
+static int g_log_trace = -1;
+static int g_log_verbose = -1;
+
+static void check_log_levels(void) {
+    if (g_debug == -1) {
+        const char *d = getenv("CHIDORI_DEBUG");
+        g_debug = (d && d[0] == '1') ? 1 : 0;
+    }
+    if (g_log_trace == -1) {
+        const char *v = getenv("CHIDORI_TRACE");
+        g_log_trace = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (g_log_verbose == -1) {
+        const char *v = getenv("CHIDORI_VERBOSE");
+        g_log_verbose = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (g_debug && !g_log_verbose) g_log_verbose = 1;
+}
+
+#define LOG_DEBUG(fmt, ...) do { \
+    if (__builtin_expect(g_debug > 0, 0)) \
+        fprintf(stderr, "[chidori] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_TRACE(fmt, ...) do { \
+    if (__builtin_expect(g_log_trace > 0, 0)) { \
+        struct timeval _tv; gettimeofday(&_tv, NULL); \
+        fprintf(stderr, "[TRACE %ld.%03ld] " fmt "\n", \
+                (long)_tv.tv_sec % 1000, (long)_tv.tv_usec / 1000, ##__VA_ARGS__); \
+    } \
+} while(0)
+
+#define LOG_VERBOSE(fmt, ...) do { \
+    if (__builtin_expect(g_log_verbose > 0, 0)) \
+        fprintf(stderr, "[chidori-rpc] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
 /* CUDA types (minimal definitions to avoid requiring cuda.h on client) */
 typedef int CUresult;
 typedef int CUdevice;
@@ -219,8 +266,7 @@ static void init_real_cuda(void) {
     /* Default device 0: if it's local, set routing accordingly */
     if (g_local_device_mask & 1)
 
-    fprintf(stderr, "[chidori] Partial offload: local_devices=%s (%d local GPUs)\n",
-            env, g_local_device_count);
+    LOG_DEBUG("Partial offload: local_devices=%s (%d local GPUs)", env, g_local_device_count);
 }
 
 static inline int is_local_device(int device) {
@@ -324,7 +370,7 @@ static int tcp_connect(const char *host, int port) {
             fd = higher;
         }
     }
-    fprintf(stderr, "[chidori] Socket fd=%d\n", fd);
+    LOG_DEBUG("Socket fd=%d", fd);
 
     /* TCP keepalive to detect dead connections */
     int keepalive = 1;
@@ -382,7 +428,7 @@ static int chidori_connect(void) {
 
     if (direct && direct[0] == '1') {
         /* Direct TCP connection to gpu-worker standalone mode */
-        fprintf(stderr, "[chidori] Direct connect to gpu-worker at %s:%d\n", host, port);
+        LOG_DEBUG("Direct connect to gpu-worker at %s:%d", host, port);
 
         g_server_fd = tcp_connect(host, port);
         if (g_server_fd < 0) {
@@ -391,11 +437,10 @@ static int chidori_connect(void) {
             return -1;
         }
 
-        fprintf(stderr, "[chidori] Connected directly to GPU worker\n");
+        LOG_DEBUG("Connected directly to GPU worker");
     } else {
         /* Agent-mediated connection via HTTP session protocol */
-        fprintf(stderr, "[chidori] Connecting to agent at %s:%d (session %s)\n",
-                host, port, session_id);
+        LOG_DEBUG("Connecting to agent at %s:%d (session %s)", host, port, session_id);
 
         g_server_fd = tcp_connect(host, port);
         if (g_server_fd < 0) {
@@ -492,7 +537,7 @@ static int chidori_connect(void) {
             }
         }
 
-        fprintf(stderr, "[chidori] Connected to remote GPU (session %s)\n", session_id);
+        LOG_DEBUG("Connected to remote GPU (session %s)", session_id);
     }
 
     free(session_id);
@@ -504,17 +549,29 @@ static int chidori_connect(void) {
  * Send an RPC and receive the response.
  * Thread-safe via mutex (simple approach; could use per-thread connections later).
  */
-static int g_verbose = -1; /* -1 = unchecked */
-static int g_trace = -1;   /* -1 = unchecked, CHIDORI_TRACE=1 logs every RPC */
-static int g_pending_responses = 0; /* count of async responses not yet read */
-static uint64_t g_async_count = 0;  /* total async RPCs sent */
-static uint64_t g_sync_count = 0;   /* total sync RPCs sent */
+/*
+ * ============================================================================
+ * Centralized logging — CHIDORI_DEBUG=1 enables all debug output.
+ *
+ * Log levels:
+ *   CHIDORI_DEBUG=1    — Connection events, device routing, errors, fat binary loads
+ *   CHIDORI_TRACE=1    — Every sync/async RPC with func_id and timing
+ *   CHIDORI_VERBOSE=1  — Per-RPC details (payload size, pending count, result)
+ *
+ * All output goes to stderr. Use LOG_DEBUG/LOG_TRACE/LOG_VERBOSE macros.
+ * ============================================================================
+ */
+/* Aliases for existing code that references g_verbose/g_trace directly */
+static int g_verbose = -1;
+static int g_trace = -1;
+static int g_pending_responses = 0;
+static uint64_t g_async_count = 0;
+static uint64_t g_sync_count = 0;
 
 static void check_trace(void) {
-    if (g_trace == -1) {
-        const char *v = getenv("CHIDORI_TRACE");
-        g_trace = (v && v[0] == '1') ? 1 : 0;
-    }
+    check_log_levels();
+    g_verbose = g_log_verbose;
+    g_trace = g_log_trace;
 }
 
 /*
@@ -555,10 +612,7 @@ static void chidori_flush_responses(void) {
 static int g_cork_active = 0; /* TCP_CORK batching state */
 
 static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t payload_len) {
-    if (g_verbose == -1) {
-        const char *v = getenv("CHIDORI_VERBOSE");
-        g_verbose = (v && v[0] == '1') ? 1 : 0;
-    }
+    check_log_levels();
     check_trace();
     if (g_trace) {
         struct timeval tv;
@@ -611,10 +665,7 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
  */
 static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payload_len,
                           void *out_payload, size_t *out_payload_len) {
-    if (g_verbose == -1) {
-        const char *v = getenv("CHIDORI_VERBOSE");
-        g_verbose = (v && v[0] == '1') ? 1 : 0;
-    }
+    check_log_levels();
     check_trace();
     if (g_trace) {
         struct timeval tv;
@@ -624,9 +675,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
                 func_id, payload_len, (unsigned long)g_async_count, (unsigned long)g_sync_count);
     }
     g_sync_count++;
-    if (g_verbose)
-        fprintf(stderr, "[chidori-rpc] func=0x%04x payload=%zu pending=%d\n",
-                func_id, payload_len, g_pending_responses);
+    LOG_VERBOSE("func=0x%04x payload=%zu pending=%d", func_id, payload_len, g_pending_responses);
 
     pthread_mutex_lock(&g_lock);
 
@@ -717,8 +766,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
     }
 
     pthread_mutex_unlock(&g_lock);
-    if (g_verbose)
-        fprintf(stderr, "[chidori-rpc] func=0x%04x result=%d resp_payload=%zu\n",
+    LOG_VERBOSE("func=0x%04x result=%d resp_payload=%zu",
                 func_id, resp.result, resp_payload_len);
     return (CUresult)resp.result;
 }
@@ -1303,6 +1351,7 @@ cudaError_t cudaSetDevice(int device) {
 
     if (g_partial_offload && is_local_device(device)) {
         /* Route to local GPU via real CUDA driver */
+        LOG_DEBUG("cudaSetDevice(%d) → LOCAL", device);
         ensure_real_cuda_init();
         cudaError_t r = cudaSuccess;
         if (g_real.cudaSetDevice) {
@@ -1436,6 +1485,7 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
     /* For partial offload: route local device queries to real CUDA */
     init_real_cuda(); /* ensure g_partial_offload is set */
     if (g_partial_offload && is_local_device(device) && g_real.cuDeviceGetAttribute) {
+        LOG_DEBUG("cudaDeviceGetAttribute(attr=%d, dev=%d) → LOCAL", attr, device);
         ensure_real_cuda_init();
         g_in_real_cuda = 1;
         int r = (int)g_real.cuDeviceGetAttribute(value, attr, device);
@@ -1471,6 +1521,7 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMalloc) {
+        LOG_DEBUG("cudaMalloc(%zu) → LOCAL (dev %d)", size, g_current_device);
         ensure_real_cuda_init();
         g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)g_real.cudaMalloc(devPtr, size);
@@ -1805,14 +1856,14 @@ cudaError_t cudaDeviceReset(void) {
 cudaError_t cudaGetLastError(void) {
     cudaError_t r = g_last_error;
     if (r != 0)
-        fprintf(stderr, "[chidori] cudaGetLastError() returning %d\n", r);
+        LOG_DEBUG("cudaGetLastError() returning %d", r);
     g_last_error = cudaSuccess;
     return r;
 }
 
 cudaError_t cudaPeekAtLastError(void) {
     if (g_last_error != 0)
-        fprintf(stderr, "[chidori] cudaPeekAtLastError() returning %d\n", g_last_error);
+        LOG_DEBUG("cudaPeekAtLastError() returning %d", g_last_error);
     return g_last_error;
 }
 
@@ -4312,12 +4363,12 @@ static uint64_t lazy_register_function(int idx) {
             memcpy(&g_registered_functions[idx].params[i].size, resp_buf + 16 + i * 8 + 4, 4);
         }
         if (g_verbose) {
-            fprintf(stderr, "[chidori] Registered '%s' handle=0x%llx params=%d total=%d\n",
+            LOG_DEBUG("Registered '%s' handle=0x%llx params=%d total=%d",
                     g_registered_functions[idx].deviceName,
                     (unsigned long long)func_h, np,
                     g_registered_functions[idx].total_param_size);
             for (int i = 0; i < np; i++)
-                fprintf(stderr, "[chidori]   param[%d] offset=%d size=%d\n",
+                LOG_DEBUG("  param[%d] offset=%d size=%d",
                         i, g_registered_functions[idx].params[i].offset,
                         g_registered_functions[idx].params[i].size);
         }
@@ -4329,6 +4380,7 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem, cudaStream_t stream) {
     /* Route to local GPU if current device is local */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaLaunchKernel_ptr) {
+        LOG_DEBUG("cudaLaunchKernel → LOCAL (dev %d)", g_current_device);
         typedef int (*real_cudaLaunchKernel_t)(const void *, dim3, dim3, void **, size_t, void *);
         real_cudaLaunchKernel_t real_fn = (real_cudaLaunchKernel_t)g_real.cudaLaunchKernel_ptr;
         g_in_real_cuda = 1;
@@ -4834,6 +4886,7 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
         /* For partial offload: also register with real CUDA for local execution */
         init_real_cuda();
         if (g_partial_offload && g_real.__cudaRegisterFatBinary) {
+            LOG_DEBUG("__cudaRegisterFatBinary[%d] → LOCAL + REMOTE (size=%llu)", idx, (unsigned long long)fat_size);
             g_in_real_cuda = 1;
             g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
             g_in_real_cuda = 0;
@@ -5570,7 +5623,7 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     lt_matrix_layout_t *layD = (lt_matrix_layout_t *)Ddesc;
 
     if (!layA || !layB || !layD) {
-        fprintf(stderr, "[chidori] cublasLtMatmul: NULL layout descriptor\n");
+        LOG_DEBUG("cublasLtMatmul: NULL layout descriptor");
         return CUBLAS_STATUS_INVALID_VALUE;
     }
 
