@@ -140,7 +140,26 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
 7. NEVER fix one test and re-run — always fix all visible failures
    before the next run.
 
-8. If the same failure repeats 3 times unchanged, STOP and report 
+8. If the same failure repeats 3 times unchanged, STOP and report
    the full contents of `.claude/test_output.txt` to me — do not loop forever.
+
+9. You will always test from client (Lenovo) to whichever GPU server you are given access to. Testing on loopback is no longer considered a valid test.
+
+<rule name="no-lazy-approaches">
+NEVER take a lazy or shortcut approach that creates technical debt. If a problem is hard, solve it properly. Specifically:
+
+- Do NOT work around a problem by avoiding it (e.g., "just use a different loss function" instead of fixing the real bug).
+- Do NOT create parallel architectures to dodge a technical blocker (e.g., multi-server pretending to be multi-device instead of solving the LD_PRELOAD recursion).
+- Do NOT mark tasks as complete when the underlying issue is unresolved.
+- Do NOT claim something works based on a different test configuration than what the user asked for.
+
+A solid plan that takes longer is ALWAYS better than a quick hack that creates cleanup work later. If you're unsure whether an approach is correct, STOP and present the tradeoffs to the user before implementing. The user would rather wait for the right solution than debug your shortcuts.
+
+When facing a hard technical problem:
+1. State the exact technical blocker clearly
+2. Propose the correct fix, even if it's complex
+3. Get user approval before implementing
+4. Implement it properly or not at all
+</rule>
 
 9. <rule> you will always test from client server local to whichever gpu server you are given access to, testing on loopback is no longer considered a valid test. <rule>
