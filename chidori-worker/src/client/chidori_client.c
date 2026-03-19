@@ -145,31 +145,17 @@ static void init_real_cuda(void) {
     }
 
     /* Load real CUDA driver */
-    const char *cuda_path = getenv("CHIDORI_REAL_CUDA_PATH");
-    if (!cuda_path) cuda_path = "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
-    /* RTLD_DEEPBIND: the loaded library resolves symbols from itself FIRST,
-     * preventing our LD_PRELOAD from intercepting the real CUDA's internal calls.
-          g_in_real_cuda = 1;
-          * Without this, calling g_real.cudaMalloc causes infinite recursion. */
-     g_in_real_cuda = 0;
-    g_real_cuda_handle = dlopen(cuda_path, RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
-          g_in_real_cuda = 0;
-    if (!g_real_cuda_handle) {
-        fprintf(stderr, "[chidori] WARNING: Failed to load real CUDA driver from %s: %s\n",
-                cuda_path, dlerror());
-        fprintf(stderr, "[chidori] Set CHIDORI_REAL_CUDA_PATH to the real libcuda.so.1 path\n");
-        g_partial_offload = 0;
-        return;
-    }
+    /* Use RTLD_NEXT to find real CUDA functions behind our LD_PRELOAD.
+     * Do NOT dlopen the real libcuda.so — that would replace our PLT entries
+     * in PyTorch's libtorch_cuda.so, making our interception invisible.
+     * RTLD_NEXT returns the next occurrence of a symbol after our library. */
+    g_real_cuda_handle = RTLD_NEXT;
+    g_real_cudart_handle = RTLD_NEXT;
 
-    /* Load real CUDA runtime */
-    const char *cudart_path = getenv("CHIDORI_REAL_CUDART_PATH");
-    g_real_cudart_handle = dlopen(cudart_path ?: "libcudart.so.12", RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
-
-    /* Populate dispatch table */
+    /* Populate dispatch table using RTLD_NEXT */
     #define LOAD_SYM(handle, name) g_real.name = dlsym(handle, #name)
-    #define LOAD_CUDA(name) LOAD_SYM(g_real_cuda_handle, name)
-    #define LOAD_CUDART(name) if (g_real_cudart_handle) LOAD_SYM(g_real_cudart_handle, name)
+    #define LOAD_CUDA(name) LOAD_SYM(RTLD_NEXT, name)
+    #define LOAD_CUDART(name) LOAD_SYM(RTLD_NEXT, name)
 
     LOAD_CUDA(cuInit);
     LOAD_CUDA(cuDriverGetVersion);
