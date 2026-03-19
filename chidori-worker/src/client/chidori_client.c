@@ -1458,8 +1458,12 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
 
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
     /* For partial offload: route local device queries to real CUDA */
+    init_real_cuda(); /* ensure g_partial_offload is set */
     if (g_partial_offload && is_local_device(device) && g_real.cuDeviceGetAttribute) {
+        ensure_real_cuda_init();
+        g_in_real_cuda = 1;
         int r = (int)g_real.cuDeviceGetAttribute(value, attr, device);
+        g_in_real_cuda = 0;
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
