@@ -718,8 +718,17 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
+    int remote_count = 0;
     size_t len = sizeof(int32_t);
-    return chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, count, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
+    if (remote_count <= 0) remote_count = 1;
+    g_remote_device_count = remote_count;
+    if (g_partial_offload) {
+        *count = g_local_device_count + remote_count;
+    } else {
+        *count = remote_count;
+    }
+    return r;
 }
 
 CUresult cuDeviceGet(CUdevice *device, int ordinal) {
