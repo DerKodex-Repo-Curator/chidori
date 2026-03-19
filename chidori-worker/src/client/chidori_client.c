@@ -90,9 +90,8 @@ static struct {
     int (*cudaMemcpy)(void *, const void *, size_t, int);
     int (*cudaDeviceSynchronize)(void);
     int (*cudaStreamSynchronize)(void *);
-    int (*cudaLaunchKernel)(const void *, unsigned int, unsigned int, unsigned int,
-                            unsigned int, unsigned int, unsigned int,
-                            void **, size_t, void *);
+    /* Real cudaLaunchKernel — loaded by symbol name, called with real dim3 args */
+    void *cudaLaunchKernel_ptr; /* raw function pointer, cast at call site */
     /* Fat binary / kernel registration */
     void **(*__cudaRegisterFatBinary)(void *);
     void (*__cudaRegisterFatBinaryEnd)(void **);
@@ -164,7 +163,7 @@ static void init_real_cuda(void) {
     LOAD_CUDART(cudaMemcpy);
     LOAD_CUDART(cudaDeviceSynchronize);
     LOAD_CUDART(cudaStreamSynchronize);
-    LOAD_CUDART(cudaLaunchKernel);
+    if (g_real_cudart_handle) g_real.cudaLaunchKernel_ptr = dlsym(g_real_cudart_handle, "cudaLaunchKernel");
     LOAD_CUDART(__cudaRegisterFatBinary);
     LOAD_CUDART(__cudaRegisterFatBinaryEnd);
     LOAD_CUDART(__cudaUnregisterFatBinary);
@@ -1157,10 +1156,20 @@ cudaError_t cudaGetDeviceCount(int *count) {
         *count = g_device_count_cache;
         return cudaSuccess;
     }
+    /* Get remote device count from server */
+    int remote_count = 0;
     size_t len = sizeof(int32_t);
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, count, &len);
-    if (r == cudaSuccess)
+    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
+    if (r == cudaSuccess) {
+        g_remote_device_count = remote_count;
+        if (g_partial_offload) {
+            /* Merge: local devices + remote devices */
+            *count = g_local_device_count + remote_count;
+        } else {
+            *count = remote_count;
+        }
         g_device_count_cache = *count;
+    }
     g_last_error = r;
     return r;
 }
@@ -1177,10 +1186,27 @@ cudaError_t cudaSetDevice(int device) {
     /* Short-circuit: skip RPC if already on this device (hot path) */
     if (device == g_current_device)
         return cudaSuccess;
-    int32_t dev = device;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &dev, sizeof(dev), NULL, NULL);
-    if (r == cudaSuccess)
+
+    if (g_partial_offload && is_local_device(device)) {
+        /* Route to local GPU via real CUDA driver */
+        cudaError_t r = cudaSuccess;
+        if (g_real.cudaSetDevice)
+            r = (cudaError_t)g_real.cudaSetDevice(device);
+        if (r == cudaSuccess) {
+            g_current_device = device;
+            g_routing_local = 1;
+        }
+        g_last_error = r;
+        return r;
+    }
+
+    /* Route to remote GPU via Chidori RPC */
+    int32_t remote_dev = g_partial_offload ? (device - g_local_device_count) : device;
+    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &remote_dev, sizeof(remote_dev), NULL, NULL);
+    if (r == cudaSuccess) {
         g_current_device = device;
+        g_routing_local = 0;
+    }
     g_last_error = r;
     return r;
 }
@@ -1324,6 +1350,11 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
 }
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
+    if (g_routing_local && g_real.cudaMalloc) {
+        cudaError_t r = (cudaError_t)g_real.cudaMalloc(devPtr, size);
+        g_last_error = r;
+        return r;
+    }
     uint64_t size64 = (uint64_t)size;
     uint64_t ptr64 = 0;
     size_t len = sizeof(uint64_t);
@@ -1335,6 +1366,11 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 cudaError_t cudaFree(void *devPtr) {
+    if (g_routing_local && g_real.cudaFree) {
+        cudaError_t r = (cudaError_t)g_real.cudaFree(devPtr);
+        g_last_error = r;
+        return r;
+    }
     uint64_t ptr = (uint64_t)(uintptr_t)devPtr;
     cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_FREE, &ptr, sizeof(ptr));
     g_last_error = r;
@@ -1342,6 +1378,12 @@ cudaError_t cudaFree(void *devPtr) {
 }
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
+    /* Route to local GPU if current device is local */
+    if (g_routing_local && g_real.cudaMemcpy) {
+        cudaError_t r = (cudaError_t)g_real.cudaMemcpy(dst, src, count, kind);
+        g_last_error = r;
+        return r;
+    }
     cudaError_t r;
 
     switch (kind) {
@@ -1501,6 +1543,11 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 
 cudaError_t cudaDeviceSynchronize(void) {
+    if (g_routing_local && g_real.cudaDeviceSynchronize) {
+        cudaError_t r = (cudaError_t)g_real.cudaDeviceSynchronize();
+        g_last_error = r;
+        return r;
+    }
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_SYNCHRONIZE, NULL, 0, NULL, NULL);
     g_last_error = r;
     return r;
@@ -1524,6 +1571,11 @@ cudaError_t cudaStreamDestroy(void *stream) {
 }
 
 cudaError_t cudaStreamSynchronize(void *stream) {
+    if (g_routing_local && g_real.cudaStreamSynchronize) {
+        cudaError_t r = (cudaError_t)g_real.cudaStreamSynchronize(stream);
+        g_last_error = r;
+        return r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)stream;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
     g_last_error = r;
@@ -4127,6 +4179,15 @@ static uint64_t lazy_register_function(int idx) {
 
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem, cudaStream_t stream) {
+    /* Route to local GPU if current device is local */
+    if (g_routing_local && g_real.cudaLaunchKernel_ptr) {
+        typedef int (*real_cudaLaunchKernel_t)(const void *, dim3, dim3, void **, size_t, void *);
+        real_cudaLaunchKernel_t real_fn = (real_cudaLaunchKernel_t)g_real.cudaLaunchKernel_ptr;
+        cudaError_t r = (cudaError_t)real_fn(func, gridDim, blockDim, args, sharedMem, stream);
+        g_last_error = r;
+        return r;
+    }
+
     /* Look up function (lazy register on first use) */
     uint64_t func_handle = 0;
     int func_idx = -1;

@@ -2,8 +2,6 @@
 [chidori] Direct connect to gpu-worker at 127.0.0.1:43211
 [chidori] Socket fd=500
 [chidori] Connected directly to GPU worker
-[chidori-rpc] func=0x0106 returned error 700
-[chidori] cudaGetLastError() returning 700
 Device: NVIDIA GeForce RTX 4090 Laptop GPU
 ============================================================
 
@@ -12,49 +10,120 @@ Device: NVIDIA GeForce RTX 4090 Laptop GPU
 
 [COMPUTE] 2000x mm(4096x4096) — ALL data already on GPU
 [COMPUTE] Watch nvidia-smi NOW...
-Traceback (most recent call last):
-  File "/home/fabricio/chidori/chidori-worker/tests/test_train.py", line 39, in <module>
-    torch.cuda.synchronize()
-    ~~~~~~~~~~~~~~~~~~~~~~^^
-  File "/home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/cuda/__init__.py", line 1108, in synchronize
-    return torch._C._cuda_synchronize()
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
-torch.AcceleratorError: CUDA error: illegal address
-Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
-CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
-For debugging consider passing CUDA_LAUNCH_BLOCKING=1
-Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+[COMPUTE] Done: 18.29s — 15.03 TFLOPS
+[COMPUTE] 109 matmuls/s
 
+[READ] Downloading result...
+[READ] Done: 0.0s
+[READ] Sum: -239949.08
+[VERIFY] OK: sum=-239949.08 looks reasonable for 4096x4096 matmul
+
+============================================================
+LOAD:    0.3s (network transfer)
+COMPUTE: 18.29s (15.03 TFLOPS, 2000 matmuls)
+READ:    0.0s (network transfer)
+TOTAL:   18.6s
+============================================================
 [chidori] SOCKET CLOSED at src/client/chidori_client.c:5739
 EXIT: 0
 === test_training_fp16.py ===
 [chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] connect: Connection refused
-[chidori] cudaGetLastError() returning 3
-Traceback (most recent call last):
-  File "/home/fabricio/chidori/chidori-worker/tests/test_training_fp16.py", line 5, in <module>
-    torch._C._cuda_init()
-    ~~~~~~~~~~~~~~~~~~~^^
-RuntimeError: CUDA driver initialization failed, you might not have a CUDA gpu.
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+Model: 23M params, 46 MB on NVIDIA GeForce RTX 4090 Laptop GPU
+Warmup done
+  step   0  loss=9.3879  tokens/s=136500  elapsed=0.0s
+  step  10  loss=9.4036  tokens/s=187666  elapsed=0.1s
+  step  20  loss=9.3946  tokens/s=196071  elapsed=0.2s
+  step  30  loss=9.4120  tokens/s=201992  elapsed=0.3s
+  step  40  loss=9.4096  tokens/s=202261  elapsed=0.4s
+
+Losses: [9.387901306152344, 9.403639793395996, 9.394628524780273, 9.412023544311523, 9.409626007080078]
+WARNING — loss not decreasing (FP16 overflow or LR too high)
+
+============================================================
+DEVICE:     NVIDIA GeForce RTX 4090 Laptop GPU
+MODEL:      23M params (6L, h=512)
+BATCH:      32 x 64 = 2048 tokens/step
+TRAINING:   0.5s (50 steps)
+THROUGHPUT: 204510 tokens/s (204.5K tok/s)
+============================================================
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5739
 EXIT: 0
 === test_training.py ===
 [chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] connect: Connection refused
-[chidori] cudaGetLastError() returning 3
-Traceback (most recent call last):
-  File "/home/fabricio/chidori/chidori-worker/tests/test_training.py", line 7, in <module>
-    torch._C._cuda_init()
-    ~~~~~~~~~~~~~~~~~~~^^
-RuntimeError: CUDA driver initialization failed, you might not have a CUDA gpu.
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+Device: NVIDIA GeForce RTX 4090 Laptop GPU (16.7 GB)
+============================================================
+
+[MODEL] 12 transformer layers, hidden=2048, vocab=32000
+[MODEL] Batch=32, seq=128
+[MODEL] 534M params, 1069 MB VRAM, loaded in 4.3s
+
+[TRAIN] Running 50 training steps...
+[TRAIN] Warmup done
+  step   0  loss=10.5397  tokens/s=13526  elapsed=0.3s
+  step  10  loss=nan  tokens/s=15737  elapsed=2.9s
+  step  20  loss=nan  tokens/s=15826  elapsed=5.4s
+  step  30  loss=nan  tokens/s=15849  elapsed=8.0s
+  step  40  loss=nan  tokens/s=15864  elapsed=10.6s
+
+[VERIFY] Losses: 10.5397 -> nan -> nan -> nan -> nan
+[VERIFY] WARNING — loss did not decrease (may need more steps)
+
+============================================================
+DEVICE:     NVIDIA GeForce RTX 4090 Laptop GPU
+MODEL:      534M params (12L, h=2048)
+BATCH:      32 x 128 = 4096 tokens/step
+MODEL LOAD: 4.3s
+TRAINING:   12.9s (50 steps)
+THROUGHPUT: 15872 tokens/s (15.9K tok/s)
+TOTAL TOKENS: 204,800
+============================================================
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5739
 EXIT: 0
 === test_inference.py ===
 [chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] connect: Connection refused
-[chidori] cudaGetLastError() returning 3
-Traceback (most recent call last):
-  File "/home/fabricio/chidori/chidori-worker/tests/test_inference.py", line 6, in <module>
-    torch._C._cuda_init()
-    ~~~~~~~~~~~~~~~~~~~^^
-RuntimeError: CUDA driver initialization failed, you might not have a CUDA gpu.
+[chidori] Socket fd=500
+[chidori] Connected directly to GPU worker
+Device: NVIDIA GeForce RTX 4090 Laptop GPU
+VRAM: 16.7 GB
+============================================================
+
+[LOAD] Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
+Loading weights:   0%|          | 0/201 [00:00<?, ?it/s]Loading weights:  60%|██████    | 121/201 [00:00<00:00, 1199.89it/s]Loading weights: 100%|██████████| 201/201 [00:00<00:00, 1313.01it/s]
+Both `max_new_tokens` (=200) and `max_length`(=2048) seem to have been set. `max_new_tokens` will take precedence. Please refer to the documentation for more information. (https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)
+[LOAD] CPU load: 1.0s
+[LOAD] Moving to GPU...
+[LOAD] GPU transfer: 1.2s
+[LOAD] GPU memory used: 2202 MB
+
+[INFERENCE] Prompt: Explain how GPU-over-IP works in simple terms:
+
+[EMBED] Testing embedding forward pass...
+[EMBED] mean=-0.000060 std=0.010998
+[EMBED] OK — embedding produces non-trivial output
+
+[INFERENCE] Generating 200 tokens...
+[DEBUG] Output shape: torch.Size([1, 176]), dtype: torch.int64
+[DEBUG] First 20 tokens: [1, 12027, 7420, 920, 22796, 29899, 957, 29899, 5690, 1736, 297, 2560, 4958, 29901, 13, 13, 29954, 7056, 29899, 957]
+[DEBUG] Last 20 tokens: [263, 10808, 29892, 1316, 408, 15061, 29871, 29941, 29928, 18533, 470, 2734, 2919, 29899, 7052, 4933, 6509, 14009, 29889, 2]
+[DEBUG] Min: 1, Max: 29954
+[INFERENCE] Done: 5.38s — 162 tokens — 30.1 tok/s
+
+--- Output ---
+Explain how GPU-over-IP works in simple terms:
+
+GPU-over-IP is a technology that allows the use of GPUs on a network, by using a network interface card (NIC) to connect the GPU to the network. The NIC is a device that connects the computer to the network, and it can be used to connect the GPU to the network. When a computer with a GPU is connected to a network, the GPU is connected to the NIC, and the NIC is connected to the network. The NIC then routes the data between the GPU and the network, 
+--- End ---
+
+============================================================
+MODEL:     TinyLlama/TinyLlama-1.1B-Chat-v1.0
+CPU LOAD:  1.0s
+GPU LOAD:  1.2s (2202 MB)
+INFERENCE: 5.38s (162 tokens, 30.1 tok/s)
+============================================================
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:5739
 EXIT: 0
 === DONE ===
