@@ -1,97 +1,13 @@
 === test_train.py ===
-[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] Socket fd=500
-[chidori] Connected directly to GPU worker
-Device: NVIDIA GeForce RTX 4090 Laptop GPU
-============================================================
-
-[LOAD] Uploading 4096x4096 matrices to GPU...
-[LOAD] Done: 0.3s (201 MB transferred)
-
-[COMPUTE] 2000x mm(4096x4096) — ALL data already on GPU
-[COMPUTE] Watch nvidia-smi NOW...
-[COMPUTE] Done: 17.94s — 15.32 TFLOPS
-[COMPUTE] 111 matmuls/s
-
-[READ] Downloading result...
-[READ] Done: 0.0s
-[READ] Sum: 107234.61
-[VERIFY] OK: sum=107234.61 looks reasonable for 4096x4096 matmul
-
-============================================================
-LOAD:    0.3s (network transfer)
-COMPUTE: 17.94s (15.32 TFLOPS, 2000 matmuls)
-READ:    0.0s (network transfer)
-TOTAL:   18.3s
-============================================================
-[chidori] SOCKET CLOSED at src/client/chidori_client.c:5800
+[COMPUTE] Done: 17.98s — 15.29 TFLOPS
+[VERIFY] OK: sum=-25712.44 looks reasonable for 4096x4096 matmul
+COMPUTE: 17.98s (15.29 TFLOPS, 2000 matmuls)
 EXIT: 0
 === test_training_fp16.py ===
-[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] Socket fd=500
-[chidori] Connected directly to GPU worker
-Model: 23M params, 46 MB on NVIDIA GeForce RTX 4090 Laptop GPU
-Warmup done
-  step   0  loss=9.4173  tokens/s=130050  elapsed=0.0s
-  step  10  loss=9.4218  tokens/s=184248  elapsed=0.1s
-  step  20  loss=9.4243  tokens/s=188172  elapsed=0.2s
-  step  30  loss=9.4141  tokens/s=190981  elapsed=0.3s
-  step  40  loss=9.4290  tokens/s=196800  elapsed=0.4s
-
-Losses: [9.417302131652832, 9.421829223632812, 9.42432975769043, 9.414098739624023, 9.429035186767578]
-WARNING — loss not decreasing (FP16 overflow or LR too high)
-
-============================================================
-DEVICE:     NVIDIA GeForce RTX 4090 Laptop GPU
-MODEL:      23M params (6L, h=512)
-BATCH:      32 x 64 = 2048 tokens/step
-TRAINING:   0.5s (50 steps)
-THROUGHPUT: 200385 tokens/s (200.4K tok/s)
-============================================================
-[chidori] SOCKET CLOSED at src/client/chidori_client.c:5800
+THROUGHPUT: 198326 tokens/s (198.3K tok/s)
 EXIT: 0
 === test_inference.py ===
-[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] Socket fd=500
-[chidori] Connected directly to GPU worker
-Device: NVIDIA GeForce RTX 4090 Laptop GPU
-VRAM: 16.7 GB
-============================================================
-
-[LOAD] Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
-Loading weights:   0%|          | 0/201 [00:00<?, ?it/s]Loading weights:  40%|███▉      | 80/201 [00:00<00:00, 799.61it/s]Loading weights: 100%|██████████| 201/201 [00:00<00:00, 1105.98it/s]
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Both `max_new_tokens` (=200) and `max_length`(=2048) seem to have been set. `max_new_tokens` will take precedence. Please refer to the documentation for more information. (https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)
-[LOAD] CPU load: 1.1s
-[LOAD] Moving to GPU...
-[LOAD] GPU transfer: 1.4s
-[LOAD] GPU memory used: 2202 MB
-
-[INFERENCE] Prompt: Explain how GPU-over-IP works in simple terms:
-
-[EMBED] Testing embedding forward pass...
-[EMBED] mean=-0.000060 std=0.010998
-[EMBED] OK — embedding produces non-trivial output
-
-[INFERENCE] Generating 200 tokens...
-[DEBUG] Output shape: torch.Size([1, 176]), dtype: torch.int64
-[DEBUG] First 20 tokens: [1, 12027, 7420, 920, 22796, 29899, 957, 29899, 5690, 1736, 297, 2560, 4958, 29901, 13, 13, 29954, 7056, 29899, 957]
-[DEBUG] Last 20 tokens: [263, 10808, 29892, 1316, 408, 15061, 29871, 29941, 29928, 18533, 470, 2734, 2919, 29899, 7052, 4933, 6509, 14009, 29889, 2]
-[DEBUG] Min: 1, Max: 29954
-[INFERENCE] Done: 5.17s — 162 tokens — 31.4 tok/s
-
---- Output ---
-Explain how GPU-over-IP works in simple terms:
-
-GPU-over-IP is a technology that allows the use of GPUs on a network, by using a network interface card (NIC) to connect the GPU to the network. The NIC is a device that connects the computer to the network, and it can be used to connect the GPU to the network. When a computer with a GPU is connected to a network, the GPU is connected to the NIC, and the NIC is connected to the network. The NIC then routes the data between the GPU and the network, 
---- End ---
-
-============================================================
-MODEL:     TinyLlama/TinyLlama-1.1B-Chat-v1.0
-CPU LOAD:  1.1s
-GPU LOAD:  1.4s (2202 MB)
-INFERENCE: 5.17s (162 tokens, 31.4 tok/s)
-============================================================
-[chidori] SOCKET CLOSED at src/client/chidori_client.c:5800
+[INFERENCE] Done: 6.96s — 162 tokens — 23.3 tok/s
+INFERENCE: 6.96s (162 tokens, 23.3 tok/s)
 EXIT: 0
 === DONE ===

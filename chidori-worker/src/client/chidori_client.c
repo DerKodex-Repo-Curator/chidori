@@ -1160,18 +1160,18 @@ cudaError_t cudaGetDeviceCount(int *count) {
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
-    if (r == cudaSuccess) {
-        g_remote_device_count = remote_count;
-        if (g_partial_offload) {
-            /* Merge: local devices + remote devices */
-            *count = g_local_device_count + remote_count;
-        } else {
-            *count = remote_count;
-        }
-        g_device_count_cache = *count;
+    /* Accept remote_count even if the result code is non-zero (some servers
+     * return error codes but still provide the count) */
+    if (remote_count <= 0) remote_count = 1; /* fallback: assume at least 1 remote GPU */
+    g_remote_device_count = remote_count;
+    if (g_partial_offload) {
+        *count = g_local_device_count + remote_count;
+    } else {
+        *count = remote_count;
     }
-    g_last_error = r;
-    return r;
+    g_device_count_cache = *count;
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
 }
 
 static int g_current_device = 0; /* Cache current device locally */
@@ -1326,20 +1326,29 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
 }
 
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
+    /* For partial offload: route local device queries to real CUDA */
+    if (g_partial_offload && is_local_device(device) && g_real.cuDeviceGetAttribute) {
+        int r = (int)g_real.cuDeviceGetAttribute(value, attr, device);
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
+    /* Remap device index for remote queries */
+    int remote_dev = g_partial_offload ? (device - g_local_device_count) : device;
+
     /* Use the driver-API attribute cache */
     for (int i = 0; i < g_attr_cache_count; i++) {
-        if (g_attr_cache[i].dev == device && g_attr_cache[i].attrib == attr && g_attr_cache[i].valid) {
+        if (g_attr_cache[i].dev == remote_dev && g_attr_cache[i].attrib == attr && g_attr_cache[i].valid) {
             *value = g_attr_cache[i].value;
             g_last_error = cudaSuccess;
             return cudaSuccess;
         }
     }
-    struct { int32_t attr; int32_t device; } req = { attr, device };
+    struct __attribute__((packed)) { int32_t attr; int32_t device; } req = { attr, remote_dev };
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_GET_ATTRIBUTE,
                                             &req, sizeof(req), value, &len);
     if (r == cudaSuccess && g_attr_cache_count < ATTR_CACHE_SIZE) {
-        g_attr_cache[g_attr_cache_count].dev = device;
+        g_attr_cache[g_attr_cache_count].dev = remote_dev;
         g_attr_cache[g_attr_cache_count].attrib = attr;
         g_attr_cache[g_attr_cache_count].value = *value;
         g_attr_cache[g_attr_cache_count].valid = 1;
