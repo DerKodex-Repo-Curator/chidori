@@ -142,3 +142,5 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
 
 8. If the same failure repeats 3 times unchanged, STOP and report 
    the full contents of `.claude/test_output.txt` to me — do not loop forever.
+
+9. <rule> you will always test from client server local to whichever gpu server you are given access to, testing on loopback is no longer considered a valid test. <rule>
