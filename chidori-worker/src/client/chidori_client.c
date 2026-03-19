@@ -702,9 +702,11 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
+    fprintf(stderr, "[chidori] cuDeviceGetCount: g_num_servers=%d\n", g_num_servers);
     /* Multi-server: 1 device per server */
     if (g_num_servers > 1) {
         *count = g_num_servers;
+        fprintf(stderr, "[chidori] cuDeviceGetCount returning %d (multi-server)\n", *count);
         return CUDA_SUCCESS;
     }
     int remote_count = 0;
