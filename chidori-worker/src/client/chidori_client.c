@@ -4867,10 +4867,14 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
             g_in_real_cuda = 0;
         }
 
+        /* Safety: always clear guard before returning */
+        g_in_real_cuda = 0;
+
         fat_idx_storage[idx] = idx;
         return (void **)&fat_idx_storage[idx];
     }
 
+    g_in_real_cuda = 0; /* safety clear */
     static int fallback_idx = 0;
     return (void **)&fallback_idx;
 }
