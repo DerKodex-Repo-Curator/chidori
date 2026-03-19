@@ -189,6 +189,9 @@ static void init_real_cuda(void) {
         if (g_local_device_mask & (1u << i))
             g_local_device_count++;
     }
+    /* Default device 0: if it's local, set routing accordingly */
+    if (g_local_device_mask & 1)
+        g_routing_local = 1;
 
     fprintf(stderr, "[chidori] Partial offload: local_devices=%s (%d local GPUs)\n",
             env, g_local_device_count);
@@ -1406,7 +1409,8 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
 }
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    if (g_routing_local && g_real.cudaMalloc) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMalloc) {
+        ensure_real_cuda_init();
         cudaError_t r = (cudaError_t)g_real.cudaMalloc(devPtr, size);
         g_last_error = r;
         return r;
@@ -1422,7 +1426,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 cudaError_t cudaFree(void *devPtr) {
-    if (g_routing_local && g_real.cudaFree) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaFree) {
         cudaError_t r = (cudaError_t)g_real.cudaFree(devPtr);
         g_last_error = r;
         return r;
@@ -1435,7 +1439,7 @@ cudaError_t cudaFree(void *devPtr) {
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     /* Route to local GPU if current device is local */
-    if (g_routing_local && g_real.cudaMemcpy) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMemcpy) {
         cudaError_t r = (cudaError_t)g_real.cudaMemcpy(dst, src, count, kind);
         g_last_error = r;
         return r;
@@ -1599,7 +1603,7 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 
 cudaError_t cudaDeviceSynchronize(void) {
-    if (g_routing_local && g_real.cudaDeviceSynchronize) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaDeviceSynchronize) {
         cudaError_t r = (cudaError_t)g_real.cudaDeviceSynchronize();
         g_last_error = r;
         return r;
@@ -1627,7 +1631,7 @@ cudaError_t cudaStreamDestroy(void *stream) {
 }
 
 cudaError_t cudaStreamSynchronize(void *stream) {
-    if (g_routing_local && g_real.cudaStreamSynchronize) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaStreamSynchronize) {
         cudaError_t r = (cudaError_t)g_real.cudaStreamSynchronize(stream);
         g_last_error = r;
         return r;
@@ -4237,7 +4241,7 @@ static uint64_t lazy_register_function(int idx) {
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem, cudaStream_t stream) {
     /* Route to local GPU if current device is local */
-    if (g_routing_local && g_real.cudaLaunchKernel_ptr) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaLaunchKernel_ptr) {
         typedef int (*real_cudaLaunchKernel_t)(const void *, dim3, dim3, void **, size_t, void *);
         real_cudaLaunchKernel_t real_fn = (real_cudaLaunchKernel_t)g_real.cudaLaunchKernel_ptr;
         cudaError_t r = (cudaError_t)real_fn(func, gridDim, blockDim, args, sharedMem, stream);
