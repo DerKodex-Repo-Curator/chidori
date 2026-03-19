@@ -127,12 +127,25 @@ if [ -f "$DIR/build/test_protocol" ]; then
     run_test_no_server "protocol (wire format)" "$DIR/build/test_protocol" 10
 fi
 
-# GPU tests
+# GPU tests (single server — client to remote)
 run_test "test_pytorch.py (basic ops)" "$PY $DIR/tests/test_pytorch.py" 30
 run_test "test_train.py (matmul 4096)" "$PY $DIR/tests/test_train.py" 120
 run_test "test_training_fp16.py (FP16)" "$PY $DIR/tests/test_training_fp16.py" 60
 run_test "test_training.py (FP32 train)" "$PY $DIR/tests/test_training.py" 120
 run_test "test_inference.py (TinyLlama)" "$PY $DIR/tests/test_inference.py" 300
+
+# Partial GPU offload tests (local GPU + remote GPU)
+# These require CHIDORI_LOCAL_DEVICES=0 and CHIDORI_REAL_CUDA_PATH set.
+# They will FAIL until partial offloading is implemented.
+if [ -n "$CHIDORI_LOCAL_DEVICES" ]; then
+    echo ""
+    echo "--- Partial Offload Tests ---"
+    run_test "partial: basic (enum)" "$PY $DIR/tests/test_partial_offload_basic.py" 30
+    run_test "partial: compute" "$PY $DIR/tests/test_partial_offload_compute.py" 60
+    run_test "partial: transfer" "$PY $DIR/tests/test_partial_offload_transfer.py" 60
+    run_test "partial: split model" "$PY $DIR/tests/test_partial_offload_split_model.py" 120
+    run_test "partial: device_map" "$PY $DIR/tests/test_partial_offload_device_map.py" 300
+fi
 
 # Cleanup
 stop_server
