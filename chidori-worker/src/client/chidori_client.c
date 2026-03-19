@@ -775,7 +775,11 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
-    if (g_in_real_cuda && g_real.cuDeviceGetCount) return g_real.cuDeviceGetCount(count);
+    /* For partial offload: NEVER forward to real driver (it only sees local GPUs).
+     * Always return our merged count. Only forward when inside real CUDA AND
+     * not in partial offload mode. */
+    if (g_in_real_cuda && !g_partial_offload && g_real.cuDeviceGetCount)
+        return g_real.cuDeviceGetCount(count);
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
