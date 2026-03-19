@@ -1328,14 +1328,19 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_REGISTER_FAT_BINARY: {
-        /* Payload is raw fat binary data. Use cuModuleLoadData which handles
-         * both fat binaries (0xba55ed50) and raw CUBINs/PTX. */
+        /* Payload is raw fat binary data. Use cuModuleLoadDataEx with JIT
+         * options to enable PTX compilation for cross-architecture support.
+         * This allows sm_89 fat binaries (with PTX) to run on sm_120 GPUs. */
         CUmodule mod;
-        res = cuModuleLoadData(&mod, payload);
+        CUjit_option opts[] = {
+            CU_JIT_FALLBACK_STRATEGY,
+        };
+        void *opt_vals[] = {
+            (void *)(uintptr_t)CU_PREFER_PTX,
+        };
+        res = cuModuleLoadDataEx(&mod, payload, 1, opts, opt_vals);
         if (res != CUDA_SUCCESS) {
-            /* Log the failure but DON'T try alternative loaders — they can
-             * fatally poison the GPU context with error 700. */
-            fprintf(stderr, "[cuda_dispatch] cuModuleLoadData FAILED: size=%u res=%d\n",
+            fprintf(stderr, "[cuda_dispatch] cuModuleLoadDataEx FAILED: size=%u res=%d\n",
                     req->payload_size, (int)res);
         }
         if (res == CUDA_SUCCESS) {
