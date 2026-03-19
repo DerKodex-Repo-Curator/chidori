@@ -719,7 +719,9 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
-    fprintf(stderr, "[chidori] cuDeviceGetCount: g_num_servers=%d\n", g_num_servers);
+    char dbg[128];
+    int dbg_len = snprintf(dbg, sizeof(dbg), "[chidori] cuDeviceGetCount ENTER: g_num_servers=%d\n", g_num_servers);
+    write(2, dbg, dbg_len);
     /* Multi-server: 1 device per server */
     if (g_num_servers > 1) {
         *count = g_num_servers;
