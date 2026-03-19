@@ -201,22 +201,11 @@ static inline int is_local_device(int device) {
     return g_partial_offload && ((g_local_device_mask >> device) & 1);
 }
 
-/* Client state — multi-server support */
-#define MAX_SERVERS 16
-static int g_server_fds[MAX_SERVERS] = {[0 ... MAX_SERVERS-1] = -1}; /* one TCP fd per server */
-static int g_num_servers = 0;         /* how many servers connected */
-static int g_active_server = 0;      /* which server is active (maps from g_current_device) */
-static int g_server_fd = -1;         /* alias for g_server_fds[g_active_server] — updated on device switch */
+/* Client state */
+static int g_server_fd = -1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_seq_num = 0;
 static int g_initialized = 0;
-
-static void set_active_server(int idx) {
-    if (idx >= 0 && idx < g_num_servers) {
-        g_active_server = idx;
-        g_server_fd = g_server_fds[idx];
-    }
-}
 
 /*
  * Connect to the Chidori GPU worker.
@@ -255,38 +244,6 @@ static char *json_get_array_first(const char *json, const char *key) {
     memcpy(val, start, len);
     val[len] = '\0';
     return val;
-}
-
-/* Parse ALL elements from a JSON string array, e.g., "servers":["a:1","b:2"]
- * Returns count of elements found. Results stored in out[] (caller provides). */
-static int json_get_array_all(const char *json, const char *key, char **out, int max_out) {
-    char search[128];
-    snprintf(search, sizeof(search), "\"%s\":[", key);
-    const char *p = strstr(json, search);
-    if (!p) return 0;
-    p += strlen(search);
-
-    int count = 0;
-    while (*p && count < max_out) {
-        /* Skip whitespace */
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == ']') break;
-        if (*p == ',') { p++; continue; }
-        if (*p == '"') {
-            p++;
-            const char *end = strchr(p, '"');
-            if (!end) break;
-            size_t len = (size_t)(end - p);
-            out[count] = (char *)malloc(len + 1);
-            memcpy(out[count], p, len);
-            out[count][len] = '\0';
-            count++;
-            p = end + 1;
-        } else {
-            break;
-        }
-    }
-    return count;
 }
 
 static int tcp_connect(const char *host, int port) {
@@ -359,7 +316,7 @@ static int tcp_connect(const char *host, int port) {
 }
 
 static int chidori_connect(void) {
-    if (g_num_servers > 0 && g_server_fd >= 0)
+    if (g_server_fd >= 0)
         return 0;
 
     const char *cfg = getenv("CHIDORI_CFG_OVERRIDE");
@@ -368,97 +325,152 @@ static int chidori_connect(void) {
         return -1;
     }
 
-    /* Parse session ID and ALL server addresses from config */
+    /* Parse session ID and server address from config */
     char *session_id = json_get_string(cfg, "id");
-    char *servers[MAX_SERVERS];
-    int server_count = json_get_array_all(cfg, "servers", servers, MAX_SERVERS);
+    char *server = json_get_array_first(cfg, "servers");
 
-    if (!session_id || server_count == 0) {
+    if (!session_id || !server) {
         fprintf(stderr, "[chidori] Missing id or servers in config\n");
         free(session_id);
+        free(server);
         return -1;
     }
 
+    /* Split host:port */
+    char host[256] = "127.0.0.1";
+    int port = 43210;
+    char *colon = strrchr(server, ':');
+    if (colon) {
+        *colon = '\0';
+        strncpy(host, server, sizeof(host) - 1);
+        port = atoi(colon + 1);
+    } else {
+        strncpy(host, server, sizeof(host) - 1);
+    }
+
+    /*
+     * Check if CHIDORI_DIRECT_CONNECT is set — if so, connect directly to
+     * chidori-worker's standalone TCP port (no HTTP/agent middleman).
+     */
     const char *direct = getenv("CHIDORI_DIRECT_CONNECT");
 
-    /* Connect to each server */
-    /* Connect to each server */
-    for (int s = 0; s < server_count; s++) {
-        char host[256] = "127.0.0.1";
-        int port = 43210;
-        char *colon = strrchr(servers[s], ':');
-        if (colon) {
-            *colon = '\0';
-            strncpy(host, servers[s], sizeof(host) - 1);
-            port = atoi(colon + 1);
-        } else {
-            strncpy(host, servers[s], sizeof(host) - 1);
-        }
-        free(servers[s]);
+    if (direct && direct[0] == '1') {
+        /* Direct TCP connection to gpu-worker standalone mode */
+        fprintf(stderr, "[chidori] Direct connect to gpu-worker at %s:%d\n", host, port);
 
-        fprintf(stderr, "[chidori] Connecting to server %d at %s:%d\n", s, host, port);
-        int fd = tcp_connect(host, port);
-        if (fd < 0) {
-            fprintf(stderr, "[chidori] Failed to connect to server %d\n", s);
+        g_server_fd = tcp_connect(host, port);
+        if (g_server_fd < 0) {
             free(session_id);
+            free(server);
             return -1;
         }
 
-        if (!(direct && direct[0] == '1')) {
-            /* Agent-mediated: send HTTP upgrade, read 101 response */
-            char http_req[2048];
-            const char *body = "{\"id\":\"conn-1\",\"pid\":\"0\",\"processName\":\"chidori-client\"}";
-            int body_len = (int)strlen(body);
-            int req_len = snprintf(http_req, sizeof(http_req),
-                "POST /v1/connect/session/%s HTTP/1.1\r\n"
-                "Host: %s:%d\r\nContent-Type: application/json\r\n"
-                "Content-Length: %d\r\nConnection: Upgrade\r\n\r\n%s",
-                session_id, host, port, body_len, body);
-            if (chidori_write_full(fd, http_req, (size_t)req_len) != 0) {
-                close(fd); free(session_id); return -1;
-            }
-            /* Read HTTP 101 response */
+        fprintf(stderr, "[chidori] Connected directly to GPU worker\n");
+    } else {
+        /* Agent-mediated connection via HTTP session protocol */
+        fprintf(stderr, "[chidori] Connecting to agent at %s:%d (session %s)\n",
+                host, port, session_id);
+
+        g_server_fd = tcp_connect(host, port);
+        if (g_server_fd < 0) {
+            free(session_id);
+            free(server);
+            return -1;
+        }
+
+        char http_req[2048];
+        const char *body = "{\"id\":\"conn-1\",\"pid\":\"0\",\"processName\":\"chidori-client\"}";
+        int body_len = (int)strlen(body);
+
+        int req_len = snprintf(http_req, sizeof(http_req),
+            "POST /v1/connect/session/%s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: Upgrade\r\n"
+            "\r\n"
+            "%s",
+            session_id, host, port, body_len, body);
+
+        if (chidori_write_full(g_server_fd, http_req, (size_t)req_len) != 0) {
+            fprintf(stderr, "[chidori] Failed to send HTTP connect request\n");
+            close(g_server_fd);
+            fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+            free(session_id);
+            free(server);
+            return -1;
+        }
+
+        /*
+         * Read the HTTP 101 Switching Protocols response from the agent.
+         * This confirms the agent has hijacked the connection and forwarded
+         * the socket to gpu-worker.  We read byte-by-byte looking for the
+         * end-of-headers marker "\r\n\r\n".  After this point the TCP
+         * stream carries raw Chidori CUDA protocol.
+         *
+         * Timeout: we give the agent up to 30 seconds to respond (CUDA
+         * init on the worker side can take a while on first launch).
+         */
+        {
             struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            char resp_buf[1024]; int resp_len = 0; int found_end = 0;
+            setsockopt(g_server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            char resp_buf[1024];
+            int resp_len = 0;
+            int found_end = 0;
+
             while (resp_len < (int)sizeof(resp_buf) - 1) {
-                ssize_t n = read(fd, resp_buf + resp_len, 1);
-                if (n <= 0) { close(fd); free(session_id); return -1; }
+                ssize_t n = read(g_server_fd, resp_buf + resp_len, 1);
+                if (n <= 0) {
+                    fprintf(stderr, "[chidori] Failed to read HTTP response from agent (n=%zd errno=%d)\n", n, errno);
+                    close(g_server_fd);
+                    fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+                    free(session_id);
+                    free(server);
+                    return -1;
+                }
                 resp_len += (int)n;
-                if (resp_len >= 4 && resp_buf[resp_len-4]=='\r' && resp_buf[resp_len-3]=='\n'
-                    && resp_buf[resp_len-2]=='\r' && resp_buf[resp_len-1]=='\n') { found_end=1; break; }
+                /* Look for \r\n\r\n end-of-headers */
+                if (resp_len >= 4 &&
+                    resp_buf[resp_len - 4] == '\r' &&
+                    resp_buf[resp_len - 3] == '\n' &&
+                    resp_buf[resp_len - 2] == '\r' &&
+                    resp_buf[resp_len - 1] == '\n') {
+                    found_end = 1;
+                    break;
+                }
             }
-            tv.tv_sec = 0; tv.tv_usec = 0;
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (!found_end || strstr(resp_buf, "101") == NULL) {
-                close(fd); free(session_id); return -1;
+
+            /* Clear the receive timeout for subsequent CUDA RPC traffic */
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            setsockopt(g_server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            if (!found_end) {
+                fprintf(stderr, "[chidori] Invalid HTTP response from agent\n");
+                close(g_server_fd);
+                fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+                free(session_id);
+                free(server);
+                return -1;
+            }
+
+            resp_buf[resp_len] = '\0';
+            if (strstr(resp_buf, "101") == NULL) {
+                fprintf(stderr, "[chidori] Agent did not return 101: %s\n", resp_buf);
+                close(g_server_fd);
+                fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+                free(session_id);
+                free(server);
+                return -1;
             }
         }
 
-        g_server_fds[s] = fd;
-        fprintf(stderr, "[chidori] Connected to server %d (fd=%d)\n", s, fd);
+        fprintf(stderr, "[chidori] Connected to remote GPU (session %s)\n", session_id);
     }
 
-    g_num_servers = server_count;
-
-    /* Send cuInit to EACH server so they're ready for attribute queries */
-    if (server_count > 1) {
-        uint32_t flags = 0;
-        for (int s = 0; s < server_count; s++) {
-            set_active_server(s);
-            chidori_request_t req = {0};
-            req.func_id = CHIDORI_CU_INIT;
-            req.flags = CHIDORI_FLAG_SYNC;
-            req.seq_num = ++g_seq_num;
-            chidori_send_request(g_server_fd, &req, &flags, sizeof(flags));
-            chidori_response_t resp;
-            chidori_recv_response(g_server_fd, &resp);
-            fprintf(stderr, "[chidori] cuInit on server %d: result=%d\n", s, resp.result);
-        }
-    }
-
-    set_active_server(0);  /* default: device 0 on server 0 */
     free(session_id);
+    free(server);
     return 0;
 }
 
@@ -718,35 +730,16 @@ CUresult cuDriverGetVersion(int *version) {
     return r;
 }
 
-static volatile int g_cuDeviceGetCount_called = 0;
 CUresult cuDeviceGetCount(int *count) {
-    g_cuDeviceGetCount_called++;
-    /* Write a sentinel file to prove we're being called */
-    int dbgfd = open("/tmp/chidori_cuDeviceGetCount", O_WRONLY|O_CREAT|O_TRUNC, 0644);
-    if (dbgfd >= 0) {
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "called=%d servers=%d\n", g_cuDeviceGetCount_called, g_num_servers);
-        write(dbgfd, buf, n);
-        close(dbgfd);
-    }
-    /* Multi-server: 1 device per server */
-    if (g_num_servers > 1) {
-        *count = g_num_servers;
-        fprintf(stderr, "[chidori] cuDeviceGetCount returning %d (multi-server)\n", *count);
-        return CUDA_SUCCESS;
-    }
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
-    /* Re-check after RPC (chidori_connect may have run inside chidori_rpc) */
-    if (g_num_servers > 1) {
-        *count = g_num_servers;
-        return CUDA_SUCCESS;
-    }
     if (remote_count <= 0) remote_count = 1;
     g_remote_device_count = remote_count;
     if (g_partial_offload) {
         *count = g_local_device_count + remote_count;
+        fprintf(stderr, "[chidori] cuDeviceGetCount: local=%d remote=%d total=%d\n",
+                g_local_device_count, remote_count, *count);
     } else {
         *count = remote_count;
     }
@@ -771,16 +764,10 @@ CUresult cuDeviceGetName(char *name, int len, CUdevice dev) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGetName(name, len, dev);
     }
-    /* Multi-server: temporarily switch to the target server */
-    int saved = g_active_server;
-    if (g_num_servers > 1 && dev >= 0 && dev < g_num_servers)
-        set_active_server(dev);
-    int32_t dev0 = 0; /* each server's device 0 */
-    struct __attribute__((packed)) { int32_t len; int32_t dev; } req = { len, dev0 };
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
+    struct __attribute__((packed)) { int32_t len; int32_t dev; } req = { len, remote_dev };
     size_t out_len = (size_t)len;
-    CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_NAME, &req, sizeof(req), name, &out_len);
-    if (g_num_servers > 1) set_active_server(saved);
-    return r;
+    return chidori_rpc(CHIDORI_CU_DEVICE_GET_NAME, &req, sizeof(req), name, &out_len);
 }
 
 CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
@@ -811,32 +798,21 @@ CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGetAttribute(pi, attrib, dev);
     }
+    /* Remap device for remote */
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
 
-    /* Multi-server: switch to target server, query device 0 */
-    int saved = g_active_server;
-    int query_dev = dev;
-    if (g_num_servers > 1 && dev >= 0 && dev < g_num_servers) {
-        set_active_server(dev);
-        query_dev = 0;
-    } else if (g_partial_offload) {
-        query_dev = dev - g_local_device_count;
-    }
-
-    /* Check cache first (cache key includes server index for multi-server) */
-    int cache_key = g_num_servers > 1 ? (dev * 1000 + attrib) : (query_dev * 1000 + attrib);
+    /* Check cache first */
     for (int i = 0; i < g_attr_cache_count; i++) {
-        if (g_attr_cache[i].dev == cache_key && g_attr_cache[i].valid) {
+        if (g_attr_cache[i].dev == remote_dev && g_attr_cache[i].attrib == attrib && g_attr_cache[i].valid) {
             *pi = g_attr_cache[i].value;
-            if (g_num_servers > 1) set_active_server(saved);
             return CUDA_SUCCESS;
         }
     }
-    struct __attribute__((packed)) { int32_t attrib; int32_t dev; } req = { attrib, query_dev };
+    struct __attribute__((packed)) { int32_t attrib; int32_t dev; } req = { attrib, remote_dev };
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
-    if (g_num_servers > 1) set_active_server(saved);
     if (r == CUDA_SUCCESS && g_attr_cache_count < ATTR_CACHE_SIZE) {
-        g_attr_cache[g_attr_cache_count].dev = cache_key;
+        g_attr_cache[g_attr_cache_count].dev = remote_dev;
         g_attr_cache[g_attr_cache_count].attrib = attrib;
         g_attr_cache[g_attr_cache_count].value = *pi;
         g_attr_cache[g_attr_cache_count].valid = 1;
@@ -1233,52 +1209,24 @@ static cudaError_t g_last_error = 0;
 static int g_device_count_cache = -1;
 
 cudaError_t cudaGetDeviceCount(int *count) {
+    fprintf(stderr, "[chidori] cudaGetDeviceCount called (cache=%d)\n", g_device_count_cache);
     if (g_device_count_cache >= 0) {
         *count = g_device_count_cache;
         return cudaSuccess;
     }
-
-    /* Pre-connect: check how many servers are configured BEFORE connecting.
-     * This ensures the first cudaGetDeviceCount call returns the right count
-     * even before chidori_connect runs. */
-    if (g_num_servers == 0) {
-        const char *cfg = getenv("CHIDORI_CFG_OVERRIDE");
-        if (cfg) {
-            /* Count commas in servers array as proxy for server count */
-            const char *arr = strstr(cfg, "\"servers\":[");
-            if (arr) {
-                int n = 1;
-                for (const char *p = arr; *p && *p != ']'; p++)
-                    if (*p == ',') n++;
-                if (n > 1) {
-                    *count = n;
-                    g_device_count_cache = n;
-                    return cudaSuccess;
-                }
-            }
-        }
-    }
-
-    /* Multi-server: each server has 1 GPU (device), total = num_servers. */
-    if (g_num_servers > 1) {
-        *count = g_num_servers;
-        g_device_count_cache = *count;
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
-    }
-    /* Single server: query remote */
+    /* Get remote device count from server */
     int remote_count = 0;
     size_t len = sizeof(int32_t);
-    chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
-    /* Re-check after RPC (chidori_connect may have established multi-server) */
-    if (g_num_servers > 1) {
-        *count = g_num_servers;
-        g_device_count_cache = *count;
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
+    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
+    /* Accept remote_count even if the result code is non-zero (some servers
+     * return error codes but still provide the count) */
+    if (remote_count <= 0) remote_count = 1; /* fallback: assume at least 1 remote GPU */
+    g_remote_device_count = remote_count;
+    if (g_partial_offload) {
+        *count = g_local_device_count + remote_count;
+    } else {
+        *count = remote_count;
     }
-    if (remote_count <= 0) remote_count = 1;
-    *count = remote_count;
     g_device_count_cache = *count;
     g_last_error = cudaSuccess;
     return cudaSuccess;
@@ -1297,17 +1245,8 @@ cudaError_t cudaSetDevice(int device) {
     if (device == g_current_device)
         return cudaSuccess;
 
-    /* Multi-server: device N → switch to server N, set device 0 on that server */
-    if (g_num_servers > 1 && device >= 0 && device < g_num_servers) {
-        set_active_server(device);
-        int32_t dev0 = 0; /* each server has device 0 */
-        chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &dev0, sizeof(dev0), NULL, NULL);
-        g_current_device = device;
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
-    }
-
     if (g_partial_offload && is_local_device(device)) {
+        /* Route to local GPU via real CUDA driver */
         ensure_real_cuda_init();
         cudaError_t r = cudaSuccess;
         if (g_real.cudaSetDevice)
@@ -1320,7 +1259,7 @@ cudaError_t cudaSetDevice(int device) {
         return r;
     }
 
-    /* Single server: set device on the server directly */
+    /* Route to remote GPU via Chidori RPC */
     int32_t remote_dev = g_partial_offload ? (device - g_local_device_count) : device;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &remote_dev, sizeof(remote_dev), NULL, NULL);
     if (r == cudaSuccess) {
