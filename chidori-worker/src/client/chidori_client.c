@@ -718,11 +718,17 @@ CUresult cuDriverGetVersion(int *version) {
     return r;
 }
 
+static volatile int g_cuDeviceGetCount_called = 0;
 CUresult cuDeviceGetCount(int *count) {
-    /* Debug: write directly to fd 2 */
-    const char *msg = "[DEBUG] cuDeviceGetCount ENTERED\n";
-    ssize_t wr = write(2, msg, 33);
-    (void)wr;
+    g_cuDeviceGetCount_called++;
+    /* Write a sentinel file to prove we're being called */
+    int dbgfd = open("/tmp/chidori_cuDeviceGetCount", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (dbgfd >= 0) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "called=%d servers=%d\n", g_cuDeviceGetCount_called, g_num_servers);
+        write(dbgfd, buf, n);
+        close(dbgfd);
+    }
     /* Multi-server: 1 device per server */
     if (g_num_servers > 1) {
         *count = g_num_servers;
