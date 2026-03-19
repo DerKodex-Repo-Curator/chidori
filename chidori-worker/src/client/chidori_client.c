@@ -440,6 +440,23 @@ static int chidori_connect(void) {
     }
 
     g_num_servers = server_count;
+
+    /* Send cuInit to EACH server so they're ready for attribute queries */
+    if (server_count > 1) {
+        uint32_t flags = 0;
+        for (int s = 0; s < server_count; s++) {
+            set_active_server(s);
+            chidori_request_t req = {0};
+            req.func_id = CHIDORI_CU_INIT;
+            req.flags = CHIDORI_FLAG_SYNC;
+            req.seq_num = ++g_seq_num;
+            chidori_send_request(g_server_fd, &req, &flags, sizeof(flags));
+            chidori_response_t resp;
+            chidori_recv_response(g_server_fd, &resp);
+            fprintf(stderr, "[chidori] cuInit on server %d: result=%d\n", s, resp.result);
+        }
+    }
+
     set_active_server(0);  /* default: device 0 on server 0 */
     free(session_id);
     return 0;
