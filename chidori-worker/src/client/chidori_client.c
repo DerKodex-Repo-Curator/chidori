@@ -725,6 +725,8 @@ CUresult cuDeviceGetCount(int *count) {
     g_remote_device_count = remote_count;
     if (g_partial_offload) {
         *count = g_local_device_count + remote_count;
+        fprintf(stderr, "[chidori] cuDeviceGetCount: local=%d remote=%d total=%d\n",
+                g_local_device_count, remote_count, *count);
     } else {
         *count = remote_count;
     }
