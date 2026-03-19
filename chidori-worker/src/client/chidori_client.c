@@ -775,6 +775,7 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
+    write(2, "[cuDeviceGetCount ENTER]\n", 24);
     /* For partial offload: NEVER forward to real driver (it only sees local GPUs).
      * Always return our merged count. Only forward when inside real CUDA AND
      * not in partial offload mode. */
