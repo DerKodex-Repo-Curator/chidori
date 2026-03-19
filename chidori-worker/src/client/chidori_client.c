@@ -4359,7 +4359,9 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaLaunchKernel_ptr) {
         typedef int (*real_cudaLaunchKernel_t)(const void *, dim3, dim3, void **, size_t, void *);
         real_cudaLaunchKernel_t real_fn = (real_cudaLaunchKernel_t)g_real.cudaLaunchKernel_ptr;
+        g_in_real_cuda = 1;
         cudaError_t r = (cudaError_t)real_fn(func, gridDim, blockDim, args, sharedMem, stream);
+        g_in_real_cuda = 0;
         g_last_error = r;
         return r;
     }
@@ -4860,7 +4862,9 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
         /* For partial offload: also register with real CUDA for local execution */
         init_real_cuda();
         if (g_partial_offload && g_real.__cudaRegisterFatBinary) {
+            g_in_real_cuda = 1;
             g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
+            g_in_real_cuda = 0;
         }
 
         fat_idx_storage[idx] = idx;
@@ -4874,16 +4878,22 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
 void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
     if (g_partial_offload && g_real.__cudaRegisterFatBinaryEnd) {
         int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
-        if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle)
+        if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
+            g_in_real_cuda = 1;
             g_real.__cudaRegisterFatBinaryEnd(g_fat_binaries[idx].real_handle);
+            g_in_real_cuda = 0;
+        }
     }
 }
 
 void __cudaUnregisterFatBinary(void **fatCubinHandle) {
     if (g_partial_offload && g_real.__cudaUnregisterFatBinary) {
         int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
-        if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle)
+        if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
+            g_in_real_cuda = 1;
             g_real.__cudaUnregisterFatBinary(g_fat_binaries[idx].real_handle);
+            g_in_real_cuda = 0;
+        }
     }
 }
 
@@ -4913,9 +4923,12 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
     if (g_partial_offload && g_real.__cudaRegisterFunction) {
         void **real_handle = (fat_idx >= 0 && fat_idx < g_fat_binary_count)
                              ? g_fat_binaries[fat_idx].real_handle : NULL;
-        if (real_handle)
+        if (real_handle) {
+            g_in_real_cuda = 1;
             g_real.__cudaRegisterFunction(real_handle, hostFun, deviceFun, deviceName,
                                           thread_limit, tid, bid, bDim, gDim, wSize);
+            g_in_real_cuda = 0;
+        }
     }
 }
 
