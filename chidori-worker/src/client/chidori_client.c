@@ -26,6 +26,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#ifndef RTLD_DEEPBIND
+#define RTLD_DEEPBIND 0  /* Not available on this platform */
+#endif
 
 #include "chidori_protocol.h"
 
@@ -124,7 +127,10 @@ static void init_real_cuda(void) {
     /* Load real CUDA driver */
     const char *cuda_path = getenv("CHIDORI_REAL_CUDA_PATH");
     if (!cuda_path) cuda_path = "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
-    g_real_cuda_handle = dlopen(cuda_path, RTLD_LAZY | RTLD_LOCAL);
+    /* RTLD_DEEPBIND: the loaded library resolves symbols from itself FIRST,
+     * preventing our LD_PRELOAD from intercepting the real CUDA's internal calls.
+     * Without this, calling g_real.cudaMalloc causes infinite recursion. */
+    g_real_cuda_handle = dlopen(cuda_path, RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
     if (!g_real_cuda_handle) {
         fprintf(stderr, "[chidori] WARNING: Failed to load real CUDA driver from %s: %s\n",
                 cuda_path, dlerror());
@@ -135,7 +141,7 @@ static void init_real_cuda(void) {
 
     /* Load real CUDA runtime */
     const char *cudart_path = getenv("CHIDORI_REAL_CUDART_PATH");
-    g_real_cudart_handle = dlopen(cudart_path ?: "libcudart.so.12", RTLD_LAZY | RTLD_LOCAL);
+    g_real_cudart_handle = dlopen(cudart_path ?: "libcudart.so.12", RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
 
     /* Populate dispatch table */
     #define LOAD_SYM(handle, name) g_real.name = dlsym(handle, #name)
