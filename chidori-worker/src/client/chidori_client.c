@@ -1295,16 +1295,38 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
      *   404: int computeMode
      */
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
+
+    /* For partial offload: local device properties from real CUDA */
+    if (g_partial_offload && is_local_device(device) && g_real.cudaSetDevice) {
+        /* Use the real CUDA runtime's cudaGetDeviceProperties if available.
+         * We load it dynamically since it's not in our dispatch table. */
+        ensure_real_cuda_init();
+        typedef int (*real_getDeviceProps_t)(void *, int);
+        static real_getDeviceProps_t real_fn = NULL;
+        if (!real_fn && g_real_cudart_handle)
+            real_fn = (real_getDeviceProps_t)dlsym(g_real_cudart_handle, "cudaGetDeviceProperties_v2");
+        if (!real_fn && g_real_cudart_handle)
+            real_fn = (real_getDeviceProps_t)dlsym(g_real_cudart_handle, "cudaGetDeviceProperties");
+        if (real_fn) {
+            cudaError_t r = (cudaError_t)real_fn(prop, device);
+            g_last_error = r;
+            return r;
+        }
+    }
+
     memset(prop, 0, 1032);
 
     char *p = (char *)prop;
     int val;
 
+    /* Remap device for remote */
+    int remote_device = g_partial_offload ? (device - g_local_device_count) : device;
+
     /* name: use cuDeviceGetName via the server */
     {
         /* Get name from a raw properties RPC, only use the first 256 bytes (name field) */
         char tmp[1024];
-        int32_t dev = device;
+        int32_t dev = remote_device;
         size_t len = sizeof(tmp);
         if (chidori_rpc(CHIDORI_CUDA_GET_DEVICE_PROPERTIES, &dev, sizeof(dev), tmp, &len) == 0 && len >= 256) {
             memcpy(p, tmp, 256);  /* name is at offset 0 in ALL CUDA versions */
@@ -1313,7 +1335,7 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
 
     /* totalGlobalMem at offset 288 (size_t = 8) — use cuDeviceTotalMem */
     {
-        int32_t dev = device;
+        int32_t dev = remote_device;
         uint64_t total = 0;
         size_t len = sizeof(total);
         chidori_rpc(CHIDORI_CU_DEVICE_TOTAL_MEM, &dev, sizeof(dev), &total, &len);
