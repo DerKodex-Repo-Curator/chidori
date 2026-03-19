@@ -13,11 +13,11 @@ print("=" * 60)
 # ============================================================
 # MODEL — simple transformer-like layers (no HF dependency)
 # ============================================================
-HIDDEN = 2048
-LAYERS = 12
-BATCH = 32
-SEQ = 128
-VOCAB = 32000
+HIDDEN = 512
+LAYERS = 6
+BATCH = 16
+SEQ = 64
+VOCAB = 10000
 STEPS = 50
 
 # Disable Flash/SDPA attention — Chidori doesn't proxy CUTLASS kernels yet

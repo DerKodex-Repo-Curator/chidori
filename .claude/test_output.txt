@@ -1,13 +1,39 @@
-=== test_train.py ===
-[COMPUTE] Done: 17.98s — 15.29 TFLOPS
-[VERIFY] OK: sum=-25712.44 looks reasonable for 4096x4096 matmul
-COMPUTE: 17.98s (15.29 TFLOPS, 2000 matmuls)
-EXIT: 0
-=== test_training_fp16.py ===
-THROUGHPUT: 198326 tokens/s (198.3K tok/s)
-EXIT: 0
-=== test_inference.py ===
-[INFERENCE] Done: 6.96s — 162 tokens — 23.3 tok/s
-INFERENCE: 6.96s (162 tokens, 23.3 tok/s)
-EXIT: 0
-=== DONE ===
+Updating f5155f4..eeece03
+Fast-forward
+ chidori-worker/Makefile                    |   3 +
+ chidori-worker/tests/README.md             |  79 +++++++++++++++
+ chidori-worker/tests/run_all.sh            | 153 +++++++++++++++++++++++++++++
+ chidori-worker/tests/test_inference.py     |   8 ++
+ chidori-worker/tests/test_pytorch.py       |  18 +++-
+ chidori-worker/tests/test_train.py         |  12 +++
+ chidori-worker/tests/test_training.py      |   9 ++
+ chidori-worker/tests/test_training_fp16.py |  18 +++-
+ 8 files changed, 296 insertions(+), 4 deletions(-)
+ create mode 100644 chidori-worker/tests/README.md
+ create mode 100755 chidori-worker/tests/run_all.sh
+rm -rf build
+From github.com:fpolica91/chidori
+   f5155f4..eeece03  main       -> origin/main
+      |                                                             ~~~~~^~~~~~~~~~
+
+=== Chidori Test Suite ===
+Server:  127.0.0.1:43211
+Python:  /home/fabricio/chidori/chidori-worker/../.venv/bin/python
+Build:   /home/fabricio/chidori/chidori-worker/build
+
+  test_pytorch.py (basic ops)         PASS  (2s)
+  test_train.py (matmul 4096)         PASS  (20s)
+  test_training_fp16.py (FP16)        PASS  (4s)
+  test_training.py (FP32 train)       FAIL  (20s, exit=1)
+    ============================================================
+    FAIL: test_training
+    [chidori] SOCKET CLOSED at src/client/chidori_client.c:5886
+  test_inference.py (TinyLlama)       PASS  (12s)
+
+=== Results ===
+4/5 passed, 1 failed
+
+Failures:
+  - test_training.py (FP32 train) (exit 1)
+
+SOME TESTS FAILED
