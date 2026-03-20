@@ -129,7 +129,7 @@ static void *find_fatbin(uint64_t mod_handle, size_t *out_size) {
  *   [24..27] arch  (e.g. 89 for sm_89, 120 for sm_120)
  *   followed by data_size bytes of payload (PTX text or ELF)
  */
-static const char *extract_ptx_from_fatbin(const void *fb, size_t fb_size) {
+static const char *extract_ptx_from_fatbin(const void *fb, size_t fb_size, uint32_t target_sm) {
     if (!fb || fb_size < 16) return NULL;
 
     const uint8_t *p = (const uint8_t *)fb;
@@ -159,24 +159,57 @@ static const char *extract_ptx_from_fatbin(const void *fb, size_t fb_size) {
         memcpy(&data_size, ep + 8, 8);
 
         if (entry_hdr_size < 16) entry_hdr_size = 16;
-        if (data_size == 0 || pos + entry_hdr_size + data_size > fat_size) break;
+
+        /* Fat binary entries may be compressed. Offset 16 has the actual
+         * (compressed) size in the file. Use it if data_size overflows. */
+        uint64_t actual_data_len = data_size;
+        if (pos + entry_hdr_size + actual_data_len > fat_size) {
+            uint64_t comp_size = 0;
+            memcpy(&comp_size, ep + 16, 4);  /* compressed size at offset 16 (4 bytes) */
+            if (comp_size > 0 && pos + entry_hdr_size + comp_size <= fat_size) {
+                actual_data_len = comp_size;
+            } else {
+                /* Can't fix — try remaining space as last resort */
+                actual_data_len = fat_size - pos - entry_hdr_size;
+            }
+        }
+        if (data_size == 0) break;
+
+        /* Dump first 64 bytes of entry header as hex for format analysis */
+        fprintf(stderr, "[ptx_extract] entry@%zu: type=%u hdr=%u data=%llu hex=",
+                pos, (unsigned)entry_type, (unsigned)entry_hdr_size,
+                (unsigned long long)data_size);
+        for (size_t hi = 0; hi < (entry_hdr_size < 64 ? entry_hdr_size : 64); hi++)
+            fprintf(stderr, "%02x", ep[hi]);
+        fprintf(stderr, "\n");
+
+        /* Read sm version from offset 28 */
+        uint32_t sm_ver = 0;
+        if (entry_hdr_size >= 32) memcpy(&sm_ver, ep + 28, 4);
 
         if (entry_type == 1) {
             /* PTX entry — data is null-terminated ASCII text */
             const char *ptx = (const char *)(ep + entry_hdr_size);
-            uint32_t arch = 0;
-            if (entry_hdr_size >= 28) memcpy(&arch, ep + 24, 4);
-            fprintf(stderr, "[ptx_extract] found PTX entry: arch=sm_%u size=%llu\n",
-                    (unsigned)arch, (unsigned long long)data_size);
+            fprintf(stderr, "[ptx_extract] found PTX entry: sm_%u size=%llu\n",
+                    (unsigned)sm_ver, (unsigned long long)data_size);
             return ptx;
         }
 
-        pos += entry_hdr_size + data_size;
+        /* ELF entry matching server's SM version — can be loaded by cuModuleLoadData */
+        if (entry_type == 2 && sm_ver == target_sm) {
+            const char *elf = (const char *)(ep + entry_hdr_size);
+            fprintf(stderr, "[ptx_extract] found ELF entry for sm_%u: size=%llu\n",
+                    (unsigned)sm_ver, (unsigned long long)actual_data_len);
+            return elf;
+        }
+
+        pos += entry_hdr_size + actual_data_len;
         /* Entries are typically 8-byte aligned */
         if (pos & 7) pos = (pos + 7) & ~(size_t)7;
     }
 
-    fprintf(stderr, "[ptx_extract] no PTX entry found in fat binary\n");
+    fprintf(stderr, "[ptx_extract] no PTX entry found in fat binary (scanned to pos=%zu of %llu)\n",
+            pos, (unsigned long long)fat_size);
     return NULL;
 }
 
@@ -1648,7 +1681,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 size_t fb_size = 0;
                 void *fb_data = find_fatbin(mod_handle, &fb_size);
                 if (fb_data) {
-                    const char *ptx = extract_ptx_from_fatbin(fb_data, fb_size);
+                    /* Get server's SM version for matching ELF entries */
+                    int dev_major = 0, dev_minor = 0;
+                    cuDeviceGetAttribute(&dev_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, g_devices[0]);
+                    cuDeviceGetAttribute(&dev_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, g_devices[0]);
+                    uint32_t server_sm = dev_major * 10 + dev_minor;
+                    const char *ptx = extract_ptx_from_fatbin(fb_data, fb_size, server_sm);
                     if (ptx) {
                         CUmodule ptx_mod = NULL;
                         CUresult ptx_res = cuModuleLoadData(&ptx_mod, ptx);
