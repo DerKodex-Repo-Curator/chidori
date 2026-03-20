@@ -111,16 +111,10 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
    ```bash
    ssh fabricio@lenovo.local 'cd ~/chidori/chidori-worker && \
      kill $(pgrep chidori-worker) 2>/dev/null; sleep 1; \
-     nohup build/chidori-worker --standalone 43211 > /tmp/server.log 2>&1 & sleep 1; \
-     ENV="CHIDORI_DIRECT_CONNECT=1 CHIDORI_CFG_OVERRIDE={\"id\":\"test\",\"servers\":[\"127.0.0.1:43211\"]} LD_PRELOAD=build/libcuda.so.1 LD_LIBRARY_PATH=build" && \
-     echo "=== run_training_test.sh ===" && ./tests/run_training_test.sh && \
-     echo "=== test_train.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_train.py && \
-     echo "=== test_training_fp16.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_training_fp16.py && \
-     echo "=== test_training.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_training.py && \
-     echo "=== test_inference.py ===" && eval $ENV ~/chidori/.venv/bin/python tests/test_inference.py && \
-     echo "=== ALL TESTS PASSED ==="' 2>&1 | tee .claude/test_output.txt
+     ./tests/run_all.sh' 2>&1 | tee .claude/test_output.txt
    ```
-   Before pushing code, ALWAYS: `git push origin main` then on Lenovo `git pull && make clean && make all CUDA_PATH=/opt/cuda && cd build && ln -sf libchidori.so libcuda.so.1`
+   `run_all.sh` restarts the server between each test and reports PASS/FAIL per test with a summary.
+   Before pushing code, ALWAYS: `git push origin <branch>` then on Lenovo `git pull && make clean && make all CUDA_PATH=/opt/cuda && cd build && ln -sf libchidori.so libcuda.so.1`
 
 3. The test command is NON-BLOCKING — wait for it to fully complete
    before reading the output. Do not proceed while tests are running.
