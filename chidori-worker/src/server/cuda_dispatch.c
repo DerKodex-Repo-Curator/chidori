@@ -1590,7 +1590,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     if (is_runtime_func && rt_hostFun) {
                         /* Runtime API path: get CUfunction from the runtime's
                          * hostFun via cudaGetFuncBySymbol, then launch with
-                         * CU_LAUNCH_PARAM_BUFFER_POINTER (same as Driver API). */
+                         * CU_LAUNCH_PARAM_BUFFER_POINTER (same as Driver API).
+                         * Ensure CUDA Runtime is initialized first. */
+                        static int rt_init_done = 0;
+                        if (!rt_init_done) { cudaSetDevice(0); rt_init_done = 1; }
                         CUfunction rt_func = NULL;
                         cudaError_t ge = cudaGetFuncBySymbol(&rt_func, rt_hostFun);
                         if (ge == cudaSuccess && rt_func) {
