@@ -1476,30 +1476,53 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                                             func_name, -1, NULL, NULL, NULL, NULL, NULL);
             }
 
-            /* Get the CUfunction via cuModuleGetFunction from a runtime-managed module.
-             * The runtime should have created a module from the registered fat binary. */
-            CUmodule rt_mod = NULL;
-            /* Try to get function directly — the runtime might expose it */
-            res = CUDA_ERROR_NOT_FOUND;
-            /* Alternative: query the function from the CUDA context */
-            CUfunction rt_func = NULL;
-            /* Use cuModuleGetLoadingMode to check, then try cuModuleGetFunction */
-            /* Actually, after __cudaRegisterFunction, we can use cudaGetKernel or
-             * call the Runtime API's cudaLaunchKernel with the hostFun pointer.
-             * Store the dummy_hostFun as our "function handle". */
             uint64_t handle = alloc_handle();
-            /* Store dummy_hostFun pointer as the function "handle" — we'll need
-             * to use cudaLaunchKernel (Runtime API) instead of cuLaunchKernel for these */
             hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)dummy_hostFun | (1ULL << 63));
             res = CUDA_SUCCESS;
 
-            /* For Runtime API functions, we can't use cuFuncGetParamInfo.
-             * Return 0 params — the client already knows the param layout. */
+            /* Try to get CUfunction from runtime to query param info */
+            static int rt_param_init = 0;
+            if (!rt_param_init) { cudaSetDevice(0); cudaFree(0); rt_param_init = 1; }
+            CUfunction rt_func = NULL;
+            cudaGetFuncBySymbol(&rt_func, dummy_hostFun);
+
+            if (rt_func) {
+                /* Got a real CUfunction — query param layout */
+                struct { uint32_t offset; uint32_t size; } pinfo[64];
+                int np = 0;
+                for (int pi = 0; pi < 64; pi++) {
+                    size_t off = 0, sz = 0;
+                    CUresult pr = cuFuncGetParamInfo(rt_func, pi, &off, &sz);
+                    if (pr != CUDA_SUCCESS) break;
+                    pinfo[np].offset = (uint32_t)off;
+                    pinfo[np].size = (uint32_t)sz;
+                    np++;
+                }
+                int total_ps = 0;
+                cuFuncGetAttribute(&total_ps, (CUfunction_attribute)74, rt_func);
+                if (total_ps <= 0 && np > 0)
+                    total_ps = pinfo[np-1].offset + pinfo[np-1].size;
+
+                uint8_t resp_buf[16 + 64 * 8];
+                memcpy(resp_buf, &handle, 8);
+                uint32_t tps32 = (uint32_t)total_ps;
+                uint32_t np32 = (uint32_t)np;
+                memcpy(resp_buf + 8, &tps32, 4);
+                memcpy(resp_buf + 12, &np32, 4);
+                for (int pi = 0; pi < np; pi++) {
+                    memcpy(resp_buf + 16 + pi * 8, &pinfo[pi].offset, 4);
+                    memcpy(resp_buf + 16 + pi * 8 + 4, &pinfo[pi].size, 4);
+                }
+                return chidori_send_response(fd, req->seq_num, (int32_t)res,
+                                             resp_buf, 16 + np * 8);
+            }
+
+            /* Fallback: no param info available */
             uint8_t resp_buf[16];
             memcpy(resp_buf, &handle, 8);
             uint32_t zero = 0;
-            memcpy(resp_buf + 8, &zero, 4); /* total_param_size = 0 */
-            memcpy(resp_buf + 12, &zero, 4); /* num_params = 0 */
+            memcpy(resp_buf + 8, &zero, 4);
+            memcpy(resp_buf + 12, &zero, 4);
             return chidori_send_response(fd, req->seq_num, (int32_t)res, resp_buf, 16);
         }
 
