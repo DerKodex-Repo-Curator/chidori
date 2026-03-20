@@ -4375,17 +4375,15 @@ static uint64_t lazy_register_function(int idx) {
             static CUresult (*real_cuModuleUnload)(CUmodule) = NULL;
             static int local_init = 0;
             if (!local_init) {
-                /* Open the REAL NVIDIA driver (not our LD_PRELOAD'd one) */
-                real_cuda = dlopen("/usr/lib/libcuda.so.1", RTLD_LAZY);
-                if (!real_cuda) real_cuda = dlopen("/usr/lib/x86_64-linux-gnu/libcuda.so.1", RTLD_LAZY);
-                if (!real_cuda) real_cuda = dlopen("/usr/lib64/libcuda.so.1", RTLD_LAZY);
-                if (real_cuda) {
-                    real_cuModuleLoadData = dlsym(real_cuda, "cuModuleLoadData");
-                    real_cuModuleGetFunction = dlsym(real_cuda, "cuModuleGetFunction");
-                    real_cuFuncGetParamInfo = dlsym(real_cuda, "cuFuncGetParamInfo");
-                    real_cuFuncGetAttribute = dlsym(real_cuda, "cuFuncGetAttribute");
-                    real_cuModuleUnload = dlsym(real_cuda, "cuModuleUnload");
-                }
+                /* Use RTLD_NEXT to get the REAL CUDA driver functions
+                 * behind our LD_PRELOAD interception */
+                real_cuModuleLoadData = dlsym(RTLD_NEXT, "cuModuleLoadData");
+                real_cuModuleGetFunction = dlsym(RTLD_NEXT, "cuModuleGetFunction");
+                real_cuFuncGetParamInfo = dlsym(RTLD_NEXT, "cuFuncGetParamInfo");
+                real_cuFuncGetAttribute = dlsym(RTLD_NEXT, "cuFuncGetAttribute");
+                real_cuModuleUnload = dlsym(RTLD_NEXT, "cuModuleUnload");
+                LOG_DEBUG("Cross-arch param init: LoadData=%p GetFunc=%p ParamInfo=%p",
+                        real_cuModuleLoadData, real_cuModuleGetFunction, real_cuFuncGetParamInfo);
                 local_init = 1;
             }
             if (real_cuModuleLoadData && real_cuModuleGetFunction && real_cuFuncGetParamInfo) {
