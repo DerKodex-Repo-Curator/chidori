@@ -1332,15 +1332,37 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * options to enable PTX compilation for cross-architecture support.
          * This allows sm_89 fat binaries (with PTX) to run on sm_120 GPUs. */
         CUmodule mod;
-        /* Try cuModuleLoadFatBinary first — this is what the native CUDA runtime
-         * uses internally and correctly handles PTX JIT for cross-architecture.
-         * Fall back to cuModuleLoadDataEx then cuModuleLoadData. */
-        res = cuModuleLoadFatBinary(&mod, payload);
-        if (res != CUDA_SUCCESS) {
-            res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
-        }
-        if (res != CUDA_SUCCESS) {
-            res = cuModuleLoadData(&mod, payload);
+        /* Use __cudaRegisterFatBinary (Runtime API) which properly handles
+         * PTX JIT for cross-architecture fat binaries. The Driver API's
+         * cuModuleLoadData/cuModuleLoadFatBinary fail with error 209 when
+         * SASS doesn't match and PTX needs JIT on Blackwell (sm_120).
+         *
+         * We reconstruct the __fatBinC_Wrapper struct that the runtime expects. */
+        {
+            struct { int magic; int version; const void *data; void *filename; } wrapper;
+            wrapper.magic = 0x466243b1;
+            wrapper.version = 1;
+            wrapper.data = payload;
+            wrapper.filename = NULL;
+
+            extern void **__cudaRegisterFatBinary(void *);
+            extern void __cudaUnregisterFatBinary(void **);
+            void **handle = __cudaRegisterFatBinary(&wrapper);
+            if (handle) {
+                /* Success — the runtime loaded the fat binary.
+                 * We need to get a CUmodule from it. Use cuModuleLoadData
+                 * which should now find the loaded module in the runtime's cache. */
+                res = cuModuleLoadData(&mod, payload);
+                if (res != CUDA_SUCCESS) {
+                    /* Fallback: try the other loaders */
+                    res = cuModuleLoadFatBinary(&mod, payload);
+                }
+                if (res != CUDA_SUCCESS) {
+                    res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
+                }
+            } else {
+                res = CUDA_ERROR_INVALID_IMAGE;
+            }
         }
         if (res != CUDA_SUCCESS) {
             fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: size=%u res=%d\n",
