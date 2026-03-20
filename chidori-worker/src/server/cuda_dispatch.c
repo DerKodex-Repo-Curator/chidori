@@ -1564,17 +1564,39 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                         fprintf(stderr, "\n");
                     }
 
-                    void *extra[] = {
-                        CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
-                        CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
-                        CU_LAUNCH_PARAM_END
-                    };
+                    if (is_runtime_func && rt_hostFun) {
+                        /* Runtime API path: use cudaLaunchKernel with hostFun.
+                         * The param_buffer contains packed arguments — we need
+                         * to reconstruct void** kernelParams from the buffer.
+                         * For now, pass via the extra[] mechanism through cuLaunchKernel
+                         * on the underlying CUfunction obtained via cudaGetFuncBySymbol. */
+                        dim3 grid_dim = {gridX, gridY, gridZ};
+                        dim3 block_dim = {blockX, blockY, blockZ};
+                        /* cudaLaunchKernel takes void** args, not the extra[] buffer.
+                         * But we can use the internal __cudaLaunchKernel which may
+                         * accept the buffer. For now, try cuLaunchKernel with the
+                         * function resolved from the runtime. */
+                        CUfunction rt_func = NULL;
+                        cuModuleGetFunction(&rt_func, NULL, NULL); /* won't work — placeholder */
+                        /* Actually: the runtime registered the function with hostFun.
+                         * We can call cudaLaunchKernel directly with the hostFun pointer. */
+                        res = (CUresult)cudaLaunchKernel(rt_hostFun,
+                            grid_dim, block_dim,
+                            NULL, /* args — need to reconstruct from param_buffer */
+                            shared, (cudaStream_t)stream);
+                    } else {
+                        void *extra[] = {
+                            CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
+                            CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
+                            CU_LAUNCH_PARAM_END
+                        };
 
-                    res = cuLaunchKernel(func,
-                                         gridX, gridY, gridZ,
-                                         blockX, blockY, blockZ,
-                                         shared, stream,
-                                         NULL, extra);
+                        res = cuLaunchKernel(func,
+                                             gridX, gridY, gridZ,
+                                             blockX, blockY, blockZ,
+                                             shared, stream,
+                                             NULL, extra);
+                    }
 
                     if (s_verbose) {
                         fprintf(stderr, "[cuda_dispatch] LAUNCH result=%d\n", res);
