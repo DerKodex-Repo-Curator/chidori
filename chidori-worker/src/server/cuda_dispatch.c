@@ -1379,8 +1379,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             }
         }
         /* Driver API failed (likely cross-architecture, error 209).
-         * Fall back to Runtime API which handles PTX JIT correctly. */
+         * Fall back to Runtime API which handles PTX JIT correctly.
+         * Initialize CUDA Runtime first (needed for fat binary JIT). */
         {
+            static int rt_initialized = 0;
+            if (!rt_initialized) { cudaSetDevice(0); rt_initialized = 1; }
             init_runtime_registration();
             void **rt_handle = g_rt_RegisterFatBinary
                 ? (void **)g_rt_RegisterFatBinary(&wrapper) : NULL;
