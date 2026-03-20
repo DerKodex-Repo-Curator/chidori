@@ -12,6 +12,7 @@
  * Phase 2: Full CUDA Driver API interception via codegen.
  */
 
+#define _GNU_SOURCE  /* for dlmopen, LM_ID_NEWLM */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
