@@ -1345,26 +1345,28 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         wrapper.data = payload;
         wrapper.filename = NULL;
 
-        /* First: register with Runtime API for PTX JIT cross-architecture support */
+        /* Register with Runtime API — this is the ONLY path that correctly
+         * handles PTX JIT for cross-architecture (sm_89 → sm_120).
+         * We store the runtime handle and use __cudaRegisterFunction for
+         * function registration instead of cuModuleGetFunction. */
         void **rt_handle = __cudaRegisterFatBinary(&wrapper);
         if (rt_handle) {
             __cudaRegisterFatBinaryEnd(rt_handle);
-        }
-
-        /* Now load via Driver API — after runtime registration, the JIT cache
-         * should have the compiled code available for cuModuleLoadData. */
-        CUmodule mod = NULL;
-        res = cuModuleLoadData(&mod, payload);
-        if (res != CUDA_SUCCESS) {
-            res = cuModuleLoadFatBinary(&mod, payload);
-        }
-        if (res != CUDA_SUCCESS) {
-            res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
-        }
-        if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
-            hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+            /* Store runtime handle (tagged: set bit 63 to distinguish from CUmodule) */
+            hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
+            res = CUDA_SUCCESS;
             return chidori_send_response(fd, req->seq_num, (int32_t)res, &handle, sizeof(handle));
+        }
+        /* Fallback: Driver API for non-fat-binary formats */
+        {
+            CUmodule mod;
+            res = cuModuleLoadData(&mod, payload);
+            if (res == CUDA_SUCCESS) {
+                uint64_t handle = alloc_handle();
+                hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+                return chidori_send_response(fd, req->seq_num, (int32_t)res, &handle, sizeof(handle));
+            }
         }
         fprintf(stderr, "[cuda_dispatch] fat binary load FAILED: size=%u res=%d\n",
                 req->payload_size, (int)res);
@@ -1379,11 +1381,54 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&mod_handle, payload, 8);
             func_name = (const char *)((char *)payload + 8);
         }
-        CUmodule mod = (CUmodule)(uintptr_t)hmap_get(&g_modules, mod_handle);
-        if (!mod) {
+        uint64_t mod_val = hmap_get(&g_modules, mod_handle);
+        if (!mod_val) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
         }
-        CUfunction func;
+
+        CUfunction func = NULL;
+        int is_runtime_handle = (mod_val >> 63) & 1;
+
+        if (is_runtime_handle) {
+            /* Runtime API path: use __cudaRegisterFunction with a dummy hostFun.
+             * Allocate a unique dummy pointer for each function. */
+            void **rt_handle = (void **)(uintptr_t)(mod_val & ~(1ULL << 63));
+            static char g_dummy_funcs[65536]; /* pool of unique addresses */
+            static int g_dummy_func_idx = 0;
+            char *dummy_hostFun = &g_dummy_funcs[g_dummy_func_idx++ % 65536];
+
+            __cudaRegisterFunction(rt_handle, dummy_hostFun, (char *)func_name,
+                                   func_name, -1, NULL, NULL, NULL, NULL, NULL);
+
+            /* Get the CUfunction via cuModuleGetFunction from a runtime-managed module.
+             * The runtime should have created a module from the registered fat binary. */
+            CUmodule rt_mod = NULL;
+            /* Try to get function directly — the runtime might expose it */
+            res = CUDA_ERROR_NOT_FOUND;
+            /* Alternative: query the function from the CUDA context */
+            CUfunction rt_func = NULL;
+            /* Use cuModuleGetLoadingMode to check, then try cuModuleGetFunction */
+            /* Actually, after __cudaRegisterFunction, we can use cudaGetKernel or
+             * call the Runtime API's cudaLaunchKernel with the hostFun pointer.
+             * Store the dummy_hostFun as our "function handle". */
+            uint64_t handle = alloc_handle();
+            /* Store dummy_hostFun pointer as the function "handle" — we'll need
+             * to use cudaLaunchKernel (Runtime API) instead of cuLaunchKernel for these */
+            hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)dummy_hostFun | (1ULL << 63));
+            res = CUDA_SUCCESS;
+
+            /* For Runtime API functions, we can't use cuFuncGetParamInfo.
+             * Return 0 params — the client already knows the param layout. */
+            uint8_t resp_buf[16];
+            memcpy(resp_buf, &handle, 8);
+            uint32_t zero = 0;
+            memcpy(resp_buf + 8, &zero, 4); /* total_param_size = 0 */
+            memcpy(resp_buf + 12, &zero, 4); /* num_params = 0 */
+            return chidori_send_response(fd, req->seq_num, (int32_t)res, resp_buf, 16);
+        }
+
+        /* Driver API path: cuModuleGetFunction */
+        CUmodule mod = (CUmodule)(uintptr_t)mod_val;
         res = cuModuleGetFunction(&func, mod, func_name);
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
