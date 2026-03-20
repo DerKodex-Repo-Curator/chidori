@@ -1353,27 +1353,28 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         wrapper.data = payload;
         wrapper.filename = NULL;
 
-        /* Register with Runtime API — this is the ONLY path that correctly
-         * handles PTX JIT for cross-architecture (sm_89 → sm_120).
-         * We store the runtime handle and use __cudaRegisterFunction for
-         * function registration instead of cuModuleGetFunction. */
-        void **rt_handle = __cudaRegisterFatBinary(&wrapper);
-        if (rt_handle) {
-            __cudaRegisterFatBinaryEnd(rt_handle);
-            uint64_t handle = alloc_handle();
-            /* Store runtime handle (tagged: set bit 63 to distinguish from CUmodule) */
-            hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
-            res = CUDA_SUCCESS;
-            return chidori_send_response(fd, req->seq_num, (int32_t)res, &handle, sizeof(handle));
-        }
-        /* Fallback: Driver API for non-fat-binary formats */
+        /* Try Driver API first — works for same-architecture (fastest path).
+         * Fall back to Runtime API for cross-architecture PTX JIT. */
         {
             CUmodule mod;
             res = cuModuleLoadData(&mod, payload);
             if (res == CUDA_SUCCESS) {
+                /* Same architecture — Driver API worked */
                 uint64_t handle = alloc_handle();
                 hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
                 return chidori_send_response(fd, req->seq_num, (int32_t)res, &handle, sizeof(handle));
+            }
+        }
+        /* Driver API failed (likely cross-architecture, error 209).
+         * Fall back to Runtime API which handles PTX JIT correctly. */
+        {
+            void **rt_handle = __cudaRegisterFatBinary(&wrapper);
+            if (rt_handle) {
+                __cudaRegisterFatBinaryEnd(rt_handle);
+                uint64_t handle = alloc_handle();
+                /* Tag bit 63 to mark this as a runtime handle */
+                hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
+                return chidori_send_response(fd, req->seq_num, 0, &handle, sizeof(handle));
             }
         }
         fprintf(stderr, "[cuda_dispatch] fat binary load FAILED: size=%u res=%d\n",
