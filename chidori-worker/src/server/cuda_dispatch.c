@@ -79,6 +79,107 @@ static uint64_t alloc_handle(void) {
     return g_next_handle++;
 }
 
+/* Side table: stores a copy of the fat binary payload for each module handle.
+ * Used by REGISTER_FUNCTION to extract PTX for cross-architecture JIT. */
+static struct {
+    uint64_t mod_handle;
+    void    *data;
+    size_t   size;
+} g_stored_fatbins[256];
+static int g_stored_fatbin_count = 0;
+
+/* Store a copy of fat binary data associated with a module handle. */
+static void store_fatbin(uint64_t mod_handle, const void *data, size_t size) {
+    if (g_stored_fatbin_count >= 256) return;
+    void *copy = malloc(size);
+    if (!copy) return;
+    memcpy(copy, data, size);
+    g_stored_fatbins[g_stored_fatbin_count].mod_handle = mod_handle;
+    g_stored_fatbins[g_stored_fatbin_count].data       = copy;
+    g_stored_fatbins[g_stored_fatbin_count].size       = size;
+    g_stored_fatbin_count++;
+}
+
+/* Look up a stored fat binary by module handle. Returns NULL if not found. */
+static void *find_fatbin(uint64_t mod_handle, size_t *out_size) {
+    for (int i = 0; i < g_stored_fatbin_count; i++) {
+        if (g_stored_fatbins[i].mod_handle == mod_handle) {
+            if (out_size) *out_size = g_stored_fatbins[i].size;
+            return g_stored_fatbins[i].data;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Scan a fat binary (0xba55ed50 format) and return a pointer to the PTX
+ * text of the first PTX entry found (type == 1).  Returns NULL on failure.
+ *
+ * Fat binary layout:
+ *   [0..3]   magic  0xba55ed50
+ *   [4..5]   version
+ *   [6..7]   header_size
+ *   [8..15]  fat_size  (total bytes including this header)
+ *
+ * Each entry following the outer header:
+ *   [0..1]   entry_type  (1 = PTX, 2 = ELF/cubin)
+ *   [2..3]   unused
+ *   [4..7]   entry_header_size
+ *   [8..15]  data_size
+ *   [24..27] arch  (e.g. 89 for sm_89, 120 for sm_120)
+ *   followed by data_size bytes of payload (PTX text or ELF)
+ */
+static const char *extract_ptx_from_fatbin(const void *fb, size_t fb_size) {
+    if (!fb || fb_size < 16) return NULL;
+
+    const uint8_t *p = (const uint8_t *)fb;
+    uint32_t magic = 0;
+    memcpy(&magic, p, 4);
+    if (magic != 0xba55ed50) {
+        fprintf(stderr, "[ptx_extract] bad magic 0x%08x\n", magic);
+        return NULL;
+    }
+
+    uint16_t outer_hdr_size = 0;
+    memcpy(&outer_hdr_size, p + 6, 2);
+    if (outer_hdr_size < 16) outer_hdr_size = 16;
+
+    uint64_t fat_size = 0;
+    memcpy(&fat_size, p + 8, 8);
+    if (fat_size == 0 || fat_size > fb_size) fat_size = fb_size;
+
+    size_t pos = outer_hdr_size;  /* skip outer header */
+    while (pos + 16 <= fat_size) {
+        const uint8_t *ep = p + pos;
+        uint16_t entry_type = 0;
+        memcpy(&entry_type, ep, 2);
+        uint32_t entry_hdr_size = 0;
+        memcpy(&entry_hdr_size, ep + 4, 4);
+        uint64_t data_size = 0;
+        memcpy(&data_size, ep + 8, 8);
+
+        if (entry_hdr_size < 16) entry_hdr_size = 16;
+        if (data_size == 0 || pos + entry_hdr_size + data_size > fat_size) break;
+
+        if (entry_type == 1) {
+            /* PTX entry — data is null-terminated ASCII text */
+            const char *ptx = (const char *)(ep + entry_hdr_size);
+            uint32_t arch = 0;
+            if (entry_hdr_size >= 28) memcpy(&arch, ep + 24, 4);
+            fprintf(stderr, "[ptx_extract] found PTX entry: arch=sm_%u size=%llu\n",
+                    (unsigned)arch, (unsigned long long)data_size);
+            return ptx;
+        }
+
+        pos += entry_hdr_size + data_size;
+        /* Entries are typically 8-byte aligned */
+        if (pos & 7) pos = (pos + 7) & ~(size_t)7;
+    }
+
+    fprintf(stderr, "[ptx_extract] no PTX entry found in fat binary\n");
+    return NULL;
+}
+
 /* Find device ordinal for a given device handle (CUdevice value) */
 static int device_ordinal_for_handle(int32_t dev_handle) {
     for (int i = 0; i < g_device_count; i++) {
@@ -1416,6 +1517,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 /* Same architecture — Driver API worked */
                 uint64_t handle = alloc_handle();
                 hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+                /* Store a copy of the fat binary so REGISTER_FUNCTION can
+                 * extract PTX for cross-arch JIT if ever needed later. */
+                store_fatbin(handle, payload, req->payload_size);
                 return chidori_send_response(fd, req->seq_num, (int32_t)res, &handle, sizeof(handle));
             }
         }
@@ -1438,6 +1542,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 uint64_t handle = alloc_handle();
                 /* Tag bit 63 to mark this as a runtime handle */
                 hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
+                /* Store a copy of the fat binary so REGISTER_FUNCTION can
+                 * extract PTX for cross-arch JIT when cudaGetFuncBySymbol fails. */
+                store_fatbin(handle, payload, req->payload_size);
                 return chidori_send_response(fd, req->seq_num, 0, &handle, sizeof(handle));
             }
         }
@@ -1525,6 +1632,74 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 }
                 return chidori_send_response(fd, req->seq_num, (int32_t)res,
                                              resp_buf, 16 + np * 8);
+            }
+
+            /*
+             * cudaGetFuncBySymbol failed (error 209: cross-architecture fat binary
+             * could not be loaded by the runtime).  Fall back to PTX JIT via the
+             * Driver API:
+             *   1. Retrieve the stored fat binary for this module.
+             *   2. Scan entries for type == 1 (PTX text).
+             *   3. cuModuleLoadData(ptx) → Driver API JIT-compiles to host arch.
+             *   4. cuModuleGetFunction → real CUfunction.
+             *   5. cuFuncGetParamInfo → param layout returned to client.
+             */
+            {
+                size_t fb_size = 0;
+                void *fb_data = find_fatbin(mod_handle, &fb_size);
+                if (fb_data) {
+                    const char *ptx = extract_ptx_from_fatbin(fb_data, fb_size);
+                    if (ptx) {
+                        CUmodule ptx_mod = NULL;
+                        CUresult ptx_res = cuModuleLoadData(&ptx_mod, ptx);
+                        fprintf(stderr, "[cuda_dispatch] PTX JIT for '%s': cuModuleLoadData=%d mod=%p\n",
+                                func_name, (int)ptx_res, (void *)ptx_mod);
+                        if (ptx_res == CUDA_SUCCESS && ptx_mod) {
+                            CUfunction ptx_func = NULL;
+                            ptx_res = cuModuleGetFunction(&ptx_func, ptx_mod, func_name);
+                            fprintf(stderr, "[cuda_dispatch] PTX JIT cuModuleGetFunction('%s')=%d func=%p\n",
+                                    func_name, (int)ptx_res, (void *)ptx_func);
+                            if (ptx_res == CUDA_SUCCESS && ptx_func) {
+                                /* Update the stored function value to point at the real
+                                 * Driver API CUfunction (clear the runtime tag bit). */
+                                hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)ptx_func);
+
+                                struct { uint32_t offset; uint32_t size; } pinfo[64];
+                                int np = 0;
+                                for (int pi = 0; pi < 64; pi++) {
+                                    size_t off = 0, sz = 0;
+                                    CUresult pr = cuFuncGetParamInfo(ptx_func, pi, &off, &sz);
+                                    if (pr != CUDA_SUCCESS) break;
+                                    pinfo[np].offset = (uint32_t)off;
+                                    pinfo[np].size   = (uint32_t)sz;
+                                    np++;
+                                }
+                                int total_ps = 0;
+                                cuFuncGetAttribute(&total_ps, (CUfunction_attribute)74, ptx_func);
+                                if (total_ps <= 0 && np > 0)
+                                    total_ps = pinfo[np-1].offset + pinfo[np-1].size;
+
+                                uint8_t resp_buf[16 + 64 * 8];
+                                memcpy(resp_buf, &handle, 8);
+                                uint32_t tps32 = (uint32_t)total_ps;
+                                uint32_t np32  = (uint32_t)np;
+                                memcpy(resp_buf + 8,  &tps32, 4);
+                                memcpy(resp_buf + 12, &np32,  4);
+                                for (int pi = 0; pi < np; pi++) {
+                                    memcpy(resp_buf + 16 + pi * 8,     &pinfo[pi].offset, 4);
+                                    memcpy(resp_buf + 16 + pi * 8 + 4, &pinfo[pi].size,   4);
+                                }
+                                return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS,
+                                                             resp_buf, 16 + np * 8);
+                            }
+                            /* cuModuleGetFunction failed — unload the PTX module */
+                            if (ptx_mod) cuModuleUnload(ptx_mod);
+                        }
+                    }
+                } else {
+                    fprintf(stderr, "[cuda_dispatch] PTX fallback: no stored fat binary for mod_handle=0x%llx\n",
+                            (unsigned long long)mod_handle);
+                }
             }
 
             /* Fallback: no param info available */
