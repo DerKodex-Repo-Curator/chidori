@@ -23,22 +23,18 @@
 
 /* CUDA Runtime API internal functions — not in any public header but
  * exported by libcudart. Used for cross-architecture fat binary loading. */
-/* __cudaRegisterFunction has version-dependent signatures across CUDA versions.
- * We load all three registration functions via dlsym to avoid linker conflicts. */
+/* CUDA Runtime internal registration functions — loaded via dlsym at runtime
+ * to avoid type conflicts between CUDA versions (CUhostFn vs const char*). */
 #include <dlfcn.h>
-typedef void **(*cudaRegisterFatBinary_t)(void *);
-typedef void (*cudaRegisterFatBinaryEnd_t)(void **);
-typedef void (*cudaRegisterFunction_t)(void **, const void *, char *, const char *,
-    int, void *, void *, void *, void *, int *);
-static cudaRegisterFatBinary_t g_real_cudaRegisterFatBinary = NULL;
-static cudaRegisterFatBinaryEnd_t g_real_cudaRegisterFatBinaryEnd = NULL;
-static cudaRegisterFunction_t g_real_cudaRegisterFunction = NULL;
+static void *(*g_rt_RegisterFatBinary)(void *) = NULL;
+static void (*g_rt_RegisterFatBinaryEnd)(void **) = NULL;
+static void (*g_rt_RegisterFunction)(void **, ...) = NULL; /* variadic to avoid type issues */
 
 static void init_runtime_registration(void) {
-    if (!g_real_cudaRegisterFatBinary) {
-        g_real_cudaRegisterFatBinary = (cudaRegisterFatBinary_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinary");
-        g_real_cudaRegisterFatBinaryEnd = (cudaRegisterFatBinaryEnd_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinaryEnd");
-        g_real_cudaRegisterFunction = (cudaRegisterFunction_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
+    if (!g_rt_RegisterFatBinary) {
+        g_rt_RegisterFatBinary = dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinary");
+        g_rt_RegisterFatBinaryEnd = dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinaryEnd");
+        g_rt_RegisterFunction = dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
     }
 }
 
@@ -1382,11 +1378,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * Fall back to Runtime API which handles PTX JIT correctly. */
         {
             init_runtime_registration();
-            void **rt_handle = g_real_cudaRegisterFatBinary
-                ? g_real_cudaRegisterFatBinary(&wrapper) : NULL;
+            void **rt_handle = g_rt_RegisterFatBinary
+                ? (void **)g_rt_RegisterFatBinary(&wrapper) : NULL;
             if (rt_handle) {
-                if (g_real_cudaRegisterFatBinaryEnd)
-                    g_real_cudaRegisterFatBinaryEnd(rt_handle);
+                if (g_rt_RegisterFatBinaryEnd)
+                    g_rt_RegisterFatBinaryEnd(rt_handle);
                 uint64_t handle = alloc_handle();
                 /* Tag bit 63 to mark this as a runtime handle */
                 hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
@@ -1423,11 +1419,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             char *dummy_hostFun = &g_dummy_funcs[g_dummy_func_idx++ % 65536];
 
             /* Load __cudaRegisterFunction via dlsym if not yet loaded */
-            if (!g_real_cudaRegisterFunction) {
-                g_real_cudaRegisterFunction = (cudaRegisterFunction_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
+            if (!g_rt_RegisterFunction) {
+                g_rt_RegisterFunction = (cudaRegisterFunction_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
             }
-            if (g_real_cudaRegisterFunction) {
-                g_real_cudaRegisterFunction(rt_handle, dummy_hostFun, (char *)func_name,
+            if (g_rt_RegisterFunction) {
+                g_rt_RegisterFunction(rt_handle, dummy_hostFun, (char *)func_name,
                                             func_name, -1, NULL, NULL, NULL, NULL, NULL);
             }
 
