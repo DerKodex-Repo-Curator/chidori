@@ -17,17 +17,23 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 
 #include "chidori_protocol.h"
 #include "handle_map.h"
 
 /* CUDA Runtime API internal functions — not in any public header but
  * exported by libcudart. Used for cross-architecture fat binary loading. */
+/* These are CUDA Runtime internal functions — declared with compatible
+ * signatures to avoid conflicts with cuda_runtime.h on different CUDA versions. */
 extern void **__cudaRegisterFatBinary(void *fatCubin);
 extern void __cudaRegisterFatBinaryEnd(void **fatCubinHandle);
-extern void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
-    char *deviceFun, const char *deviceName, int thread_limit,
-    void *tid, void *bid, void *bDim, void *gDim, int *wSize);
+
+/* __cudaRegisterFunction has version-dependent signatures.
+ * We load it via dlsym to avoid linker conflicts. */
+typedef void (*cudaRegisterFunction_t)(void **, const void *, char *, const char *,
+    int, void *, void *, void *, void *, int *);
+static cudaRegisterFunction_t g_real_cudaRegisterFunction = NULL;
 
 /* Maximum number of GPUs we support */
 #define CHIDORI_MAX_DEVICES 16
@@ -1406,8 +1412,14 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             static int g_dummy_func_idx = 0;
             char *dummy_hostFun = &g_dummy_funcs[g_dummy_func_idx++ % 65536];
 
-            __cudaRegisterFunction(rt_handle, dummy_hostFun, (char *)func_name,
-                                   func_name, -1, NULL, NULL, NULL, NULL, NULL);
+            /* Load __cudaRegisterFunction via dlsym if not yet loaded */
+            if (!g_real_cudaRegisterFunction) {
+                g_real_cudaRegisterFunction = (cudaRegisterFunction_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
+            }
+            if (g_real_cudaRegisterFunction) {
+                g_real_cudaRegisterFunction(rt_handle, dummy_hostFun, (char *)func_name,
+                                            func_name, -1, NULL, NULL, NULL, NULL, NULL);
+            }
 
             /* Get the CUfunction via cuModuleGetFunction from a runtime-managed module.
              * The runtime should have created a module from the registered fat binary. */
@@ -1565,25 +1577,25 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     }
 
                     if (is_runtime_func && rt_hostFun) {
-                        /* Runtime API path: use cudaLaunchKernel with hostFun.
-                         * The param_buffer contains packed arguments — we need
-                         * to reconstruct void** kernelParams from the buffer.
-                         * For now, pass via the extra[] mechanism through cuLaunchKernel
-                         * on the underlying CUfunction obtained via cudaGetFuncBySymbol. */
-                        dim3 grid_dim = {gridX, gridY, gridZ};
-                        dim3 block_dim = {blockX, blockY, blockZ};
-                        /* cudaLaunchKernel takes void** args, not the extra[] buffer.
-                         * But we can use the internal __cudaLaunchKernel which may
-                         * accept the buffer. For now, try cuLaunchKernel with the
-                         * function resolved from the runtime. */
+                        /* Runtime API path: get CUfunction from the runtime's
+                         * hostFun via cudaGetFuncBySymbol, then launch with
+                         * CU_LAUNCH_PARAM_BUFFER_POINTER (same as Driver API). */
                         CUfunction rt_func = NULL;
-                        cuModuleGetFunction(&rt_func, NULL, NULL); /* won't work — placeholder */
-                        /* Actually: the runtime registered the function with hostFun.
-                         * We can call cudaLaunchKernel directly with the hostFun pointer. */
-                        res = (CUresult)cudaLaunchKernel(rt_hostFun,
-                            grid_dim, block_dim,
-                            NULL, /* args — need to reconstruct from param_buffer */
-                            shared, (cudaStream_t)stream);
+                        cudaError_t ge = cudaGetFuncBySymbol(&rt_func, rt_hostFun);
+                        if (ge == cudaSuccess && rt_func) {
+                            void *extra[] = {
+                                CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
+                                CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
+                                CU_LAUNCH_PARAM_END
+                            };
+                            res = cuLaunchKernel(rt_func,
+                                                 gridX, gridY, gridZ,
+                                                 blockX, blockY, blockZ,
+                                                 shared, stream,
+                                                 NULL, extra);
+                        } else {
+                            res = CUDA_ERROR_NOT_FOUND;
+                        }
                     } else {
                         void *extra[] = {
                             CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
