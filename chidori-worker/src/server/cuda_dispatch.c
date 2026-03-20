@@ -1603,6 +1603,8 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                         if (!rt_init_done) { cudaSetDevice(0); rt_init_done = 1; }
                         CUfunction rt_func = NULL;
                         cudaError_t ge = cudaGetFuncBySymbol(&rt_func, rt_hostFun);
+                        fprintf(stderr, "[cuda_dispatch] cudaGetFuncBySymbol(%p) = %d, func=%p\n",
+                                rt_hostFun, ge, (void*)rt_func);
                         if (ge == cudaSuccess && rt_func) {
                             void *extra[] = {
                                 CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
