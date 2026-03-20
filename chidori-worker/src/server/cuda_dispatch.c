@@ -1328,52 +1328,47 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_REGISTER_FAT_BINARY: {
-        /* Payload is raw fat binary data. Use cuModuleLoadDataEx with JIT
-         * options to enable PTX compilation for cross-architecture support.
-         * This allows sm_89 fat binaries (with PTX) to run on sm_120 GPUs. */
-        CUmodule mod;
-        /* Use __cudaRegisterFatBinary (Runtime API) which properly handles
-         * PTX JIT for cross-architecture fat binaries. The Driver API's
-         * cuModuleLoadData/cuModuleLoadFatBinary fail with error 209 when
-         * SASS doesn't match and PTX needs JIT on Blackwell (sm_120).
+        /*
+         * Use CUDA Runtime API (__cudaRegisterFatBinary) to load fat binaries.
+         * This is the same path native PyTorch uses and correctly handles
+         * PTX JIT for cross-architecture support (e.g., sm_89 → sm_120).
          *
-         * We reconstruct the __fatBinC_Wrapper struct that the runtime expects. */
-        {
-            struct { int magic; int version; const void *data; void *filename; } wrapper;
-            wrapper.magic = 0x466243b1;
-            wrapper.version = 1;
-            wrapper.data = payload;
-            wrapper.filename = NULL;
+         * The Driver API (cuModuleLoadData) fails with error 209 for
+         * cross-architecture fat binaries even when PTX is included.
+         *
+         * We reconstruct the __fatBinC_Wrapper struct and pass it to the
+         * Runtime API. The returned handle is stored for __cudaRegisterFunction.
+         */
+        struct { int magic; int version; const void *data; void *filename; } wrapper;
+        wrapper.magic = 0x466243b1;
+        wrapper.version = 1;
+        wrapper.data = payload;
+        wrapper.filename = NULL;
 
-            extern void **__cudaRegisterFatBinary(void *);
-            extern void __cudaUnregisterFatBinary(void **);
-            void **handle = __cudaRegisterFatBinary(&wrapper);
-            if (handle) {
-                /* Success — the runtime loaded the fat binary.
-                 * We need to get a CUmodule from it. Use cuModuleLoadData
-                 * which should now find the loaded module in the runtime's cache. */
-                res = cuModuleLoadData(&mod, payload);
-                if (res != CUDA_SUCCESS) {
-                    /* Fallback: try the other loaders */
-                    res = cuModuleLoadFatBinary(&mod, payload);
-                }
-                if (res != CUDA_SUCCESS) {
-                    res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
-                }
-            } else {
-                res = CUDA_ERROR_INVALID_IMAGE;
-            }
+        /* First: register with Runtime API for PTX JIT cross-architecture support */
+        void **rt_handle = __cudaRegisterFatBinary(&wrapper);
+        if (rt_handle) {
+            __cudaRegisterFatBinaryEnd(rt_handle);
+        }
+
+        /* Now load via Driver API — after runtime registration, the JIT cache
+         * should have the compiled code available for cuModuleLoadData. */
+        CUmodule mod = NULL;
+        res = cuModuleLoadData(&mod, payload);
+        if (res != CUDA_SUCCESS) {
+            res = cuModuleLoadFatBinary(&mod, payload);
         }
         if (res != CUDA_SUCCESS) {
-            fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: size=%u res=%d\n",
-                    req->payload_size, (int)res);
+            res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
         }
         if (res == CUDA_SUCCESS) {
             uint64_t handle = alloc_handle();
             hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
-            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+            return chidori_send_response(fd, req->seq_num, (int32_t)res, &handle, sizeof(handle));
         }
-        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+        fprintf(stderr, "[cuda_dispatch] fat binary load FAILED: size=%u res=%d\n",
+                req->payload_size, (int)res);
+        return chidori_send_response(fd, req->seq_num, (int32_t)res, NULL, 0);
     }
 
     case CHIDORI_CUDA_REGISTER_FUNCTION: {
