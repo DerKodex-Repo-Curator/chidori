@@ -17,23 +17,30 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <dlfcn.h>
 
 #include "chidori_protocol.h"
 #include "handle_map.h"
 
 /* CUDA Runtime API internal functions — not in any public header but
  * exported by libcudart. Used for cross-architecture fat binary loading. */
-/* These are CUDA Runtime internal functions — declared with compatible
- * signatures to avoid conflicts with cuda_runtime.h on different CUDA versions. */
-extern void **__cudaRegisterFatBinary(void *fatCubin);
-extern void __cudaRegisterFatBinaryEnd(void **fatCubinHandle);
-
-/* __cudaRegisterFunction has version-dependent signatures.
- * We load it via dlsym to avoid linker conflicts. */
+/* __cudaRegisterFunction has version-dependent signatures across CUDA versions.
+ * We load all three registration functions via dlsym to avoid linker conflicts. */
+#include <dlfcn.h>
+typedef void **(*cudaRegisterFatBinary_t)(void *);
+typedef void (*cudaRegisterFatBinaryEnd_t)(void **);
 typedef void (*cudaRegisterFunction_t)(void **, const void *, char *, const char *,
     int, void *, void *, void *, void *, int *);
+static cudaRegisterFatBinary_t g_real_cudaRegisterFatBinary = NULL;
+static cudaRegisterFatBinaryEnd_t g_real_cudaRegisterFatBinaryEnd = NULL;
 static cudaRegisterFunction_t g_real_cudaRegisterFunction = NULL;
+
+static void init_runtime_registration(void) {
+    if (!g_real_cudaRegisterFatBinary) {
+        g_real_cudaRegisterFatBinary = (cudaRegisterFatBinary_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinary");
+        g_real_cudaRegisterFatBinaryEnd = (cudaRegisterFatBinaryEnd_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinaryEnd");
+        g_real_cudaRegisterFunction = (cudaRegisterFunction_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
+    }
+}
 
 /* Maximum number of GPUs we support */
 #define CHIDORI_MAX_DEVICES 16
@@ -1374,9 +1381,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         /* Driver API failed (likely cross-architecture, error 209).
          * Fall back to Runtime API which handles PTX JIT correctly. */
         {
-            void **rt_handle = __cudaRegisterFatBinary(&wrapper);
+            init_runtime_registration();
+            void **rt_handle = g_real_cudaRegisterFatBinary
+                ? g_real_cudaRegisterFatBinary(&wrapper) : NULL;
             if (rt_handle) {
-                __cudaRegisterFatBinaryEnd(rt_handle);
+                if (g_real_cudaRegisterFatBinaryEnd)
+                    g_real_cudaRegisterFatBinaryEnd(rt_handle);
                 uint64_t handle = alloc_handle();
                 /* Tag bit 63 to mark this as a runtime handle */
                 hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));

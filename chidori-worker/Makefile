@@ -14,7 +14,7 @@ CUDA_PATH ?= /usr/local/cuda
 CUDA_CFLAGS = -I$(CUDA_PATH)/include
 CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcuda -lcudart -lcublas -lcublasLt -lcudnn
 
-LDFLAGS_SERVER = -lpthread $(CUDA_LDFLAGS)
+LDFLAGS_SERVER = -lpthread -ldl $(CUDA_LDFLAGS)
 LDFLAGS_CLIENT = -lpthread -ldl -shared
 
 BUILD_DIR = build
