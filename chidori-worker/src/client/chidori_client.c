@@ -4375,15 +4375,30 @@ static uint64_t lazy_register_function(int idx) {
             static CUresult (*real_cuModuleUnload)(CUmodule) = NULL;
             static int local_init = 0;
             if (!local_init) {
-                /* Use RTLD_NEXT to get the REAL CUDA driver functions
-                 * behind our LD_PRELOAD interception */
-                real_cuModuleLoadData = dlsym(RTLD_NEXT, "cuModuleLoadData");
-                real_cuModuleGetFunction = dlsym(RTLD_NEXT, "cuModuleGetFunction");
-                real_cuFuncGetParamInfo = dlsym(RTLD_NEXT, "cuFuncGetParamInfo");
-                real_cuFuncGetAttribute = dlsym(RTLD_NEXT, "cuFuncGetAttribute");
-                real_cuModuleUnload = dlsym(RTLD_NEXT, "cuModuleUnload");
-                LOG_DEBUG("Cross-arch param init: LoadData=%p GetFunc=%p ParamInfo=%p",
-                        real_cuModuleLoadData, real_cuModuleGetFunction, real_cuFuncGetParamInfo);
+                /* Load real NVIDIA driver in a separate namespace to avoid
+                 * SONAME collision with our LD_PRELOAD'd libcuda.so.1 */
+                const char *paths[] = {
+                    "/usr/lib/libcuda.so.1",
+                    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+                    "/usr/lib64/libcuda.so.1",
+                    NULL
+                };
+                for (int pi = 0; paths[pi]; pi++) {
+                    real_cuda = dlmopen(LM_ID_NEWLM, paths[pi], RTLD_LAZY);
+                    if (real_cuda) break;
+                }
+                if (real_cuda) {
+                    real_cuModuleLoadData = dlsym(real_cuda, "cuModuleLoadData");
+                    real_cuModuleGetFunction = dlsym(real_cuda, "cuModuleGetFunction");
+                    real_cuFuncGetParamInfo = dlsym(real_cuda, "cuFuncGetParamInfo");
+                    real_cuFuncGetAttribute = dlsym(real_cuda, "cuFuncGetAttribute");
+                    real_cuModuleUnload = dlsym(real_cuda, "cuModuleUnload");
+                    /* Initialize the driver in the new namespace */
+                    CUresult (*real_cuInit)(unsigned int) = dlsym(real_cuda, "cuInit");
+                    if (real_cuInit) real_cuInit(0);
+                }
+                LOG_DEBUG("Cross-arch param init: handle=%p LoadData=%p ParamInfo=%p",
+                        real_cuda, (void*)real_cuModuleLoadData, (void*)real_cuFuncGetParamInfo);
                 local_init = 1;
             }
             if (real_cuModuleLoadData && real_cuModuleGetFunction && real_cuFuncGetParamInfo) {
