@@ -21,6 +21,14 @@
 #include "chidori_protocol.h"
 #include "handle_map.h"
 
+/* CUDA Runtime API internal functions — not in any public header but
+ * exported by libcudart. Used for cross-architecture fat binary loading. */
+extern void **__cudaRegisterFatBinary(void *fatCubin);
+extern void __cudaRegisterFatBinaryEnd(void **fatCubinHandle);
+extern void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
+    char *deviceFun, const char *deviceName, int thread_limit,
+    void *tid, void *bid, void *bDim, void *gDim, int *wSize);
+
 /* Maximum number of GPUs we support */
 #define CHIDORI_MAX_DEVICES 16
 
