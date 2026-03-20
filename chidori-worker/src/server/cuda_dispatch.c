@@ -658,10 +658,14 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         memcpy(&shared, p, 4); p += 4;
         memcpy(&stream_handle, p, 8); p += 8;
 
-        CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
-        if (!func) {
+        uint64_t func_val = hmap_get(&g_functions, func_handle);
+        if (!func_val) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
         }
+        int is_runtime_func = (func_val >> 63) & 1;
+        CUfunction func = is_runtime_func ? NULL : (CUfunction)(uintptr_t)func_val;
+        const void *rt_hostFun = is_runtime_func
+            ? (const void *)(uintptr_t)(func_val & ~(1ULL << 63)) : NULL;
 
         /* Grid with any zero dimension = empty launch (no-op) */
         if (gridX == 0 || gridY == 0 || gridZ == 0) {
@@ -1418,10 +1422,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             static int g_dummy_func_idx = 0;
             char *dummy_hostFun = &g_dummy_funcs[g_dummy_func_idx++ % 65536];
 
-            /* Load __cudaRegisterFunction via dlsym if not yet loaded */
-            if (!g_rt_RegisterFunction) {
-                g_rt_RegisterFunction = (cudaRegisterFunction_t)dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
-            }
+            init_runtime_registration();
             if (g_rt_RegisterFunction) {
                 g_rt_RegisterFunction(rt_handle, dummy_hostFun, (char *)func_name,
                                             func_name, -1, NULL, NULL, NULL, NULL, NULL);
@@ -1539,10 +1540,14 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         memcpy(&shared, p, 4); p += 4;
         memcpy(&stream_handle, p, 8); p += 8;
 
-        CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
-        if (!func) {
+        uint64_t func_val = hmap_get(&g_functions, func_handle);
+        if (!func_val) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
         }
+        int is_runtime_func = (func_val >> 63) & 1;
+        CUfunction func = is_runtime_func ? NULL : (CUfunction)(uintptr_t)func_val;
+        const void *rt_hostFun = is_runtime_func
+            ? (const void *)(uintptr_t)(func_val & ~(1ULL << 63)) : NULL;
 
         /* Grid with any zero dimension = empty launch (no-op) */
         if (gridX == 0 || gridY == 0 || gridZ == 0) {
