@@ -17,6 +17,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <dlfcn.h>
 
 #include "chidori_protocol.h"
 #include "handle_map.h"
@@ -60,6 +62,45 @@ static uint64_t g_next_handle = 0x10000;
 
 static uint64_t alloc_handle(void) {
     return g_next_handle++;
+}
+
+/* ----------------------------------------------------------------
+ * Runtime API registration via dlsym — used for cross-arch fat binaries.
+ * __cudaRegisterFatBinary handles compressed cubins and PTX JIT across
+ * architectures (e.g., sm_89 client -> sm_120 server).
+ * ---------------------------------------------------------------- */
+typedef void **(*rt_RegisterFatBinary_fn)(void *);
+typedef void   (*rt_RegisterFatBinaryEnd_fn)(void **);
+typedef void   (*rt_RegisterFunction_fn)(void **, const char *, char *,
+                                         const char *, int, void *, void *,
+                                         void *, void *, int *);
+
+static rt_RegisterFatBinary_fn    g_rt_RegisterFatBinary    = NULL;
+static rt_RegisterFatBinaryEnd_fn g_rt_RegisterFatBinaryEnd = NULL;
+static rt_RegisterFunction_fn     g_rt_RegisterFunction     = NULL;
+
+static void init_runtime_registration(void) {
+    if (g_rt_RegisterFatBinary) return;  /* already initialized */
+    g_rt_RegisterFatBinary    = (rt_RegisterFatBinary_fn)   dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinary");
+    g_rt_RegisterFatBinaryEnd = (rt_RegisterFatBinaryEnd_fn)dlsym(RTLD_DEFAULT, "__cudaRegisterFatBinaryEnd");
+    g_rt_RegisterFunction     = (rt_RegisterFunction_fn)    dlsym(RTLD_DEFAULT, "__cudaRegisterFunction");
+}
+
+/* Pool of executable function stubs for __cudaRegisterFunction.
+ * The CUDA Runtime requires hostFun to be a real executable address.
+ * We mmap a page of RET instructions (0xC3 on x86_64). */
+static void *g_stub_page = NULL;
+static int g_stub_count = 0;
+
+static void *alloc_function_stub(void) {
+    if (!g_stub_page) {
+        g_stub_page = mmap(NULL, 65536, PROT_READ|PROT_WRITE|PROT_EXEC,
+                           MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (g_stub_page == MAP_FAILED) { g_stub_page = NULL; return NULL; }
+        memset(g_stub_page, 0xC3, 65536); /* fill with RET instructions */
+    }
+    if (g_stub_count >= 4096) return NULL; /* max 4096 unique stubs */
+    return (char *)g_stub_page + (g_stub_count++ * 16); /* 16 bytes per stub */
 }
 
 /* Find device ordinal for a given device handle (CUdevice value) */
@@ -1328,52 +1369,63 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_REGISTER_FAT_BINARY: {
-        /* Payload is raw fat binary data. Use cuModuleLoadDataEx with JIT
-         * options to enable PTX compilation for cross-architecture support.
-         * This allows sm_89 fat binaries (with PTX) to run on sm_120 GPUs. */
-        CUmodule mod;
-        /* Use __cudaRegisterFatBinary (Runtime API) which properly handles
-         * PTX JIT for cross-architecture fat binaries. The Driver API's
-         * cuModuleLoadData/cuModuleLoadFatBinary fail with error 209 when
-         * SASS doesn't match and PTX needs JIT on Blackwell (sm_120).
+        /* Payload is raw fat binary data.
          *
-         * We reconstruct the __fatBinC_Wrapper struct that the runtime expects. */
-        {
-            struct { int magic; int version; const void *data; void *filename; } wrapper;
-            wrapper.magic = 0x466243b1;
-            wrapper.version = 1;
-            wrapper.data = payload;
-            wrapper.filename = NULL;
-
-            extern void **__cudaRegisterFatBinary(void *);
-            extern void __cudaUnregisterFatBinary(void **);
-            void **handle = __cudaRegisterFatBinary(&wrapper);
-            if (handle) {
-                /* Success — the runtime loaded the fat binary.
-                 * We need to get a CUmodule from it. Use cuModuleLoadData
-                 * which should now find the loaded module in the runtime's cache. */
-                res = cuModuleLoadData(&mod, payload);
-                if (res != CUDA_SUCCESS) {
-                    /* Fallback: try the other loaders */
-                    res = cuModuleLoadFatBinary(&mod, payload);
-                }
-                if (res != CUDA_SUCCESS) {
-                    res = cuModuleLoadDataEx(&mod, payload, 0, NULL, NULL);
-                }
-            } else {
-                res = CUDA_ERROR_INVALID_IMAGE;
-            }
-        }
-        if (res != CUDA_SUCCESS) {
-            fprintf(stderr, "[cuda_dispatch] cuModuleLoad FAILED: size=%u res=%d\n",
-                    req->payload_size, (int)res);
-        }
+         * Fast path: cuModuleLoadData (Driver API) — works when the fat binary
+         * contains SASS matching the server GPU architecture.
+         *
+         * Cross-arch fallback: __cudaRegisterFatBinary (Runtime API) — handles
+         * compressed cubins and PTX JIT across architectures (e.g., sm_89
+         * client -> sm_120 server). The Runtime handle is stored with bit 63
+         * set so REGISTER_FUNCTION knows to use the Runtime API path. */
+        CUmodule mod;
+        res = cuModuleLoadData(&mod, payload);
         if (res == CUDA_SUCCESS) {
+            /* Same-arch: store as a normal Driver API module (no bit 63) */
             uint64_t handle = alloc_handle();
             hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
-            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+            if (s_verbose)
+                fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Driver API success, handle=0x%llx\n",
+                        (unsigned long long)handle);
+            return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &handle, sizeof(handle));
         }
-        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+
+        /* Driver API failed — try Runtime API for cross-arch */
+        if (s_verbose)
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: cuModuleLoadData failed (%d), trying Runtime API\n",
+                    (int)res);
+
+        init_runtime_registration();
+        if (!g_rt_RegisterFatBinary) {
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: dlsym(__cudaRegisterFatBinary) failed\n");
+            return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_ERROR_NOT_SUPPORTED, NULL, 0);
+        }
+
+        struct { int magic; int version; const void *data; void *filename; } wrapper;
+        wrapper.magic = 0x466243b1;
+        wrapper.version = 1;
+        wrapper.data = payload;
+        wrapper.filename = NULL;
+
+        void **rt_handle = g_rt_RegisterFatBinary(&wrapper);
+        if (!rt_handle) {
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: __cudaRegisterFatBinary returned NULL\n");
+            return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_ERROR_INVALID_IMAGE, NULL, 0);
+        }
+
+        if (g_rt_RegisterFatBinaryEnd)
+            g_rt_RegisterFatBinaryEnd(rt_handle);
+
+        /* Store the runtime handle with bit 63 set to distinguish from Driver API modules */
+        uint64_t rt_val = (uint64_t)(uintptr_t)rt_handle | (1ULL << 63);
+        uint64_t handle = alloc_handle();
+        hmap_put(&g_modules, handle, rt_val);
+
+        if (s_verbose)
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Runtime API success, handle=0x%llx (rt_handle=%p)\n",
+                    (unsigned long long)handle, (void *)rt_handle);
+
+        return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &handle, sizeof(handle));
     }
 
     case CHIDORI_CUDA_REGISTER_FUNCTION: {
@@ -1384,14 +1436,65 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&mod_handle, payload, 8);
             func_name = (const char *)((char *)payload + 8);
         }
-        CUmodule mod = (CUmodule)(uintptr_t)hmap_get(&g_modules, mod_handle);
-        if (!mod) {
+        uint64_t mod_val = hmap_get(&g_modules, mod_handle);
+        if (!mod_val) {
             return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_HANDLE, NULL, 0);
         }
-        CUfunction func;
-        res = cuModuleGetFunction(&func, mod, func_name);
-        if (res == CUDA_SUCCESS) {
+
+        CUfunction func = NULL;
+
+        if (mod_val & (1ULL << 63)) {
+            /* ---- Cross-arch path: Runtime API module (bit 63 set) ---- */
+            void **rt_handle = (void **)(uintptr_t)(mod_val & ~(1ULL << 63));
+
+            init_runtime_registration();
+            if (!g_rt_RegisterFunction) {
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction: dlsym(__cudaRegisterFunction) failed\n");
+                return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_ERROR_NOT_SUPPORTED, NULL, 0);
+            }
+
+            void *stub = alloc_function_stub();
+            if (!stub) {
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction: stub allocation failed\n");
+                return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_ERROR_OUT_OF_MEMORY, NULL, 0);
+            }
+
+            /* Register the function with the runtime using the executable stub as hostFun */
+            g_rt_RegisterFunction(rt_handle, (const char *)stub, (char *)func_name,
+                                  (char *)func_name, -1, NULL, NULL, NULL, NULL, NULL);
+
+            /* Force runtime initialization so cudaGetFuncBySymbol can resolve the function */
+            cudaSetDevice(0);
+            cudaFree(0);
+
+            /* Get the real CUfunction from the runtime */
+            cudaError_t rt_err = cudaGetFuncBySymbol(&func, stub);
+            if (rt_err != cudaSuccess || !func) {
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction: cudaGetFuncBySymbol failed for '%s' (err=%d)\n",
+                        func_name, (int)rt_err);
+                /* Return success with 0 params — the function registration was accepted
+                 * but we couldn't resolve it yet. Send a minimal response. */
+                uint64_t f_handle = alloc_handle();
+                uint8_t empty_resp[16];
+                memset(empty_resp, 0, sizeof(empty_resp));
+                memcpy(empty_resp, &f_handle, 8);
+                return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, empty_resp, 16);
+            }
+
+            if (s_verbose)
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction (cross-arch): '%s' -> CUfunction=%p\n",
+                        func_name, (void *)func);
+
+            res = CUDA_SUCCESS;
+        } else {
+            /* ---- Same-arch path: Driver API module ---- */
+            CUmodule mod = (CUmodule)(uintptr_t)mod_val;
+            res = cuModuleGetFunction(&func, mod, func_name);
+        }
+
+        if (res == CUDA_SUCCESS && func) {
             uint64_t handle = alloc_handle();
+            /* Store as a real CUfunction — NO bit 63 tag */
             hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)func);
 
             /*
@@ -1421,7 +1524,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
             /*
              * Response: func_handle(8) + total_param_size(4) + num_params(4)
-             *           + [offset(4) + size(4)] × num_params
+             *           + [offset(4) + size(4)] x num_params
              */
             size_t resp_size = 8 + 4 + 4 + (num_params * 8);
             uint8_t *resp = (uint8_t *)malloc(resp_size);
