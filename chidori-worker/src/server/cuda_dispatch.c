@@ -1484,7 +1484,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             static int rt_param_init = 0;
             if (!rt_param_init) { cudaSetDevice(0); cudaFree(0); rt_param_init = 1; }
             CUfunction rt_func = NULL;
-            cudaGetFuncBySymbol(&rt_func, dummy_hostFun);
+            cudaError_t gfbs_err = cudaGetFuncBySymbol(&rt_func, dummy_hostFun);
+            fprintf(stderr, "[cuda_dispatch] REGISTER_FUNC rt: name='%s' hostFun=%p "
+                    "cudaGetFuncBySymbol=%d rt_func=%p\n",
+                    func_name, dummy_hostFun, gfbs_err, (void*)rt_func);
 
             if (rt_func) {
                 /* Got a real CUfunction — query param layout */
