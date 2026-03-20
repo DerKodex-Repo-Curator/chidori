@@ -1383,7 +1383,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * Initialize CUDA Runtime first (needed for fat binary JIT). */
         {
             static int rt_initialized = 0;
-            if (!rt_initialized) { cudaSetDevice(0); rt_initialized = 1; }
+            if (!rt_initialized) {
+                cudaSetDevice(0);
+                cudaFree(0); /* Force full CUDA Runtime initialization */
+                rt_initialized = 1;
+            }
             init_runtime_registration();
             void **rt_handle = g_rt_RegisterFatBinary
                 ? (void **)g_rt_RegisterFatBinary(&wrapper) : NULL;
