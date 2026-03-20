@@ -4375,8 +4375,10 @@ static uint64_t lazy_register_function(int idx) {
             static CUresult (*real_cuModuleUnload)(CUmodule) = NULL;
             static int local_init = 0;
             if (!local_init) {
-                real_cuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+                /* Open the REAL NVIDIA driver (not our LD_PRELOAD'd one) */
+                real_cuda = dlopen("/usr/lib/libcuda.so.1", RTLD_LAZY);
                 if (!real_cuda) real_cuda = dlopen("/usr/lib/x86_64-linux-gnu/libcuda.so.1", RTLD_LAZY);
+                if (!real_cuda) real_cuda = dlopen("/usr/lib64/libcuda.so.1", RTLD_LAZY);
                 if (real_cuda) {
                     real_cuModuleLoadData = dlsym(real_cuda, "cuModuleLoadData");
                     real_cuModuleGetFunction = dlsym(real_cuda, "cuModuleGetFunction");
