@@ -695,34 +695,66 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
                 if (buf_size > 0 && remaining >= buf_size) {
                     void *param_buffer = p;
+                    size_t param_size = (size_t)buf_size;
 
-                    /* Use actual kernel param size, not client buffer size */
-                    int actual_ps = 0;
-                    cuFuncGetAttribute(&actual_ps, (CUfunction_attribute)74, func); /* PARAM_SIZE */
-                    size_t param_size = (actual_ps > 0) ? (size_t)actual_ps : (size_t)buf_size;
-
-                    void *extra[] = {
-                        CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
-                        CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
-                        CU_LAUNCH_PARAM_END
-                    };
-
-                    res = cuLaunchKernel(func,
-                                         gridX, gridY, gridZ,
-                                         blockX, blockY, blockZ,
-                                         shared, stream,
-                                         NULL, extra);
+                    if (is_runtime_func && rt_hostFun) {
+                        /* Cross-arch: get CUfunction via cudaGetFuncBySymbol */
+                        static int rt_init_done_drv = 0;
+                        if (!rt_init_done_drv) { cudaSetDevice(0); cudaFree(0); rt_init_done_drv = 1; }
+                        CUfunction rt_func = NULL;
+                        cudaGetFuncBySymbol(&rt_func, rt_hostFun);
+                        if (rt_func) {
+                            int actual_ps = 0;
+                            cuFuncGetAttribute(&actual_ps, (CUfunction_attribute)74, rt_func);
+                            if (actual_ps > 0) param_size = (size_t)actual_ps;
+                            void *extra[] = {
+                                CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
+                                CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
+                                CU_LAUNCH_PARAM_END
+                            };
+                            res = cuLaunchKernel(rt_func, gridX, gridY, gridZ,
+                                                 blockX, blockY, blockZ,
+                                                 shared, stream, NULL, extra);
+                        } else {
+                            res = CUDA_ERROR_NOT_FOUND;
+                        }
+                    } else {
+                        /* Same-arch: use Driver API CUfunction directly */
+                        int actual_ps = 0;
+                        cuFuncGetAttribute(&actual_ps, (CUfunction_attribute)74, func);
+                        if (actual_ps > 0) param_size = (size_t)actual_ps;
+                        void *extra[] = {
+                            CU_LAUNCH_PARAM_BUFFER_POINTER, param_buffer,
+                            CU_LAUNCH_PARAM_BUFFER_SIZE, &param_size,
+                            CU_LAUNCH_PARAM_END
+                        };
+                        res = cuLaunchKernel(func, gridX, gridY, gridZ,
+                                             blockX, blockY, blockZ,
+                                             shared, stream, NULL, extra);
+                    }
                     return chidori_send_response(fd, req->seq_num, res, NULL, 0);
                 }
             }
         }
 
         /* No parameters — launch with NULL */
-        res = cuLaunchKernel(func,
-                             gridX, gridY, gridZ,
-                             blockX, blockY, blockZ,
-                             shared, stream,
-                             NULL, NULL);
+        if (is_runtime_func && rt_hostFun) {
+            static int rt_init_done_drv2 = 0;
+            if (!rt_init_done_drv2) { cudaSetDevice(0); cudaFree(0); rt_init_done_drv2 = 1; }
+            CUfunction rt_func = NULL;
+            cudaGetFuncBySymbol(&rt_func, rt_hostFun);
+            if (rt_func) {
+                res = cuLaunchKernel(rt_func, gridX, gridY, gridZ,
+                                     blockX, blockY, blockZ,
+                                     shared, stream, NULL, NULL);
+            } else {
+                res = CUDA_ERROR_NOT_FOUND;
+            }
+        } else {
+            res = cuLaunchKernel(func, gridX, gridY, gridZ,
+                                 blockX, blockY, blockZ,
+                                 shared, stream, NULL, NULL);
+        }
 
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -734,9 +766,16 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&attrib, payload, 4);
             memcpy(&func_handle, (char *)payload + 4, 8);
         }
-        CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
+        uint64_t fval = hmap_get(&g_functions, func_handle);
+        int is_rt = (fval >> 63) & 1;
+        CUfunction func = is_rt ? NULL : (CUfunction)(uintptr_t)fval;
         int value = 0;
-        if (func) {
+        if (is_rt) {
+            /* Runtime-registered func (cross-arch): return sensible defaults */
+            if (attrib == CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK) value = 1024;
+            else if (attrib == CU_FUNC_ATTRIBUTE_NUM_REGS) value = 32;
+            res = CUDA_SUCCESS;
+        } else if (func) {
             res = cuFuncGetAttribute(&value, (CUfunction_attribute)attrib, func);
         } else {
             res = CUDA_ERROR_INVALID_HANDLE;
@@ -1287,9 +1326,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         uint64_t func_handle = 0;
         memcpy(&func_handle, payload, 8);
-        CUfunction func = (CUfunction)(uintptr_t)hmap_get(&g_functions, func_handle);
-        if (!func) {
-            /* Unknown handle — return defaults */
+        uint64_t func_val = hmap_get(&g_functions, func_handle);
+        int is_rt_func = (func_val >> 63) & 1;
+        CUfunction func = is_rt_func ? NULL : (CUfunction)(uintptr_t)func_val;
+        if (!func_val || is_rt_func) {
+            /* Unknown or runtime-registered handle — return defaults */
             int mtp = 1024;
             memcpy(attr_buf + 24, &mtp, 4);
             return chidori_send_response(fd, req->seq_num, (int32_t)cudaSuccess, attr_buf, sizeof(attr_buf));
