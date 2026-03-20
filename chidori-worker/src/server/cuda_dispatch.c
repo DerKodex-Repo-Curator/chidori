@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 
 #include "chidori_protocol.h"
 #include "handle_map.h"
@@ -197,10 +198,20 @@ static const char *extract_ptx_from_fatbin(const void *fb, size_t fb_size, uint3
 
         /* ELF entry matching server's SM version — can be loaded by cuModuleLoadData */
         if (entry_type == 2 && sm_ver == target_sm) {
-            const char *elf = (const char *)(ep + entry_hdr_size);
-            fprintf(stderr, "[ptx_extract] found ELF entry for sm_%u: size=%llu\n",
-                    (unsigned)sm_ver, (unsigned long long)actual_data_len);
-            return elf;
+            const uint8_t *elf = ep + entry_hdr_size;
+            /* Skip compression header if present — look for ELF magic \x7fELF */
+            size_t skip = 0;
+            for (size_t si = 0; si < 16 && si < actual_data_len - 4; si++) {
+                if (elf[si] == 0x7f && elf[si+1] == 'E' && elf[si+2] == 'L' && elf[si+3] == 'F') {
+                    skip = si;
+                    break;
+                }
+            }
+            fprintf(stderr, "[ptx_extract] found ELF entry for sm_%u: size=%llu skip=%zu "
+                    "elf_magic=%02x%02x%02x%02x\n",
+                    (unsigned)sm_ver, (unsigned long long)actual_data_len, skip,
+                    elf[skip], elf[skip+1], elf[skip+2], elf[skip+3]);
+            return (const char *)(elf + skip);
         }
 
         pos += entry_hdr_size + actual_data_len;
@@ -1604,11 +1615,26 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         if (is_runtime_handle) {
             /* Runtime API path: use __cudaRegisterFunction with a dummy hostFun.
-             * Allocate a unique dummy pointer for each function. */
+             * Must use a real executable function pointer — the CUDA Runtime
+             * validates that hostFun points to executable memory. */
             void **rt_handle = (void **)(uintptr_t)(mod_val & ~(1ULL << 63));
-            static char g_dummy_funcs[65536]; /* pool of unique addresses */
-            static int g_dummy_func_idx = 0;
-            char *dummy_hostFun = &g_dummy_funcs[g_dummy_func_idx++ % 65536];
+            /* Use mmap to create executable dummy function pages */
+            static void *g_exec_page = NULL;
+            static int g_exec_offset = 0;
+            if (!g_exec_page) {
+                g_exec_page = mmap(NULL, 65536, PROT_READ|PROT_WRITE|PROT_EXEC,
+                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                if (g_exec_page != MAP_FAILED) {
+                    /* Fill with RET instructions (0xC3 on x86_64) */
+                    memset(g_exec_page, 0xC3, 65536);
+                }
+            }
+            char *dummy_hostFun = (g_exec_page && g_exec_page != MAP_FAILED)
+                ? (char *)g_exec_page + (g_exec_offset++ * 16 % 65536)
+                : NULL;
+            if (!dummy_hostFun) {
+                return chidori_send_response(fd, req->seq_num, CUDA_ERROR_UNKNOWN, NULL, 0);
+            }
 
             init_runtime_registration();
             if (g_rt_RegisterFunction) {
@@ -1624,6 +1650,15 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
              * Force lazy compilation by calling cudaFuncGetAttributes first. */
             static int rt_param_init = 0;
             if (!rt_param_init) { cudaSetDevice(0); cudaFree(0); rt_param_init = 1; }
+
+            /* Try launching with zero grid to trigger lazy resolution */
+            {
+                dim3 zero_grid = {0, 0, 0};
+                dim3 one_block = {1, 1, 1};
+                cudaError_t launch_err = cudaLaunchKernel(dummy_hostFun,
+                    zero_grid, one_block, NULL, 0, 0);
+                fprintf(stderr, "[cuda_dispatch] test cudaLaunchKernel(dummy)=%d\n", launch_err);
+            }
 
             /* Trigger lazy JIT compilation */
             struct cudaFuncAttributes fattr;
@@ -1686,18 +1721,31 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     cuDeviceGetAttribute(&dev_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, g_devices[0]);
                     cuDeviceGetAttribute(&dev_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, g_devices[0]);
                     uint32_t server_sm = dev_major * 10 + dev_minor;
-                    const char *ptx = extract_ptx_from_fatbin(fb_data, fb_size, server_sm);
-                    if (ptx) {
-                        CUmodule ptx_mod = NULL;
-                        CUresult ptx_res = cuModuleLoadData(&ptx_mod, ptx);
-                        fprintf(stderr, "[cuda_dispatch] PTX JIT for '%s': cuModuleLoadData=%d mod=%p\n",
-                                func_name, (int)ptx_res, (void *)ptx_mod);
-                        if (ptx_res == CUDA_SUCCESS && ptx_mod) {
-                            CUfunction ptx_func = NULL;
-                            ptx_res = cuModuleGetFunction(&ptx_func, ptx_mod, func_name);
-                            fprintf(stderr, "[cuda_dispatch] PTX JIT cuModuleGetFunction('%s')=%d func=%p\n",
-                                    func_name, (int)ptx_res, (void *)ptx_func);
-                            if (ptx_res == CUDA_SUCCESS && ptx_func) {
+                    /* Use CUDA 12+ Library API to load fat binary — handles
+                     * the 0xba55ed50 wrapper format and decompresses entries */
+                    CUlibrary lib = NULL;
+                    CUresult ptx_res = cuLibraryLoadData(&lib, fb_data, NULL, NULL, 0,
+                                                          NULL, NULL, 0);
+                    fprintf(stderr, "[cuda_dispatch] cuLibraryLoadData=%d lib=%p\n",
+                            (int)ptx_res, (void *)lib);
+
+                    CUfunction ptx_func = NULL;
+                    CUmodule ptx_mod = NULL;
+                    if (ptx_res == CUDA_SUCCESS && lib) {
+                        CUkernel kernel = NULL;
+                        ptx_res = cuLibraryGetKernel(&kernel, lib, func_name);
+                        fprintf(stderr, "[cuda_dispatch] cuLibraryGetKernel('%s')=%d kernel=%p\n",
+                                func_name, (int)ptx_res, (void *)kernel);
+                        if (ptx_res == CUDA_SUCCESS && kernel) {
+                            ptx_res = cuKernelGetFunction(&ptx_func, kernel);
+                            fprintf(stderr, "[cuda_dispatch] cuKernelGetFunction=%d func=%p\n",
+                                    (int)ptx_res, (void *)ptx_func);
+                        }
+                    }
+
+                    if (1) { /* scope block */(void)0;
+                        if (ptx_res == CUDA_SUCCESS && ptx_func) {
+                            {
                                 /* Update the stored function value to point at the real
                                  * Driver API CUfunction (clear the runtime tag bit). */
                                 hmap_put(&g_functions, handle, (uint64_t)(uintptr_t)ptx_func);
