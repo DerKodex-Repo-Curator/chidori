@@ -4364,70 +4364,33 @@ static uint64_t lazy_register_function(int idx) {
             memcpy(&g_registered_functions[idx].params[i].size, resp_buf + 16 + i * 8 + 4, 4);
         }
 
-        /* Cross-arch fallback: if server returned 0 params, query locally.
-         * The local GPU can load same-arch fat binaries to get param info. */
-        if (g_registered_functions[idx].num_params == 0 &&
-            g_fat_binaries[fb_idx].data != NULL) {
-            static void *real_cuda = NULL;
-            static CUresult (*real_cuModuleLoadData)(CUmodule *, const void *) = NULL;
-            static CUresult (*real_cuModuleGetFunction)(CUfunction *, CUmodule, const char *) = NULL;
-            static CUresult (*real_cuFuncGetParamInfo)(CUfunction, size_t, size_t *, size_t *) = NULL;
-            static CUresult (*real_cuFuncGetAttribute)(int *, int, CUfunction) = NULL;
-            static CUresult (*real_cuModuleUnload)(CUmodule) = NULL;
-            static int local_init = 0;
-            if (!local_init) {
-                /* Load real NVIDIA driver in a separate namespace to avoid
-                 * SONAME collision with our LD_PRELOAD'd libcuda.so.1 */
-                const char *paths[] = {
-                    "/usr/lib/libcuda.so.1",
-                    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
-                    "/usr/lib64/libcuda.so.1",
-                    NULL
-                };
-                for (int pi = 0; paths[pi]; pi++) {
-                    real_cuda = dlmopen(LM_ID_NEWLM, paths[pi], RTLD_LAZY);
-                    if (real_cuda) break;
+        /* Cross-arch fallback: if server returned 0 params, query via
+         * a secondary RPC to the server asking it to load the module with
+         * Driver API (cuModuleLoadDataEx with JIT options) to get params. */
+        if (g_registered_functions[idx].num_params == 0) {
+            /* Send CHIDORI_CUDA_QUERY_PARAM_INFO RPC: asks server to try
+             * cuModuleLoadDataEx with PTX JIT to get param layout */
+            size_t qpay_len = 8 + name_len;  /* func_handle + name */
+            void *qpay = malloc(qpay_len);
+            memcpy(qpay, &func_h, 8);
+            memcpy((char*)qpay + 8, name, name_len);
+            uint8_t qresp[8 + 64 * 8];
+            size_t qresp_len = sizeof(qresp);
+            chidori_rpc(CHIDORI_CUDA_QUERY_PARAM_INFO, qpay, qpay_len, qresp, &qresp_len);
+            free(qpay);
+
+            uint32_t qtps = 0, qnp = 0;
+            memcpy(&qtps, qresp, 4);
+            memcpy(&qnp, qresp + 4, 4);
+            if (qnp > 0 && qnp <= MAX_KERNEL_PARAMS) {
+                g_registered_functions[idx].total_param_size = qtps;
+                g_registered_functions[idx].num_params = qnp;
+                for (int pi = 0; pi < (int)qnp; pi++) {
+                    memcpy(&g_registered_functions[idx].params[pi].offset, qresp + 8 + pi * 8, 4);
+                    memcpy(&g_registered_functions[idx].params[pi].size, qresp + 8 + pi * 8 + 4, 4);
                 }
-                if (real_cuda) {
-                    real_cuModuleLoadData = dlsym(real_cuda, "cuModuleLoadData");
-                    real_cuModuleGetFunction = dlsym(real_cuda, "cuModuleGetFunction");
-                    real_cuFuncGetParamInfo = dlsym(real_cuda, "cuFuncGetParamInfo");
-                    real_cuFuncGetAttribute = dlsym(real_cuda, "cuFuncGetAttribute");
-                    real_cuModuleUnload = dlsym(real_cuda, "cuModuleUnload");
-                    /* Initialize the driver in the new namespace */
-                    CUresult (*real_cuInit)(unsigned int) = dlsym(real_cuda, "cuInit");
-                    if (real_cuInit) real_cuInit(0);
-                }
-                LOG_DEBUG("Cross-arch param init: handle=%p LoadData=%p ParamInfo=%p",
-                        real_cuda, (void*)real_cuModuleLoadData, (void*)real_cuFuncGetParamInfo);
-                local_init = 1;
-            }
-            if (real_cuModuleLoadData && real_cuModuleGetFunction && real_cuFuncGetParamInfo) {
-                CUmodule local_mod = NULL;
-                if (real_cuModuleLoadData(&local_mod, g_fat_binaries[fb_idx].data) == 0 && local_mod) {
-                    CUfunction local_func = NULL;
-                    if (real_cuModuleGetFunction(&local_func, local_mod, name) == 0 && local_func) {
-                        int local_np = 0;
-                        for (int pi = 0; pi < MAX_KERNEL_PARAMS; pi++) {
-                            size_t off = 0, sz = 0;
-                            if (real_cuFuncGetParamInfo(local_func, pi, &off, &sz) != 0) break;
-                            g_registered_functions[idx].params[local_np].offset = (int32_t)off;
-                            g_registered_functions[idx].params[local_np].size = (int32_t)sz;
-                            local_np++;
-                        }
-                        g_registered_functions[idx].num_params = local_np;
-                        int local_tps = 0;
-                        if (real_cuFuncGetAttribute)
-                            real_cuFuncGetAttribute(&local_tps, 74, local_func);
-                        if (local_tps <= 0 && local_np > 0)
-                            local_tps = g_registered_functions[idx].params[local_np-1].offset +
-                                        g_registered_functions[idx].params[local_np-1].size;
-                        g_registered_functions[idx].total_param_size = local_tps;
-                        LOG_DEBUG("Cross-arch param query: '%s' params=%d total=%d (from local GPU)",
-                                name, local_np, local_tps);
-                    }
-                    if (real_cuModuleUnload) real_cuModuleUnload(local_mod);
-                }
+                LOG_DEBUG("Cross-arch param query: '%s' params=%d total=%d",
+                        name, qnp, qtps);
             }
         }
 

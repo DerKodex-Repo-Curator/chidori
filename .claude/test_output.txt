@@ -1,0 +1,38 @@
+
+=== Chidori Test Suite ===
+Server:  localhost:43212
+Python:  /home/fabricio/chidori/chidori-worker/../.venv/bin/python
+Build:   /home/fabricio/chidori/chidori-worker/build
+
+  test_pytorch.py (basic ops)         FAIL  (5s, exit=1)
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+  test_train.py (matmul 4096)         FAIL  (5s, exit=1)
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+  test_training_fp16.py (FP16)        FAIL  (6s, exit=1)
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+  test_training.py (FP32 train)       FAIL  (5s, exit=1)
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+  test_inference.py (TinyLlama)       FAIL  (9s, exit=1)
+    CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+    For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+    Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+=== Results ===
+0/5 passed, 5 failed
+
+Failures:
+  - test_pytorch.py (basic ops) (exit 1)
+  - test_train.py (matmul 4096) (exit 1)
+  - test_training_fp16.py (FP16) (exit 1)
+  - test_training.py (FP32 train) (exit 1)
+  - test_inference.py (TinyLlama) (exit 1)
+
+SOME TESTS FAILED
