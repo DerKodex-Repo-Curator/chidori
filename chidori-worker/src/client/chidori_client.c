@@ -211,7 +211,7 @@ static void init_real_cuda(void) {
             NULL
         };
         for (int i = 0; cuda_paths[i]; i++) {
-            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY | RTLD_DEEPBIND);
+            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY);
             if (g_real_cuda_handle) {
                 fprintf(stderr, "[chidori] Loaded real CUDA driver from %s\n", cuda_paths[i]);
                 break;
