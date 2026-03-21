@@ -1557,14 +1557,17 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
 }
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMalloc) {
-        LOG_DEBUG("cudaMalloc(%zu) → LOCAL (dev %d)", size, g_current_device);
+    /* Use Driver API (cuMemAlloc) for local device to avoid Runtime API reentrance */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemAlloc_v2) {
+        LOG_DEBUG("cudaMalloc(%zu) → LOCAL via cuMemAlloc (dev %d)", size, g_current_device);
         ensure_real_cuda_init();
         g_in_real_cuda++;
-        cudaError_t r = (cudaError_t)g_real.cudaMalloc(devPtr, size);
+        CUdeviceptr dptr = 0;
+        CUresult r = g_real.cuMemAlloc_v2(&dptr, size);
         g_in_real_cuda--;
-        g_last_error = r;
-        return r;
+        if (devPtr) *devPtr = (void *)(uintptr_t)dptr;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
     }
     uint64_t size64 = (uint64_t)size;
     uint64_t ptr64 = 0;
@@ -1577,12 +1580,12 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 cudaError_t cudaFree(void *devPtr) {
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaFree) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemFree_v2) {
         g_in_real_cuda++;
-        cudaError_t r = (cudaError_t)g_real.cudaFree(devPtr);
+        CUresult r = g_real.cuMemFree_v2((CUdeviceptr)(uintptr_t)devPtr);
         g_in_real_cuda--;
-        g_last_error = r;
-        return r;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
     }
     uint64_t ptr = (uint64_t)(uintptr_t)devPtr;
     cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_FREE, &ptr, sizeof(ptr));
@@ -1591,13 +1594,32 @@ cudaError_t cudaFree(void *devPtr) {
 }
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
-    /* Route to local GPU if current device is local */
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMemcpy) {
+    /* Route to local GPU if current device is local.
+     * Use DRIVER API directly (cuMemcpyHtoD/DtoH) to avoid Runtime API
+     * reentrance — calling g_real.cudaMemcpy would go through PLT back to us. */
+    if (g_partial_offload && is_local_device(g_current_device)) {
         g_in_real_cuda++;
-        cudaError_t r = (cudaError_t)g_real.cudaMemcpy(dst, src, count, kind);
+        CUresult r = CUDA_SUCCESS;
+        switch (kind) {
+        case 1: /* HtoD */
+            if (g_real.cuMemcpyHtoD_v2)
+                r = g_real.cuMemcpyHtoD_v2((CUdeviceptr)(uintptr_t)dst, src, count);
+            break;
+        case 2: /* DtoH */
+            if (g_real.cuMemcpyDtoH_v2)
+                r = g_real.cuMemcpyDtoH_v2(dst, (CUdeviceptr)(uintptr_t)src, count);
+            break;
+        case 3: /* DtoD */
+            if (g_real.cuMemcpyDtoD_v2)
+                r = g_real.cuMemcpyDtoD_v2((CUdeviceptr)(uintptr_t)dst, (CUdeviceptr)(uintptr_t)src, count);
+            break;
+        default: /* HtoH */
+            memcpy(dst, src, count);
+            break;
+        }
         g_in_real_cuda--;
-        g_last_error = r;
-        return r;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
     }
     cudaError_t r;
 
