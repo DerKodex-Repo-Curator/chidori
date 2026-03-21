@@ -12,6 +12,7 @@
  * Phase 2: Full CUDA Driver API interception via codegen.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6083,16 +6084,39 @@ static const char *g_intercepted_symbols[] = {
     NULL
 };
 
+/* Use __libc_dlsym to avoid recursion when we intercept dlsym */
+extern void *__libc_dlsym(void *handle, const char *symbol);
+
 static void *lookup_intercepted_symbol(const char *symbol) {
-    /* Check if this symbol is one we intercept */
     for (int i = 0; g_intercepted_symbols[i] != NULL; i++) {
         if (strcmp(symbol, g_intercepted_symbols[i]) == 0) {
-            /* Found it — resolve OUR implementation via dlsym on ourselves.
-             * Since we're LD_PRELOAD'd, RTLD_DEFAULT finds our version. */
-            return dlsym(RTLD_DEFAULT, symbol);
+            /* Resolve OUR function via __libc_dlsym to avoid recursion */
+            return __libc_dlsym(RTLD_DEFAULT, symbol);
         }
     }
     return NULL;
+}
+
+/*
+ * dlsym interception — the KEY to partial GPU offloading.
+ *
+ * PyTorch (via libcudart) internally calls dlsym() to resolve CUDA driver
+ * symbols from libcuda.so. Even though our library IS LD_PRELOAD'd as
+ * libcuda.so.1, libcudart may use a specific handle from dlopen() that
+ * resolves to the real driver. By intercepting dlsym itself, we ensure
+ * ALL CUDA symbol lookups return our function pointers.
+ */
+void *dlsym(void *handle, const char *symbol) {
+    /* Check if this is a CUDA driver symbol we intercept */
+    if (symbol && symbol[0] == 'c' && symbol[1] == 'u') {
+        void *ours = lookup_intercepted_symbol(symbol);
+        if (ours) {
+            LOG_DEBUG("dlsym('%s') → OUR interception", symbol);
+            return ours;
+        }
+    }
+    /* Forward everything else to the real dlsym */
+    return __libc_dlsym(handle, symbol);
 }
 
 /*
