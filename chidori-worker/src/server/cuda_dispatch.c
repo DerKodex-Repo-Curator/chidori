@@ -1444,8 +1444,20 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 uint32_t sm = 0;    if (ehdr >= 32) memcpy(&sm, fb + pos + 28, 4);
 
                 if (ehdr < 16) ehdr = 16;
+                /* file_sz = actual bytes to read; advance_sz = space in fatbin layout */
                 uint32_t file_sz = (comp > 0 && comp < uncomp) ? comp : (uint32_t)uncomp;
-                if (uncomp == 0 || pos + ehdr + file_sz > fat_size) break;
+                uint32_t advance_sz = (uint32_t)uncomp;
+                if (uncomp == 0) break;
+                /* Clamp file_sz to available space (last entry may be truncated) */
+                if (pos + ehdr + file_sz > fat_size)
+                    file_sz = (uint32_t)(fat_size - pos - ehdr);
+
+                fprintf(stderr, "[fatbin] entry: type=%d sm=%u hdr=%u uncomp=%llu comp=%u flags=0x%x first4=%02x%02x%02x%02x\n",
+                        etype, sm, ehdr, (unsigned long long)uncomp, comp, flags,
+                        (pos+ehdr < fat_size) ? fb[pos+ehdr] : 0,
+                        (pos+ehdr+1 < fat_size) ? fb[pos+ehdr+1] : 0,
+                        (pos+ehdr+2 < fat_size) ? fb[pos+ehdr+2] : 0,
+                        (pos+ehdr+3 < fat_size) ? fb[pos+ehdr+3] : 0);
 
                 /* Prefer: ELF matching server SM > PTX (any) */
                 if (etype == 2 && sm == server_sm) {
@@ -1462,7 +1474,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     best_type = 1;
                 }
 
-                pos += ehdr + file_sz;
+                pos += ehdr + advance_sz;
                 if (pos & 7) pos = (pos + 7) & ~(size_t)7;
             }
 
@@ -1472,7 +1484,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 void *raw = NULL;
                 size_t raw_size = 0;
 
-                if (best_flags & 0x40) {
+                /* Check for zstd compression (magic 28 b5 2f fd) */
+                if (file_sz >= 4 && best_data[0] == 0x28 && best_data[1] == 0xb5 &&
+                    best_data[2] == 0x2f && best_data[3] == 0xfd) {
                     /* Zstd-compressed entry — decompress */
                     raw_size = ZSTD_getFrameContentSize(best_data, file_sz);
                     if (raw_size == ZSTD_CONTENTSIZE_ERROR || raw_size == ZSTD_CONTENTSIZE_UNKNOWN)
@@ -1487,12 +1501,18 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                             raw = NULL;
                         } else {
                             raw_size = result;
-                            fprintf(stderr, "[cuda_dispatch] zstd decompressed: %zu -> %zu bytes (type=%d)\n",
-                                    (size_t)file_sz, raw_size, best_type);
+                            fprintf(stderr, "[cuda_dispatch] zstd decompressed: %zu -> %zu bytes\n",
+                                    (size_t)file_sz, raw_size);
                         }
                     }
+                } else if (file_sz >= 2 && best_data[0] == 0xa2 &&
+                           best_data[1] == 0x7f) {
+                    /* a2-prefixed cubin — skip the 1-byte header to get raw ELF */
+                    raw = (void *)(best_data + 1);
+                    raw_size = file_sz - 1;
+                    fprintf(stderr, "[cuda_dispatch] stripped a2 prefix: %zu bytes -> ELF\n", raw_size);
                 } else {
-                    /* Uncompressed — use directly */
+                    /* Raw data — try directly */
                     raw = (void *)best_data;
                     raw_size = file_sz;
                 }
