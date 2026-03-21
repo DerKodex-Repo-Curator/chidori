@@ -6072,6 +6072,51 @@ nvrtcResult nvrtcGetLoweredName(void *prog, const char *name_expression,
     return NVRTC_SUCCESS;
 }
 
+/* ====================================================================
+ * NVML Interception for Partial GPU Offloading
+ *
+ * PyTorch calls nvmlDeviceGetCount_v2 (via libnvidia-ml.so.1) FIRST
+ * to get the device count, BEFORE calling cudaGetDeviceCount. If NVML
+ * returns a count, PyTorch uses it and never calls our cudaGetDeviceCount.
+ * We must intercept NVML to report the merged device count.
+ * ==================================================================== */
+
+#define NVML_SUCCESS 0
+
+int nvmlInit(void) { return NVML_SUCCESS; }
+int nvmlInit_v2(void) { return NVML_SUCCESS; }
+
+int nvmlDeviceGetCount(unsigned int *deviceCount) {
+    init_real_cuda();
+    if (g_partial_offload && deviceCount) {
+        /* Report local + remote device count */
+        int remote_count = 0;
+        size_t len = sizeof(int32_t);
+        chidori_rpc(CHIDORI_CUDA_GET_DEVICE_COUNT, NULL, 0, &remote_count, &len);
+        if (remote_count <= 0) remote_count = 1;
+        *deviceCount = (unsigned int)(g_local_device_count + remote_count);
+        fprintf(stderr, "[chidori] nvmlDeviceGetCount: local=%d + remote=%d = %u\n",
+                g_local_device_count, remote_count, *deviceCount);
+        return NVML_SUCCESS;
+    }
+    /* Non-partial: query real NVML */
+    typedef int (*nvml_fn)(unsigned int *);
+    static nvml_fn real_fn = NULL;
+    if (!real_fn) {
+        void *nvml = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_NOLOAD);
+        if (nvml) real_fn = (nvml_fn)dlsym(nvml, "nvmlDeviceGetCount");
+    }
+    if (real_fn) return real_fn(deviceCount);
+    if (deviceCount) *deviceCount = 1;
+    return NVML_SUCCESS;
+}
+
+int nvmlDeviceGetCount_v2(unsigned int *deviceCount) {
+    return nvmlDeviceGetCount(deviceCount);
+}
+
+int nvmlShutdown(void) { return NVML_SUCCESS; }
+
 /*
  * cudaGetDriverEntryPoint / cudaGetDriverEntryPointByVersion interception.
  *
