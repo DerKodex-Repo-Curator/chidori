@@ -110,6 +110,7 @@ typedef unsigned long long CUdeviceptr;
 static void *g_real_cuda_handle = NULL;   /* dlopen handle for real libcuda.so */
 static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so */
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
+static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: 1 = inside real CUDA call, forward to real driver */
@@ -181,6 +182,7 @@ static void init_real_cuda(void) {
     if (!env) return; /* No partial offloading — all remote */
 
     g_partial_offload = 1;
+    g_device_count_cache = -1; /* Invalidate — will be recomputed with local+remote */
 
     /* Parse local device mask (e.g., "0" or "0,1") */
     const char *p = env;
@@ -1338,7 +1340,7 @@ typedef struct { unsigned int x, y, z; } dim3;
 /* Track last error locally */
 static cudaError_t g_last_error = 0;
 
-static int g_device_count_cache = -1;
+/* g_device_count_cache declared in globals section above */
 
 cudaError_t cudaGetDeviceCount(int *count) {
     if (g_device_count_cache >= 0) {
