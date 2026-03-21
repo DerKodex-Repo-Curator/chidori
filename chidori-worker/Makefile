@@ -36,7 +36,7 @@ $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol
 
 $(BUILD_DIR)/libchidori.so: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libchidori.so -o $@ $(SRC_CLIENT) $(SRC_PROTO)
 
 $(BUILD_DIR)/test_protocol: tests/test_protocol.c $(SRC_PROTO) include/chidori_protocol.h
 	@mkdir -p $(BUILD_DIR)
