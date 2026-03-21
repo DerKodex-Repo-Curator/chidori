@@ -196,9 +196,10 @@ static void init_real_cuda(void) {
      * and there's no "next" libcuda in the chain. RTLD_NEXT fails fatally.
      * Instead, dlopen the real driver by path with RTLD_LAZY|RTLD_NOLOAD first
      * (in case it's already loaded), then try explicit paths. */
-    g_real_cuda_handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
-    if (!g_real_cuda_handle) {
-        /* Not already loaded — try known paths for the real NVIDIA driver */
+    /* Open real NVIDIA driver by absolute path. Do NOT use RTLD_NOLOAD or
+     * bare "libcuda.so.1" — those return OUR library (SONAME collision).
+     * The absolute path opens the actual file even if SONAME matches. */
+    {
         const char *cuda_paths[] = {
             "/usr/lib/libcuda.so.1",
             "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
@@ -206,14 +207,15 @@ static void init_real_cuda(void) {
             NULL
         };
         for (int i = 0; cuda_paths[i]; i++) {
-            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY);
-            if (g_real_cuda_handle) break;
+            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY | RTLD_DEEPBIND);
+            if (g_real_cuda_handle) {
+                fprintf(stderr, "[chidori] Loaded real CUDA driver from %s\n", cuda_paths[i]);
+                break;
+            }
         }
     }
-    /* For cudart: use the real libcudart from PyTorch's bundled CUDA */
+    /* For cudart: the real one is already loaded by PyTorch */
     g_real_cudart_handle = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_NOLOAD);
-    if (!g_real_cudart_handle)
-        g_real_cudart_handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
 
     if (!g_real_cuda_handle)
         fprintf(stderr, "[chidori] WARNING: Could not load real libcuda.so for partial offload\n");
