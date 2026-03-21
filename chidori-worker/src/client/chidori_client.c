@@ -6055,109 +6055,42 @@ nvrtcResult nvrtcGetLoweredName(void *prog, const char *name_expression,
  * When PyTorch requests a symbol we intercept, we return ours.
  */
 
-/* Forward declarations for symbols defined elsewhere in this file */
-CUresult cuInit(unsigned int);
-CUresult cuDriverGetVersion(int *);
-CUresult cuDeviceGet(int *, int);
-CUresult cuDeviceGetCount(int *);
-CUresult cuDeviceGetName(char *, int, int);
-CUresult cuDeviceTotalMem_v2(size_t *, int);
-CUresult cuDeviceGetAttribute(int *, int, int);
-CUresult cuDeviceGetUuid(void *, int);
-CUresult cuCtxGetCurrent(void **);
-CUresult cuCtxSetCurrent(void *);
-CUresult cuCtxSynchronize(void);
-CUresult cuModuleLoadData(void **, const void *);
-CUresult cuModuleGetFunction(void **, void *, const char *);
-CUresult cuModuleUnload(void *);
-CUresult cuMemAlloc_v2(void **, size_t);
-CUresult cuMemFree_v2(void *);
-CUresult cuMemcpyHtoD_v2(void *, const void *, size_t);
-CUresult cuMemcpyDtoH_v2(void *, void *, size_t);
-CUresult cuMemcpyDtoD_v2(void *, void *, size_t);
-CUresult cuMemcpyHtoDAsync_v2(void *, const void *, size_t, void *);
-CUresult cuMemcpyDtoHAsync_v2(void *, void *, size_t, void *);
-CUresult cuMemsetD8_v2(void *, unsigned char, size_t);
-CUresult cuMemsetD32_v2(void *, unsigned int, size_t);
-CUresult cuLaunchKernel(void *, unsigned int, unsigned int, unsigned int,
-                        unsigned int, unsigned int, unsigned int,
-                        unsigned int, void *, void **, void **);
-CUresult cuStreamCreate(void **, unsigned int);
-CUresult cuStreamSynchronize(void *);
-CUresult cuStreamDestroy_v2(void *);
-CUresult cuEventCreate(void **, unsigned int);
-CUresult cuEventRecord(void *, void *);
-CUresult cuEventSynchronize(void *);
-CUresult cuEventDestroy_v2(void *);
-CUresult cuEventElapsedTime(float *, void *, void *);
-CUresult cuFuncGetAttribute(int *, int, void *);
-CUresult cuDevicePrimaryCtxRetain(void **, int);
-CUresult cuDevicePrimaryCtxRelease_v2(int);
-CUresult cuDeviceGetPCIBusId(char *, int, int);
-CUresult cuGetErrorString(int, const char **);
-CUresult cuGetErrorName(int, const char **);
-CUresult cuPointerGetAttribute(void *, int, void *);
-
-static struct { const char *name; void *func; } g_symbol_table[] = {
-    {"cuInit",                     (void *)cuInit},
-    {"cuDriverGetVersion",         (void *)cuDriverGetVersion},
-    {"cuDeviceGet",                (void *)cuDeviceGet},
-    {"cuDeviceGetCount",           (void *)cuDeviceGetCount},
-    {"cuDeviceGetName",            (void *)cuDeviceGetName},
-    {"cuDeviceTotalMem",           (void *)cuDeviceTotalMem_v2},
-    {"cuDeviceTotalMem_v2",        (void *)cuDeviceTotalMem_v2},
-    {"cuDeviceGetAttribute",       (void *)cuDeviceGetAttribute},
-    {"cuDeviceGetUuid",            (void *)cuDeviceGetUuid},
-    {"cuCtxGetCurrent",            (void *)cuCtxGetCurrent},
-    {"cuCtxSetCurrent",            (void *)cuCtxSetCurrent},
-    {"cuCtxSynchronize",           (void *)cuCtxSynchronize},
-    {"cuModuleLoadData",           (void *)cuModuleLoadData},
-    {"cuModuleGetFunction",        (void *)cuModuleGetFunction},
-    {"cuModuleUnload",             (void *)cuModuleUnload},
-    {"cuMemAlloc",                 (void *)cuMemAlloc_v2},
-    {"cuMemAlloc_v2",              (void *)cuMemAlloc_v2},
-    {"cuMemFree",                  (void *)cuMemFree_v2},
-    {"cuMemFree_v2",               (void *)cuMemFree_v2},
-    {"cuMemcpyHtoD",               (void *)cuMemcpyHtoD_v2},
-    {"cuMemcpyHtoD_v2",            (void *)cuMemcpyHtoD_v2},
-    {"cuMemcpyDtoH",               (void *)cuMemcpyDtoH_v2},
-    {"cuMemcpyDtoH_v2",            (void *)cuMemcpyDtoH_v2},
-    {"cuMemcpyDtoD",               (void *)cuMemcpyDtoD_v2},
-    {"cuMemcpyDtoD_v2",            (void *)cuMemcpyDtoD_v2},
-    {"cuMemcpyHtoDAsync",          (void *)cuMemcpyHtoDAsync_v2},
-    {"cuMemcpyHtoDAsync_v2",       (void *)cuMemcpyHtoDAsync_v2},
-    {"cuMemcpyDtoHAsync",          (void *)cuMemcpyDtoHAsync_v2},
-    {"cuMemcpyDtoHAsync_v2",       (void *)cuMemcpyDtoHAsync_v2},
-    {"cuMemsetD8",                 (void *)cuMemsetD8_v2},
-    {"cuMemsetD8_v2",              (void *)cuMemsetD8_v2},
-    {"cuMemsetD32",                (void *)cuMemsetD32_v2},
-    {"cuMemsetD32_v2",             (void *)cuMemsetD32_v2},
-    {"cuLaunchKernel",             (void *)cuLaunchKernel},
-    {"cuStreamCreate",             (void *)cuStreamCreate},
-    {"cuStreamSynchronize",        (void *)cuStreamSynchronize},
-    {"cuStreamDestroy",            (void *)cuStreamDestroy_v2},
-    {"cuStreamDestroy_v2",         (void *)cuStreamDestroy_v2},
-    {"cuEventCreate",              (void *)cuEventCreate},
-    {"cuEventRecord",              (void *)cuEventRecord},
-    {"cuEventSynchronize",         (void *)cuEventSynchronize},
-    {"cuEventDestroy",             (void *)cuEventDestroy_v2},
-    {"cuEventDestroy_v2",          (void *)cuEventDestroy_v2},
-    {"cuEventElapsedTime",         (void *)cuEventElapsedTime},
-    {"cuFuncGetAttribute",         (void *)cuFuncGetAttribute},
-    {"cuDevicePrimaryCtxRetain",   (void *)cuDevicePrimaryCtxRetain},
-    {"cuDevicePrimaryCtxRelease",  (void *)cuDevicePrimaryCtxRelease_v2},
-    {"cuDevicePrimaryCtxRelease_v2", (void *)cuDevicePrimaryCtxRelease_v2},
-    {"cuDeviceGetPCIBusId",        (void *)cuDeviceGetPCIBusId},
-    {"cuGetErrorString",           (void *)cuGetErrorString},
-    {"cuGetErrorName",             (void *)cuGetErrorName},
-    {"cuPointerGetAttribute",      (void *)cuPointerGetAttribute},
-    {NULL, NULL}
+/* Names of CUDA Driver API symbols we intercept. When PyTorch requests
+ * any of these via cudaGetDriverEntryPoint, we return our own function
+ * pointer (found via dlsym(RTLD_DEFAULT) on ourselves). */
+static const char *g_intercepted_symbols[] = {
+    "cuInit", "cuDriverGetVersion",
+    "cuDeviceGet", "cuDeviceGetCount", "cuDeviceGetName",
+    "cuDeviceTotalMem", "cuDeviceTotalMem_v2",
+    "cuDeviceGetAttribute", "cuDeviceGetUuid",
+    "cuCtxGetCurrent", "cuCtxSetCurrent", "cuCtxSynchronize",
+    "cuModuleLoadData", "cuModuleGetFunction", "cuModuleUnload",
+    "cuMemAlloc", "cuMemAlloc_v2", "cuMemFree", "cuMemFree_v2",
+    "cuMemcpyHtoD", "cuMemcpyHtoD_v2", "cuMemcpyDtoH", "cuMemcpyDtoH_v2",
+    "cuMemcpyDtoD", "cuMemcpyDtoD_v2",
+    "cuMemcpyHtoDAsync", "cuMemcpyHtoDAsync_v2",
+    "cuMemcpyDtoHAsync", "cuMemcpyDtoHAsync_v2",
+    "cuMemsetD8", "cuMemsetD8_v2", "cuMemsetD32", "cuMemsetD32_v2",
+    "cuLaunchKernel",
+    "cuStreamCreate", "cuStreamSynchronize", "cuStreamDestroy", "cuStreamDestroy_v2",
+    "cuEventCreate", "cuEventRecord", "cuEventSynchronize",
+    "cuEventDestroy", "cuEventDestroy_v2", "cuEventElapsedTime",
+    "cuFuncGetAttribute",
+    "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease", "cuDevicePrimaryCtxRelease_v2",
+    "cuDeviceGetPCIBusId",
+    "cuGetErrorString", "cuGetErrorName",
+    "cuPointerGetAttribute",
+    NULL
 };
 
 static void *lookup_intercepted_symbol(const char *symbol) {
-    for (int i = 0; g_symbol_table[i].name != NULL; i++) {
-        if (strcmp(symbol, g_symbol_table[i].name) == 0)
-            return g_symbol_table[i].func;
+    /* Check if this symbol is one we intercept */
+    for (int i = 0; g_intercepted_symbols[i] != NULL; i++) {
+        if (strcmp(symbol, g_intercepted_symbols[i]) == 0) {
+            /* Found it — resolve OUR implementation via dlsym on ourselves.
+             * Since we're LD_PRELOAD'd, RTLD_DEFAULT finds our version. */
+            return dlsym(RTLD_DEFAULT, symbol);
+        }
     }
     return NULL;
 }
