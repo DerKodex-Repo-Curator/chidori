@@ -896,10 +896,26 @@ static struct { int dev; int attrib; int value; int valid; } g_attr_cache[ATTR_C
 static int g_attr_cache_count = 0;
 
 /* g_real_cuda_inited declared near g_partial_offload, used by cuInit and ensure_real_cuda_init */
+static CUcontext g_real_ctx = NULL;
 static void ensure_real_cuda_init(void) {
     if (!g_real_cuda_inited && g_real.cuInit) {
+        g_in_real_cuda++;
         g_real.cuInit(0);
+        /* Create and activate a context on the local GPU */
+        if (g_real.cuDevicePrimaryCtxRetain && g_real.cuCtxSetCurrent) {
+            CUdevice dev = 0;
+            if (g_real.cuDeviceGet) g_real.cuDeviceGet(&dev, 0);
+            g_real.cuDevicePrimaryCtxRetain(&g_real_ctx, dev);
+            g_real.cuCtxSetCurrent(g_real_ctx);
+        }
+        g_in_real_cuda--;
         g_real_cuda_inited = 1;
+    }
+    /* Ensure real context is active for local operations */
+    if (g_real_ctx && g_real.cuCtxSetCurrent) {
+        g_in_real_cuda++;
+        g_real.cuCtxSetCurrent(g_real_ctx);
+        g_in_real_cuda--;
     }
 }
 
