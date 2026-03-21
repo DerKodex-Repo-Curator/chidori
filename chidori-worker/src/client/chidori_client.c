@@ -177,6 +177,7 @@ static void init_real_cuda(void) {
     g_real_cuda_initialized = 1;
 
     const char *env = getenv("CHIDORI_LOCAL_DEVICES");
+    fprintf(stderr, "[chidori] init_real_cuda: CHIDORI_LOCAL_DEVICES=%s\n", env ? env : "(not set)");
     if (!env) return; /* No partial offloading — all remote */
 
     g_partial_offload = 1;
