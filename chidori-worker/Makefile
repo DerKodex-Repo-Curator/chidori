@@ -28,7 +28,7 @@ all: server client
 
 server: $(BUILD_DIR)/chidori-worker
 
-client: $(BUILD_DIR)/libchidori.so
+client: $(BUILD_DIR)/libchidori.so $(BUILD_DIR)/libnvidia-ml.so.1
 
 $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol.h src/server/handle_map.h
 	@mkdir -p $(BUILD_DIR)
@@ -37,6 +37,10 @@ $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol
 $(BUILD_DIR)/libchidori.so: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libchidori.so -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+
+$(BUILD_DIR)/libnvidia-ml.so.1: src/client/chidori_nvml.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -shared -fPIC -Wl,-soname,libnvidia-ml.so.1 -o $@ $< -ldl
 
 $(BUILD_DIR)/test_protocol: tests/test_protocol.c $(SRC_PROTO) include/chidori_protocol.h
 	@mkdir -p $(BUILD_DIR)
