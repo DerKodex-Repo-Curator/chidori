@@ -6044,6 +6044,190 @@ nvrtcResult nvrtcGetLoweredName(void *prog, const char *name_expression,
 }
 
 /*
+ * cudaGetDriverEntryPoint / cudaGetDriverEntryPointByVersion interception.
+ *
+ * PyTorch resolves CUDA Driver API symbols via cudaGetDriverEntryPoint()
+ * (from libcudart), not via direct function calls or dlsym. Without
+ * intercepting this, PyTorch gets the real driver's cuDeviceGetCount
+ * (returning 1 GPU) instead of our merged count (2 GPUs for partial offload).
+ *
+ * We maintain a lookup table of symbol name → our function pointer.
+ * When PyTorch requests a symbol we intercept, we return ours.
+ */
+
+/* Forward declarations for symbols defined elsewhere in this file */
+CUresult cuInit(unsigned int);
+CUresult cuDriverGetVersion(int *);
+CUresult cuDeviceGet(int *, int);
+CUresult cuDeviceGetCount(int *);
+CUresult cuDeviceGetName(char *, int, int);
+CUresult cuDeviceTotalMem_v2(size_t *, int);
+CUresult cuDeviceGetAttribute(int *, int, int);
+CUresult cuDeviceGetUuid(void *, int);
+CUresult cuCtxGetCurrent(void **);
+CUresult cuCtxSetCurrent(void *);
+CUresult cuCtxSynchronize(void);
+CUresult cuModuleLoadData(void **, const void *);
+CUresult cuModuleGetFunction(void **, void *, const char *);
+CUresult cuModuleUnload(void *);
+CUresult cuMemAlloc_v2(void **, size_t);
+CUresult cuMemFree_v2(void *);
+CUresult cuMemcpyHtoD_v2(void *, const void *, size_t);
+CUresult cuMemcpyDtoH_v2(void *, void *, size_t);
+CUresult cuMemcpyDtoD_v2(void *, void *, size_t);
+CUresult cuMemcpyHtoDAsync_v2(void *, const void *, size_t, void *);
+CUresult cuMemcpyDtoHAsync_v2(void *, void *, size_t, void *);
+CUresult cuMemsetD8_v2(void *, unsigned char, size_t);
+CUresult cuMemsetD32_v2(void *, unsigned int, size_t);
+CUresult cuLaunchKernel(void *, unsigned int, unsigned int, unsigned int,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, void *, void **, void **);
+CUresult cuStreamCreate(void **, unsigned int);
+CUresult cuStreamSynchronize(void *);
+CUresult cuStreamDestroy_v2(void *);
+CUresult cuEventCreate(void **, unsigned int);
+CUresult cuEventRecord(void *, void *);
+CUresult cuEventSynchronize(void *);
+CUresult cuEventDestroy_v2(void *);
+CUresult cuEventElapsedTime(float *, void *, void *);
+CUresult cuFuncGetAttribute(int *, int, void *);
+CUresult cuDevicePrimaryCtxRetain(void **, int);
+CUresult cuDevicePrimaryCtxRelease_v2(int);
+CUresult cuDeviceGetPCIBusId(char *, int, int);
+CUresult cuGetErrorString(int, const char **);
+CUresult cuGetErrorName(int, const char **);
+CUresult cuPointerGetAttribute(void *, int, void *);
+
+static struct { const char *name; void *func; } g_symbol_table[] = {
+    {"cuInit",                     (void *)cuInit},
+    {"cuDriverGetVersion",         (void *)cuDriverGetVersion},
+    {"cuDeviceGet",                (void *)cuDeviceGet},
+    {"cuDeviceGetCount",           (void *)cuDeviceGetCount},
+    {"cuDeviceGetName",            (void *)cuDeviceGetName},
+    {"cuDeviceTotalMem",           (void *)cuDeviceTotalMem_v2},
+    {"cuDeviceTotalMem_v2",        (void *)cuDeviceTotalMem_v2},
+    {"cuDeviceGetAttribute",       (void *)cuDeviceGetAttribute},
+    {"cuDeviceGetUuid",            (void *)cuDeviceGetUuid},
+    {"cuCtxGetCurrent",            (void *)cuCtxGetCurrent},
+    {"cuCtxSetCurrent",            (void *)cuCtxSetCurrent},
+    {"cuCtxSynchronize",           (void *)cuCtxSynchronize},
+    {"cuModuleLoadData",           (void *)cuModuleLoadData},
+    {"cuModuleGetFunction",        (void *)cuModuleGetFunction},
+    {"cuModuleUnload",             (void *)cuModuleUnload},
+    {"cuMemAlloc",                 (void *)cuMemAlloc_v2},
+    {"cuMemAlloc_v2",              (void *)cuMemAlloc_v2},
+    {"cuMemFree",                  (void *)cuMemFree_v2},
+    {"cuMemFree_v2",               (void *)cuMemFree_v2},
+    {"cuMemcpyHtoD",               (void *)cuMemcpyHtoD_v2},
+    {"cuMemcpyHtoD_v2",            (void *)cuMemcpyHtoD_v2},
+    {"cuMemcpyDtoH",               (void *)cuMemcpyDtoH_v2},
+    {"cuMemcpyDtoH_v2",            (void *)cuMemcpyDtoH_v2},
+    {"cuMemcpyDtoD",               (void *)cuMemcpyDtoD_v2},
+    {"cuMemcpyDtoD_v2",            (void *)cuMemcpyDtoD_v2},
+    {"cuMemcpyHtoDAsync",          (void *)cuMemcpyHtoDAsync_v2},
+    {"cuMemcpyHtoDAsync_v2",       (void *)cuMemcpyHtoDAsync_v2},
+    {"cuMemcpyDtoHAsync",          (void *)cuMemcpyDtoHAsync_v2},
+    {"cuMemcpyDtoHAsync_v2",       (void *)cuMemcpyDtoHAsync_v2},
+    {"cuMemsetD8",                 (void *)cuMemsetD8_v2},
+    {"cuMemsetD8_v2",              (void *)cuMemsetD8_v2},
+    {"cuMemsetD32",                (void *)cuMemsetD32_v2},
+    {"cuMemsetD32_v2",             (void *)cuMemsetD32_v2},
+    {"cuLaunchKernel",             (void *)cuLaunchKernel},
+    {"cuStreamCreate",             (void *)cuStreamCreate},
+    {"cuStreamSynchronize",        (void *)cuStreamSynchronize},
+    {"cuStreamDestroy",            (void *)cuStreamDestroy_v2},
+    {"cuStreamDestroy_v2",         (void *)cuStreamDestroy_v2},
+    {"cuEventCreate",              (void *)cuEventCreate},
+    {"cuEventRecord",              (void *)cuEventRecord},
+    {"cuEventSynchronize",         (void *)cuEventSynchronize},
+    {"cuEventDestroy",             (void *)cuEventDestroy_v2},
+    {"cuEventDestroy_v2",          (void *)cuEventDestroy_v2},
+    {"cuEventElapsedTime",         (void *)cuEventElapsedTime},
+    {"cuFuncGetAttribute",         (void *)cuFuncGetAttribute},
+    {"cuDevicePrimaryCtxRetain",   (void *)cuDevicePrimaryCtxRetain},
+    {"cuDevicePrimaryCtxRelease",  (void *)cuDevicePrimaryCtxRelease_v2},
+    {"cuDevicePrimaryCtxRelease_v2", (void *)cuDevicePrimaryCtxRelease_v2},
+    {"cuDeviceGetPCIBusId",        (void *)cuDeviceGetPCIBusId},
+    {"cuGetErrorString",           (void *)cuGetErrorString},
+    {"cuGetErrorName",             (void *)cuGetErrorName},
+    {"cuPointerGetAttribute",      (void *)cuPointerGetAttribute},
+    {NULL, NULL}
+};
+
+static void *lookup_intercepted_symbol(const char *symbol) {
+    for (int i = 0; g_symbol_table[i].name != NULL; i++) {
+        if (strcmp(symbol, g_symbol_table[i].name) == 0)
+            return g_symbol_table[i].func;
+    }
+    return NULL;
+}
+
+/*
+ * cudaGetDriverEntryPoint — CUDA Runtime API function that PyTorch uses
+ * to resolve Driver API symbols. We intercept it to return our function
+ * pointers instead of the real driver's.
+ */
+cudaError_t cudaGetDriverEntryPoint(const char *symbol, void **funcPtr,
+                                     unsigned long long flags) {
+    if (!symbol || !funcPtr) return (cudaError_t)1;
+
+    void *ours = lookup_intercepted_symbol(symbol);
+    if (ours) {
+        *funcPtr = ours;
+        LOG_DEBUG("cudaGetDriverEntryPoint('%s') → OUR interception", symbol);
+        return cudaSuccess;
+    }
+
+    /* Not intercepted — forward to real implementation */
+    LOG_DEBUG("cudaGetDriverEntryPoint('%s') → PASSTHROUGH", symbol);
+    /* The real cudaGetDriverEntryPoint is in libcudart. Since we're
+     * libcuda.so.1 (not libcudart), the real function should be
+     * resolvable via the normal symbol chain. */
+    typedef cudaError_t (*real_fn_t)(const char *, void **, unsigned long long);
+    static real_fn_t real_fn = NULL;
+    if (!real_fn) {
+        void *cudart = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (cudart)
+            real_fn = (real_fn_t)dlsym(cudart, "cudaGetDriverEntryPoint");
+    }
+    if (real_fn)
+        return real_fn(symbol, funcPtr, flags);
+
+    *funcPtr = NULL;
+    return (cudaError_t)500; /* cudaErrorNotFound */
+}
+
+cudaError_t cudaGetDriverEntryPointByVersion(const char *symbol, void **funcPtr,
+                                              unsigned int cudaVersion,
+                                              unsigned long long flags,
+                                              int *queryResult) {
+    if (!symbol || !funcPtr) return (cudaError_t)1;
+
+    void *ours = lookup_intercepted_symbol(symbol);
+    if (ours) {
+        *funcPtr = ours;
+        if (queryResult) *queryResult = 1; /* cudaDriverEntryPointSuccess */
+        LOG_DEBUG("cudaGetDriverEntryPointByVersion('%s', v%u) → OUR interception", symbol, cudaVersion);
+        return cudaSuccess;
+    }
+
+    LOG_DEBUG("cudaGetDriverEntryPointByVersion('%s', v%u) → PASSTHROUGH", symbol, cudaVersion);
+    typedef cudaError_t (*real_fn_t)(const char *, void **, unsigned int, unsigned long long, int *);
+    static real_fn_t real_fn = NULL;
+    if (!real_fn) {
+        void *cudart = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (cudart)
+            real_fn = (real_fn_t)dlsym(cudart, "cudaGetDriverEntryPointByVersion");
+    }
+    if (real_fn)
+        return real_fn(symbol, funcPtr, cudaVersion, flags, queryResult);
+
+    *funcPtr = NULL;
+    if (queryResult) *queryResult = 0;
+    return (cudaError_t)500;
+}
+
+/*
  * Cleanup on library unload
  */
 __attribute__((destructor))
