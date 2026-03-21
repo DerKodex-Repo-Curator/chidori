@@ -114,7 +114,7 @@ static int g_device_count_cache = -1;    /* cached device count, -1 = not cached
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
-static __thread int g_in_real_cuda = 0;   /* reentrance guard: 1 = inside real CUDA call, forward to real driver */
+static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
 
 /* Real CUDA function pointers (populated by init_real_cuda) */
 static struct {
@@ -816,9 +816,9 @@ CUresult cuInit(unsigned int flags) {
     g_initialized = 1;
     /* For partial offload: init the REAL local driver too */
     if (g_partial_offload && g_real.cuInit) {
-        g_in_real_cuda = 1;
+        g_in_real_cuda++;
         g_real.cuInit(0);
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_real_cuda_inited = 1;
     }
     return chidori_rpc(CHIDORI_CU_INIT, &flags, sizeof(flags), NULL, NULL);
@@ -827,7 +827,7 @@ CUresult cuInit(unsigned int flags) {
 static int g_driver_version_cached = 0;
 static int g_driver_version = 0;
 CUresult cuDriverGetVersion(int *version) {
-    if (g_in_real_cuda && g_real.cuDriverGetVersion) return g_real.cuDriverGetVersion(version);
+    if (g_in_real_cuda > 0 && g_real.cuDriverGetVersion) return g_real.cuDriverGetVersion(version);
     if (g_driver_version_cached) { *version = g_driver_version; return 0; }
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DRIVER_GET_VERSION, NULL, 0, version, &len);
@@ -838,7 +838,7 @@ CUresult cuDriverGetVersion(int *version) {
 CUresult cuDeviceGetCount(int *count) {
     /* Ensure partial offload is initialized before returning count */
     init_real_cuda();
-    if (g_in_real_cuda && !g_partial_offload && g_real.cuDeviceGetCount)
+    if (g_in_real_cuda > 0 && !g_partial_offload && g_real.cuDeviceGetCount)
         return g_real.cuDeviceGetCount(count);
     int remote_count = 0;
     size_t len = sizeof(int32_t);
@@ -858,7 +858,7 @@ CUresult cuDeviceGetCount(int *count) {
 static void ensure_real_cuda_init(void);
 
 CUresult cuDeviceGet(CUdevice *device, int ordinal) {
-    if (g_in_real_cuda && g_real.cuDeviceGet) return g_real.cuDeviceGet(device, ordinal);
+    if (g_in_real_cuda > 0 && g_real.cuDeviceGet) return g_real.cuDeviceGet(device, ordinal);
     if (g_partial_offload && is_local_device(ordinal) && g_real.cuDeviceGet) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGet(device, ordinal);
@@ -869,7 +869,7 @@ CUresult cuDeviceGet(CUdevice *device, int ordinal) {
 }
 
 CUresult cuDeviceGetName(char *name, int len, CUdevice dev) {
-    if (g_in_real_cuda && g_real.cuDeviceGetName) return g_real.cuDeviceGetName(name, len, dev);
+    if (g_in_real_cuda > 0 && g_real.cuDeviceGetName) return g_real.cuDeviceGetName(name, len, dev);
     if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceGetName) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGetName(name, len, dev);
@@ -881,7 +881,7 @@ CUresult cuDeviceGetName(char *name, int len, CUdevice dev) {
 }
 
 CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
-    if (g_in_real_cuda && g_real.cuDeviceTotalMem_v2) return g_real.cuDeviceTotalMem_v2(bytes, dev);
+    if (g_in_real_cuda > 0 && g_real.cuDeviceTotalMem_v2) return g_real.cuDeviceTotalMem_v2(bytes, dev);
     if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceTotalMem_v2) {
         return g_real.cuDeviceTotalMem_v2(bytes, dev);
     }
@@ -904,7 +904,7 @@ static void ensure_real_cuda_init(void) {
 }
 
 CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
-    if (g_in_real_cuda && g_real.cuDeviceGetAttribute) return g_real.cuDeviceGetAttribute(pi, attrib, dev);
+    if (g_in_real_cuda > 0 && g_real.cuDeviceGetAttribute) return g_real.cuDeviceGetAttribute(pi, attrib, dev);
     /* For partial offload: route local device queries to real CUDA */
     if (g_partial_offload && is_local_device(dev) && g_real.cuDeviceGetAttribute) {
         ensure_real_cuda_init();
@@ -938,7 +938,7 @@ static CUcontext g_cached_ctx = NULL;
 static int g_cached_ctx_valid = 0;
 
 CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev) {
-    if (g_in_real_cuda && g_real.cuCtxCreate_v2) return g_real.cuCtxCreate_v2(pctx, flags, dev);
+    if (g_in_real_cuda > 0 && g_real.cuCtxCreate_v2) return g_real.cuCtxCreate_v2(pctx, flags, dev);
     struct { uint32_t flags; int32_t dev; } req = { flags, dev };
     size_t len = sizeof(uint64_t);
     CUresult r = chidori_rpc(CHIDORI_CU_CTX_CREATE, &req, sizeof(req), pctx, &len);
@@ -950,13 +950,13 @@ CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev) {
 }
 
 CUresult cuCtxDestroy_v2(CUcontext ctx) {
-    if (g_in_real_cuda && g_real.cuCtxDestroy_v2) return g_real.cuCtxDestroy_v2(ctx);
+    if (g_in_real_cuda > 0 && g_real.cuCtxDestroy_v2) return g_real.cuCtxDestroy_v2(ctx);
     uint64_t handle = (uint64_t)(uintptr_t)ctx;
     return chidori_rpc(CHIDORI_CU_CTX_DESTROY, &handle, sizeof(handle), NULL, NULL);
 }
 
 CUresult cuCtxSetCurrent(CUcontext ctx) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     uint64_t handle = (uint64_t)(uintptr_t)ctx;
     g_cached_ctx = ctx;
     g_cached_ctx_valid = 1;
@@ -964,7 +964,7 @@ CUresult cuCtxSetCurrent(CUcontext ctx) {
 }
 
 CUresult cuCtxGetCurrent(CUcontext *pctx) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     if (g_cached_ctx_valid) {
         *pctx = g_cached_ctx;
         return CUDA_SUCCESS;
@@ -979,12 +979,12 @@ CUresult cuCtxGetCurrent(CUcontext *pctx) {
 }
 
 CUresult cuCtxSynchronize(void) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     return chidori_rpc(CHIDORI_CU_CTX_SYNCHRONIZE, NULL, 0, NULL, NULL);
 }
 
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
-    if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
+    if (g_in_real_cuda > 0 && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
     size_t len = sizeof(uint64_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &dev, sizeof(dev), pctx, &len);
     if (r == CUDA_SUCCESS) {
@@ -995,14 +995,14 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
 }
 
 CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
-    if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRelease_v2) return g_real.cuDevicePrimaryCtxRelease_v2(dev);
+    if (g_in_real_cuda > 0 && g_real.cuDevicePrimaryCtxRelease_v2) return g_real.cuDevicePrimaryCtxRelease_v2(dev);
     return chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RELEASE, &dev, sizeof(dev), NULL, NULL);
 }
 
 /* Memory */
 CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
     /* Reentrance guard: if inside a real CUDA call, forward to real driver */
-    if (g_in_real_cuda && g_real.cuMemAlloc_v2)
+    if (g_in_real_cuda > 0 && g_real.cuMemAlloc_v2)
         return g_real.cuMemAlloc_v2(dptr, bytesize);
     uint64_t size = (uint64_t)bytesize;
     size_t len = sizeof(uint64_t);
@@ -1010,14 +1010,14 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
 }
 
 CUresult cuMemFree_v2(CUdeviceptr dptr) {
-    if (g_in_real_cuda && g_real.cuMemFree_v2)
+    if (g_in_real_cuda > 0 && g_real.cuMemFree_v2)
         return g_real.cuMemFree_v2(dptr);
     uint64_t ptr = (uint64_t)dptr;
     return chidori_rpc_async(CHIDORI_CU_MEM_FREE, &ptr, sizeof(ptr));
 }
 
 CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byteCount) {
-    if (g_in_real_cuda && g_real.cuMemcpyHtoD_v2) return g_real.cuMemcpyHtoD_v2(dstDevice, srcHost, byteCount); /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuMemcpyHtoD_v2) return g_real.cuMemcpyHtoD_v2(dstDevice, srcHost, byteCount); /* reentrance guard */
     /* Payload: dst_ptr(8) + size(8) + data(byteCount) */
     size_t payload_len = 16 + byteCount;
     void *payload = malloc(payload_len);
@@ -1034,7 +1034,7 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byte
 }
 
 CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t byteCount) {
-    if (g_in_real_cuda && g_real.cuMemcpyDtoH_v2) return g_real.cuMemcpyDtoH_v2(dstHost, srcDevice, byteCount); /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuMemcpyDtoH_v2) return g_real.cuMemcpyDtoH_v2(dstHost, srcDevice, byteCount); /* reentrance guard */
     /* Payload: src_ptr(8) + size(8) */
     struct { uint64_t src; uint64_t size; } req;
     req.src = (uint64_t)srcDevice;
@@ -1045,7 +1045,7 @@ CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t byteCount)
 }
 
 CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t byteCount) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     struct { uint64_t dst; uint64_t src; uint64_t size; } req;
     req.dst = (uint64_t)dstDevice;
     req.src = (uint64_t)srcDevice;
@@ -1054,7 +1054,7 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t by
 }
 
 CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
-    if (g_in_real_cuda && g_real.cuMemGetInfo_v2) return g_real.cuMemGetInfo_v2(free, total);
+    if (g_in_real_cuda > 0 && g_real.cuMemGetInfo_v2) return g_real.cuMemGetInfo_v2(free, total);
     struct { uint64_t free; uint64_t total; } info;
     size_t len = sizeof(info);
     CUresult r = chidori_rpc(CHIDORI_CU_MEM_GET_INFO, NULL, 0, &info, &len);
@@ -1067,7 +1067,7 @@ CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
 
 /* Module */
 CUresult cuModuleLoadData(CUmodule *module, const void *image) {
-    if (g_in_real_cuda && g_real.cuModuleLoadData) return g_real.cuModuleLoadData(module, image);
+    if (g_in_real_cuda > 0 && g_real.cuModuleLoadData) return g_real.cuModuleLoadData(module, image);
     /* Determine image size: check for PTX (text) vs CUBIN (binary) */
     size_t image_len;
     const unsigned char *data = (const unsigned char *)image;
@@ -1091,13 +1091,13 @@ CUresult cuModuleLoadData(CUmodule *module, const void *image) {
 }
 
 CUresult cuModuleUnload(CUmodule mod) {
-    if (g_in_real_cuda && g_real.cuModuleUnload) return g_real.cuModuleUnload(mod);
+    if (g_in_real_cuda > 0 && g_real.cuModuleUnload) return g_real.cuModuleUnload(mod);
     uint64_t handle = (uint64_t)(uintptr_t)mod;
     return chidori_rpc(CHIDORI_CU_MODULE_UNLOAD, &handle, sizeof(handle), NULL, NULL);
 }
 
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name) {
-    if (g_in_real_cuda && g_real.cuModuleGetFunction) return g_real.cuModuleGetFunction(hfunc, hmod, name);
+    if (g_in_real_cuda > 0 && g_real.cuModuleGetFunction) return g_real.cuModuleGetFunction(hfunc, hmod, name);
     /* Payload: module_handle(8) + function_name (null-terminated) */
     uint64_t mod_handle = (uint64_t)(uintptr_t)hmod;
     size_t name_len = strlen(name) + 1;
@@ -1126,7 +1126,7 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
 #define CHIDORI_CU_LAUNCH_PARAM_END            ((void *)0x00)
 
 CUresult cuFuncGetAttribute(int *pi, int attrib, CUfunction hfunc) {
-    if (g_in_real_cuda && g_real.cuFuncGetAttribute) return g_real.cuFuncGetAttribute(pi, attrib, hfunc);
+    if (g_in_real_cuda > 0 && g_real.cuFuncGetAttribute) return g_real.cuFuncGetAttribute(pi, attrib, hfunc);
     struct __attribute__((packed)) { int32_t attrib; uint64_t func; } req;
     req.attrib = attrib;
     req.func = (uint64_t)(uintptr_t)hfunc;
@@ -1139,7 +1139,7 @@ CUresult cuLaunchKernel(CUfunction f,
                         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                         unsigned int sharedMemBytes, CUstream hStream,
                         void **kernelParams, void **extra) {
-    if (g_in_real_cuda && g_real.cuLaunchKernel) return g_real.cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+    if (g_in_real_cuda > 0 && g_real.cuLaunchKernel) return g_real.cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
     /*
      * Kernel launch serialization — wire format:
      *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
@@ -1270,38 +1270,38 @@ CUresult cuLaunchKernel(CUfunction f,
 
 /* Stream */
 CUresult cuStreamCreate(CUstream *phStream, unsigned int flags) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     size_t len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_STREAM_CREATE, &flags, sizeof(flags), phStream, &len);
 }
 
 CUresult cuStreamDestroy_v2(CUstream hStream) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     uint64_t handle = (uint64_t)(uintptr_t)hStream;
     return chidori_rpc_async(CHIDORI_CU_STREAM_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuStreamSynchronize(CUstream hStream) {
-    if (g_in_real_cuda && g_real.cuStreamSynchronize) return g_real.cuStreamSynchronize(hStream); /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuStreamSynchronize) return g_real.cuStreamSynchronize(hStream); /* reentrance guard */
     uint64_t handle = (uint64_t)(uintptr_t)hStream;
     return chidori_rpc(CHIDORI_CU_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
 }
 
 /* Event */
 CUresult cuEventCreate(CUevent *phEvent, unsigned int flags) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     size_t len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_EVENT_CREATE, &flags, sizeof(flags), phEvent, &len);
 }
 
 CUresult cuEventDestroy_v2(CUevent hEvent) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc_async(CHIDORI_CU_EVENT_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     struct { uint64_t event; uint64_t stream; } req;
     req.event = (uint64_t)(uintptr_t)hEvent;
     req.stream = (uint64_t)(uintptr_t)hStream;
@@ -1309,13 +1309,13 @@ CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
 }
 
 CUresult cuEventSynchronize(CUevent hEvent) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc(CHIDORI_CU_EVENT_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
 }
 
 CUresult cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd) {
-    if (g_in_real_cuda && g_real.cuEventElapsedTime) return g_real.cuEventElapsedTime(pMilliseconds, hStart, hEnd);
+    if (g_in_real_cuda > 0 && g_real.cuEventElapsedTime) return g_real.cuEventElapsedTime(pMilliseconds, hStart, hEnd);
     struct { uint64_t start; uint64_t end; } req;
     req.start = (uint64_t)(uintptr_t)hStart;
     req.end = (uint64_t)(uintptr_t)hEnd;
@@ -1392,9 +1392,9 @@ cudaError_t cudaSetDevice(int device) {
         ensure_real_cuda_init();
         cudaError_t r = cudaSuccess;
         if (g_real.cudaSetDevice) {
-            g_in_real_cuda = 1;
+            g_in_real_cuda++;
             r = (cudaError_t)g_real.cudaSetDevice(device);
-            g_in_real_cuda = 0;
+            g_in_real_cuda--;
         }
         if (r == cudaSuccess) {
             g_current_device = device;
@@ -1524,9 +1524,9 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
     if (g_partial_offload && is_local_device(device) && g_real.cuDeviceGetAttribute) {
         LOG_DEBUG("cudaDeviceGetAttribute(attr=%d, dev=%d) → LOCAL", attr, device);
         ensure_real_cuda_init();
-        g_in_real_cuda = 1;
+        g_in_real_cuda++;
         int r = (int)g_real.cuDeviceGetAttribute(value, attr, device);
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
@@ -1560,9 +1560,9 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMalloc) {
         LOG_DEBUG("cudaMalloc(%zu) → LOCAL (dev %d)", size, g_current_device);
         ensure_real_cuda_init();
-        g_in_real_cuda = 1;
+        g_in_real_cuda++;
         cudaError_t r = (cudaError_t)g_real.cudaMalloc(devPtr, size);
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = r;
         return r;
     }
@@ -1577,14 +1577,10 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 cudaError_t cudaFree(void *devPtr) {
-    g_in_real_cuda = 1;
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaFree) {
-    g_in_real_cuda = 0;
-        g_in_real_cuda = 1;
-g_in_real_cuda = 1;
+        g_in_real_cuda++;
         cudaError_t r = (cudaError_t)g_real.cudaFree(devPtr);
-        g_in_real_cuda = 0;
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = r;
         return r;
     }
@@ -1596,14 +1592,10 @@ g_in_real_cuda = 1;
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     /* Route to local GPU if current device is local */
-    g_in_real_cuda = 1;
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaMemcpy) {
-    g_in_real_cuda = 0;
-        g_in_real_cuda = 1;
-g_in_real_cuda = 1;
+        g_in_real_cuda++;
         cudaError_t r = (cudaError_t)g_real.cudaMemcpy(dst, src, count, kind);
-        g_in_real_cuda = 0;
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = r;
         return r;
     }
@@ -1766,14 +1758,10 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 
 cudaError_t cudaDeviceSynchronize(void) {
-    g_in_real_cuda = 1;
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaDeviceSynchronize) {
-    g_in_real_cuda = 0;
-        g_in_real_cuda = 1;
-g_in_real_cuda = 1;
+        g_in_real_cuda++;
         cudaError_t r = (cudaError_t)g_real.cudaDeviceSynchronize();
-        g_in_real_cuda = 0;
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = r;
         return r;
     }
@@ -1800,14 +1788,10 @@ cudaError_t cudaStreamDestroy(void *stream) {
 }
 
 cudaError_t cudaStreamSynchronize(void *stream) {
-    g_in_real_cuda = 1;
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaStreamSynchronize) {
-    g_in_real_cuda = 0;
-        g_in_real_cuda = 1;
-g_in_real_cuda = 1;
+        g_in_real_cuda++;
         cudaError_t r = (cudaError_t)g_real.cudaStreamSynchronize(stream);
-        g_in_real_cuda = 0;
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = r;
         return r;
     }
@@ -4420,9 +4404,9 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
         LOG_DEBUG("cudaLaunchKernel → LOCAL (dev %d)", g_current_device);
         typedef int (*real_cudaLaunchKernel_t)(const void *, dim3, dim3, void **, size_t, void *);
         real_cudaLaunchKernel_t real_fn = (real_cudaLaunchKernel_t)g_real.cudaLaunchKernel_ptr;
-        g_in_real_cuda = 1;
+        g_in_real_cuda++;
         cudaError_t r = (cudaError_t)real_fn(func, gridDim, blockDim, args, sharedMem, stream);
-        g_in_real_cuda = 0;
+        g_in_real_cuda--;
         g_last_error = r;
         return r;
     }
@@ -4934,19 +4918,15 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
         init_real_cuda();
         if (g_partial_offload && g_real.__cudaRegisterFatBinary) {
             LOG_DEBUG("__cudaRegisterFatBinary[%d] → LOCAL + REMOTE (size=%llu)", idx, (unsigned long long)fat_size);
-            g_in_real_cuda = 1;
+            g_in_real_cuda++;
             g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
-            g_in_real_cuda = 0;
+            g_in_real_cuda--;
         }
-
-        /* Safety: always clear guard before returning */
-        g_in_real_cuda = 0;
 
         fat_idx_storage[idx] = idx;
         return (void **)&fat_idx_storage[idx];
     }
 
-    g_in_real_cuda = 0; /* safety clear */
     static int fallback_idx = 0;
     return (void **)&fallback_idx;
 }
@@ -4955,9 +4935,9 @@ void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
     if (g_partial_offload && g_real.__cudaRegisterFatBinaryEnd) {
         int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
         if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
-            g_in_real_cuda = 1;
+            g_in_real_cuda++;
             g_real.__cudaRegisterFatBinaryEnd(g_fat_binaries[idx].real_handle);
-            g_in_real_cuda = 0;
+            g_in_real_cuda--;
         }
     }
 }
@@ -4966,9 +4946,9 @@ void __cudaUnregisterFatBinary(void **fatCubinHandle) {
     if (g_partial_offload && g_real.__cudaUnregisterFatBinary) {
         int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
         if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
-            g_in_real_cuda = 1;
+            g_in_real_cuda++;
             g_real.__cudaUnregisterFatBinary(g_fat_binaries[idx].real_handle);
-            g_in_real_cuda = 0;
+            g_in_real_cuda--;
         }
     }
 }
@@ -5000,10 +4980,10 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
         void **real_handle = (fat_idx >= 0 && fat_idx < g_fat_binary_count)
                              ? g_fat_binaries[fat_idx].real_handle : NULL;
         if (real_handle) {
-            g_in_real_cuda = 1;
+            g_in_real_cuda++;
             g_real.__cudaRegisterFunction(real_handle, hostFun, deviceFun, deviceName,
                                           thread_limit, tid, bid, bDim, gDim, wSize);
-            g_in_real_cuda = 0;
+            g_in_real_cuda--;
         }
     }
 }
@@ -6186,15 +6166,19 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
     fprintf(stderr, "[chidori] cuGetProcAddress('%s') CALLED\n", symbol ? symbol : "NULL");
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
+    /* When inside real CUDA, forward to real driver's cuGetProcAddress */
+    if (g_in_real_cuda > 0 && g_real_cuda_handle) {
+        typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
+        fn_t real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
+        if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
+    }
+
     void *ours = lookup_intercepted_symbol(symbol);
     if (ours) {
         *pfn = ours;
         LOG_DEBUG("cuGetProcAddress('%s') → OUR interception", symbol);
         return CUDA_SUCCESS;
     }
-
-    /* Not intercepted — let the real driver handle it */
-    if (g_in_real_cuda) return CUDA_ERROR_NOT_FOUND;
 
     /* For non-intercepted symbols, return NULL (let caller handle) */
     LOG_DEBUG("cuGetProcAddress('%s') → not intercepted", symbol);
