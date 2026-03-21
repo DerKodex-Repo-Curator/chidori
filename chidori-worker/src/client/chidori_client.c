@@ -4496,6 +4496,16 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
 }
 
 /*
+ * __cudaLaunchKernel — internal CUDA Runtime launch entry point.
+ * Source-built PyTorch (CUDA 13.x) calls this instead of cudaLaunchKernel.
+ * Same signature, just delegate.
+ */
+cudaError_t __cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
+                               void **args, size_t sharedMem, cudaStream_t stream) {
+    return cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
+}
+
+/*
  * cudaLaunchKernelExC — CUDA 12.x extended launch (cluster dims, etc.)
  * Extract grid/block from the config struct and delegate to cudaLaunchKernel.
  *
