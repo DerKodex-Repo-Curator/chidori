@@ -23,7 +23,7 @@ TOTAL=0
 log() { echo "[$(date +%H:%M:%S)] $1" | tee -a "$LOGFILE"; }
 
 restart_server() {
-    ssh -o ConnectTimeout=5 -p "$SSH_PORT" "root@$SSH_HOST" '/root/chidori/restart_server.sh' 2>/dev/null | grep -q SERVER_READY
+    ssh -i ~/.ssh/vast_key -o ConnectTimeout=10 -o StrictHostKeyChecking=no -p "$SSH_PORT" "root@$SSH_HOST" '/root/chidori/restart_server.sh' 2>/dev/null | grep -q SERVER_READY
     if [ $? -ne 0 ]; then
         log "FATAL: Server restart failed"
         return 1
