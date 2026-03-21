@@ -145,11 +145,16 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
 
 9. You will always test from client (Lenovo) to whichever GPU server you are given access to. Testing on loopback is no longer considered a valid test.
 
+<rule name="no-multi-server">
+NEVER propose or implement a multi-server approach for partial GPU offloading. This has been explicitly rejected MULTIPLE TIMES. The architecture is ALWAYS: ONE client with a local GPU + ONE remote server. The client uses its own GPU for some layers (via real CUDA driver behind LD_PRELOAD) and sends overflow layers to the single remote server. Two servers pretending to be two devices is NOT acceptable. If you find yourself writing code that connects to multiple servers, STOP — you are going down the wrong path.
+</rule>
+
 <rule name="no-lazy-approaches">
 NEVER take a lazy or shortcut approach that creates technical debt. If a problem is hard, solve it properly. Specifically:
 
 - Do NOT work around a problem by avoiding it (e.g., "just use a different loss function" instead of fixing the real bug).
 - Do NOT create parallel architectures to dodge a technical blocker (e.g., multi-server pretending to be multi-device instead of solving the LD_PRELOAD recursion).
+- Do NOT propose multi-server as a workaround for partial offloading — this was rejected.
 - Do NOT mark tasks as complete when the underlying issue is unresolved.
 - Do NOT claim something works based on a different test configuration than what the user asked for.
 
