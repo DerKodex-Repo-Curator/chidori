@@ -1,30 +1,47 @@
 # Updates Log - Partial GPU Offloading
 
-## What's Working NOW
-- torch.cuda.device_count() == 2 (with CHIDORI_LOCAL_DEVICES=0)
-- cuda:1 (remote) — full tensor create + readback via PyTorch: [4.0, 5.0, 6.0] ✓
-- cuda:0 (local) — raw cudaMalloc/cudaMemcpy via ctypes after torch init: [1.0, 2.0, 3.0] ✓
-- Real NVIDIA driver loaded from /usr/lib/libcuda.so.1 (confirmed separate from our library)
-- g_real.cuMemAlloc_v2 etc are now non-NULL (fixed RTLD_NEXT → dlopen)
+## Session: 2026-03-22
 
-## What's Broken
-- cuda:0 via PyTorch (torch.tensor([...]).cuda(0)) — HANGS
-- The hang is NOT in cudaMalloc itself (ctypes works)
-- The hang is in some CUDA function PyTorch calls between cudaSetDevice(0) and the actual allocation
+### MILESTONE ACHIEVED: Basic Partial GPU Offloading Works!
+```
+Devices: 2
+cuda:0: [1.0, 2.0, 3.0]  ← LOCAL GPU (real CUDA driver)
+cuda:1: [4.0, 5.0, 6.0]  ← REMOTE SERVER (Chidori TCP)
+BOTH DEVICES PASS
+```
 
-## Root Cause
-PyTorch calls intermediate functions (cuDevicePrimaryCtxRetain, cuCtxSetCurrent, cudaStreamCreate, etc.) when switching to a device. Some of these functions:
-1. Are intercepted by our LD_PRELOAD
-2. Don't have the `g_partial_offload && is_local_device()` routing guard
-3. Send an RPC to the remote server while the mutex is held
-4. The RPC blocks (or returns an error that confuses PyTorch)
+### What Works
+- torch.cuda.device_count() == 2
+- torch.tensor().cuda(0) → local GPU allocation
+- torch.tensor().cuda(1) → remote server allocation
+- x.cpu() DtoH readback from both devices
+- cudaMalloc, cudaFree, cudaMemcpy, cudaMemcpyAsync all route correctly
+- Context management (cuCtxSetCurrent, cuDevicePrimaryCtxRetain) routes correctly
+- cuInit reentrance guard prevents double RPC
 
-## What to Do Next
-1. Add `g_partial_offload && is_local_device()` guard to ALL device-context functions:
-   - cuDevicePrimaryCtxRetain
-   - cuCtxSetCurrent / cuCtxGetCurrent
-   - cudaStreamCreate / cudaStreamSynchronize
-   - cudaDeviceSynchronize
-   - cudaGetDevice
-2. For each: when local device → forward to g_real.XXX, when remote → send RPC
-3. Test incrementally: add one guard at a time, rebuild, test
+### What's Broken
+- torch.mm() on cuda:0 produces wrong results (err=69, should be <0.01)
+  - cuBLAS operations not yet routed to local driver
+  - cuBLAS handle created via RPC to remote server, used on local device = mismatch
+- Kernel launches (torch.randn) on cuda:0 crash with FPE
+  - Same issue: kernel launch goes through remote server RPC, not local driver
+
+### What to Do Next
+1. Add partial offload routing to cuBLAS functions:
+   - cublasCreate → use real driver for local device
+   - cublasSgemm → use real driver for local device
+   - All cuBLAS operations need is_local_device() guard
+2. Add partial offload routing to kernel launch (cudaLaunchKernel, cuLaunchKernel)
+3. Add routing to cuStreamCreate, cuStreamSynchronize for local device
+4. Test: matmul, training, inference on both devices
+
+### Key Fixes Made Today
+1. NVML shim (libnvidia-ml.so.1) intercepts nvmlDeviceGetCount
+2. Real driver loaded via dlopen("/usr/lib/libcuda.so.1") with SONAME fix
+3. g_in_real_cuda → recursion counter (++/--)
+4. cuGetProcAddress returns OUR functions (not real driver's)
+5. cuInit reentrance guard
+6. cudaMemcpyAsync partial offload routing
+7. Context management routing for local device
+8. g_current_device moved to globals section
+9. cuDevicePrimaryCtxRetain routing for local device
