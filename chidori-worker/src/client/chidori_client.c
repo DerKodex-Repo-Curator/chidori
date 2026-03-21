@@ -191,18 +191,37 @@ static void init_real_cuda(void) {
         if (*p == ',') p++;
     }
 
-    /* Load real CUDA driver */
-    /* Use RTLD_NEXT to find real CUDA functions behind our LD_PRELOAD.
-     * Do NOT dlopen the real libcuda.so — that would replace our PLT entries
-     * in PyTorch's libtorch_cuda.so, making our interception invisible.
-     * RTLD_NEXT returns the next occurrence of a symbol after our library. */
-    g_real_cuda_handle = RTLD_NEXT;
-    g_real_cudart_handle = RTLD_NEXT;
+    /* Load real CUDA driver via explicit dlopen.
+     * We CANNOT use RTLD_NEXT because we ARE libcuda.so.1 via LD_PRELOAD,
+     * and there's no "next" libcuda in the chain. RTLD_NEXT fails fatally.
+     * Instead, dlopen the real driver by path with RTLD_LAZY|RTLD_NOLOAD first
+     * (in case it's already loaded), then try explicit paths. */
+    g_real_cuda_handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!g_real_cuda_handle) {
+        /* Not already loaded — try known paths for the real NVIDIA driver */
+        const char *cuda_paths[] = {
+            "/usr/lib/libcuda.so.1",
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "/usr/lib64/libcuda.so.1",
+            NULL
+        };
+        for (int i = 0; cuda_paths[i]; i++) {
+            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY);
+            if (g_real_cuda_handle) break;
+        }
+    }
+    /* For cudart: use the real libcudart from PyTorch's bundled CUDA */
+    g_real_cudart_handle = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_NOLOAD);
+    if (!g_real_cudart_handle)
+        g_real_cudart_handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
 
-    /* Populate dispatch table using RTLD_NEXT */
-    #define LOAD_SYM(handle, name) g_real.name = dlsym(handle, #name)
-    #define LOAD_CUDA(name) LOAD_SYM(RTLD_NEXT, name)
-    #define LOAD_CUDART(name) LOAD_SYM(RTLD_NEXT, name)
+    if (!g_real_cuda_handle)
+        fprintf(stderr, "[chidori] WARNING: Could not load real libcuda.so for partial offload\n");
+
+    /* Populate dispatch table from real libraries */
+    #define LOAD_SYM(handle, name) g_real.name = (handle) ? dlsym(handle, #name) : NULL
+    #define LOAD_CUDA(name) LOAD_SYM(g_real_cuda_handle, name)
+    #define LOAD_CUDART(name) LOAD_SYM(g_real_cudart_handle, name)
 
     LOAD_CUDA(cuInit);
     LOAD_CUDA(cuDriverGetVersion);
