@@ -813,6 +813,13 @@ CUresult cuInit(unsigned int flags) {
     (void)flags;
     init_real_cuda(); /* Initialize partial offload if CHIDORI_LOCAL_DEVICES is set */
     g_initialized = 1;
+    /* For partial offload: init the REAL local driver too */
+    if (g_partial_offload && g_real.cuInit) {
+        g_in_real_cuda = 1;
+        g_real.cuInit(0);
+        g_in_real_cuda = 0;
+        g_real_cuda_inited = 1;
+    }
     return chidori_rpc(CHIDORI_CU_INIT, &flags, sizeof(flags), NULL, NULL);
 }
 
