@@ -112,6 +112,7 @@ static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
+static int g_current_device = 0;         /* current active device (global) */
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
@@ -1418,7 +1419,7 @@ cudaError_t cudaGetDeviceCount(int *count) {
     return cudaSuccess;
 }
 
-static int g_current_device = 0; /* Cache current device locally */
+/* g_current_device declared in globals section */
 
 cudaError_t cudaGetDevice(int *device) {
     /* Return cached value — avoids RPC for this very hot path */
