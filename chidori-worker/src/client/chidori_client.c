@@ -93,6 +93,7 @@ typedef unsigned long long CUdeviceptr;
 #define CUDA_SUCCESS 0
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_VALUE 1
+#define CUDA_ERROR_NOT_FOUND 500
 
 /*
  * ============================================================================
