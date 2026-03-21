@@ -972,7 +972,14 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
 }
 
 CUresult cuCtxSetCurrent(CUcontext ctx) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuCtxSetCurrent) return g_real.cuCtxSetCurrent(ctx);
+    /* Partial offload: local device context management goes to real driver */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxSetCurrent) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuCtxSetCurrent(ctx);
+        g_in_real_cuda--;
+        return r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)ctx;
     g_cached_ctx = ctx;
     g_cached_ctx_valid = 1;
@@ -980,7 +987,13 @@ CUresult cuCtxSetCurrent(CUcontext ctx) {
 }
 
 CUresult cuCtxGetCurrent(CUcontext *pctx) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuCtxGetCurrent) return g_real.cuCtxGetCurrent(pctx);
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxGetCurrent) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuCtxGetCurrent(pctx);
+        g_in_real_cuda--;
+        return r;
+    }
     if (g_cached_ctx_valid) {
         *pctx = g_cached_ctx;
         return CUDA_SUCCESS;
@@ -995,14 +1008,30 @@ CUresult cuCtxGetCurrent(CUcontext *pctx) {
 }
 
 CUresult cuCtxSynchronize(void) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuCtxSynchronize) return g_real.cuCtxSynchronize();
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxSynchronize) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuCtxSynchronize();
+        g_in_real_cuda--;
+        return r;
+    }
     return chidori_rpc(CHIDORI_CU_CTX_SYNCHRONIZE, NULL, 0, NULL, NULL);
 }
 
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
     if (g_in_real_cuda > 0 && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
+    /* Partial offload: local device context goes to real driver */
+    if (g_partial_offload && is_local_device(dev) && g_real.cuDevicePrimaryCtxRetain) {
+        ensure_real_cuda_init();
+        g_in_real_cuda++;
+        CUresult r = g_real.cuDevicePrimaryCtxRetain(pctx, dev);
+        g_in_real_cuda--;
+        return r;
+    }
+    /* Remap device for remote */
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
     size_t len = sizeof(uint64_t);
-    CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &dev, sizeof(dev), pctx, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &remote_dev, sizeof(remote_dev), pctx, &len);
     if (r == CUDA_SUCCESS) {
         g_cached_ctx = *pctx;
         g_cached_ctx_valid = 1;

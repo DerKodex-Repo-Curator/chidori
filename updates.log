@@ -1,0 +1,30 @@
+# Updates Log - Partial GPU Offloading
+
+## What's Working NOW
+- torch.cuda.device_count() == 2 (with CHIDORI_LOCAL_DEVICES=0)
+- cuda:1 (remote) — full tensor create + readback via PyTorch: [4.0, 5.0, 6.0] ✓
+- cuda:0 (local) — raw cudaMalloc/cudaMemcpy via ctypes after torch init: [1.0, 2.0, 3.0] ✓
+- Real NVIDIA driver loaded from /usr/lib/libcuda.so.1 (confirmed separate from our library)
+- g_real.cuMemAlloc_v2 etc are now non-NULL (fixed RTLD_NEXT → dlopen)
+
+## What's Broken
+- cuda:0 via PyTorch (torch.tensor([...]).cuda(0)) — HANGS
+- The hang is NOT in cudaMalloc itself (ctypes works)
+- The hang is in some CUDA function PyTorch calls between cudaSetDevice(0) and the actual allocation
+
+## Root Cause
+PyTorch calls intermediate functions (cuDevicePrimaryCtxRetain, cuCtxSetCurrent, cudaStreamCreate, etc.) when switching to a device. Some of these functions:
+1. Are intercepted by our LD_PRELOAD
+2. Don't have the `g_partial_offload && is_local_device()` routing guard
+3. Send an RPC to the remote server while the mutex is held
+4. The RPC blocks (or returns an error that confuses PyTorch)
+
+## What to Do Next
+1. Add `g_partial_offload && is_local_device()` guard to ALL device-context functions:
+   - cuDevicePrimaryCtxRetain
+   - cuCtxSetCurrent / cuCtxGetCurrent
+   - cudaStreamCreate / cudaStreamSynchronize
+   - cudaDeviceSynchronize
+   - cudaGetDevice
+2. For each: when local device → forward to g_real.XXX, when remote → send RPC
+3. Test incrementally: add one guard at a time, rebuild, test
