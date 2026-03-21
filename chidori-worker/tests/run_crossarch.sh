@@ -126,63 +126,81 @@ print(f'TEST_TIME: {time.time()-t0:.1f}s')
 print(f'TEST_PASS: {result == [3.0, 5.0, 7.0]}')
 " 300
 
-# TEST 4: Matmul (cuBLAS)
-run_test "matmul_cublas" "
+# TEST 4: Matmul — GPU vs CPU reference comparison
+run_test "matmul_verified" "
 import torch, time
 t0 = time.time()
 torch._C._cuda_init()
-a = torch.randn(256, 256).cuda()
-b = torch.randn(256, 256).cuda()
-c = torch.mm(a, b)
+torch.manual_seed(42)
+a = torch.randn(256, 256)
+b = torch.randn(256, 256)
+cpu_result = torch.mm(a, b)
+gpu_result = torch.mm(a.cuda(), b.cuda()).cpu()
 torch.cuda.synchronize()
-s = c.sum().item()
-print(f'TEST_SUM: {s:.2f}')
-print(f'TEST_NONZERO: {abs(s) > 0.01}')
+max_diff = (gpu_result - cpu_result).abs().max().item()
+rel_err = max_diff / cpu_result.abs().max().item()
+print(f'TEST_MAX_DIFF: {max_diff:.6f}')
+print(f'TEST_REL_ERR: {rel_err:.8f}')
+print(f'TEST_CPU_SUM: {cpu_result.sum().item():.2f}')
+print(f'TEST_GPU_SUM: {gpu_result.sum().item():.2f}')
 print(f'TEST_TIME: {time.time()-t0:.1f}s')
-print(f'TEST_PASS: {abs(s) > 0.01}')
+print(f'TEST_PASS: {rel_err < 1e-3}')
 " 300
 
-# TEST 5: Large matmul
-run_test "matmul_large" "
+# TEST 5: Large matmul — GPU vs CPU reference
+run_test "matmul_large_verified" "
 import torch, time
 t0 = time.time()
 torch._C._cuda_init()
-a = torch.randn(1024, 1024).cuda()
-b = torch.randn(1024, 1024).cuda()
-c = torch.mm(a, b)
+torch.manual_seed(123)
+a = torch.randn(1024, 1024)
+b = torch.randn(1024, 1024)
+cpu_result = torch.mm(a, b)
+gpu_result = torch.mm(a.cuda(), b.cuda()).cpu()
 torch.cuda.synchronize()
-s = c.sum().item()
-print(f'TEST_SUM: {s:.2f}')
+max_diff = (gpu_result - cpu_result).abs().max().item()
+rel_err = max_diff / cpu_result.abs().max().item()
+print(f'TEST_MAX_DIFF: {max_diff:.6f}')
+print(f'TEST_REL_ERR: {rel_err:.8f}')
+print(f'TEST_CPU_SUM: {cpu_result.sum().item():.2f}')
+print(f'TEST_GPU_SUM: {gpu_result.sum().item():.2f}')
 print(f'TEST_TIME: {time.time()-t0:.1f}s')
-print(f'TEST_PASS: {abs(s) > 0.01}')
+print(f'TEST_PASS: {rel_err < 1e-3}')
 " 300
 
-# TEST 6: Training step (forward + backward + optimizer)
-run_test "training_step" "
+# TEST 6: Training — verify loss decreases over 20 steps
+run_test "training_convergence" "
 import torch, torch.nn as nn, time, math
 t0 = time.time()
 torch._C._cuda_init()
-model = nn.Sequential(nn.Linear(64, 128, bias=False), nn.ReLU(), nn.Linear(128, 10, bias=False)).cuda()
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(64, 256, bias=False), nn.ReLU(), nn.Linear(256, 10, bias=False)).cuda()
 opt = torch.optim.SGD(model.parameters(), lr=0.01)
 loss_fn = nn.CrossEntropyLoss()
 
 losses = []
-for step in range(5):
-    x = torch.randn(8, 64).cuda()
-    t = torch.randint(0, 10, (8,)).cuda()
+for step in range(20):
+    x = torch.randn(32, 64).cuda()
+    t = torch.randint(0, 10, (32,)).cuda()
     opt.zero_grad()
     out = model(x)
     loss = loss_fn(out, t)
     loss.backward()
     opt.step()
     losses.append(loss.item())
-    print(f'TEST_STEP{step}: loss={loss.item():.4f}')
+    if step % 5 == 0:
+        print(f'TEST_STEP{step}: loss={loss.item():.4f}')
 
 all_finite = all(math.isfinite(l) for l in losses)
-print(f'TEST_LOSSES: {[round(l,4) for l in losses]}')
+first_5_avg = sum(losses[:5]) / 5
+last_5_avg = sum(losses[-5:]) / 5
+decreased = last_5_avg < first_5_avg
+print(f'TEST_FIRST5_AVG: {first_5_avg:.4f}')
+print(f'TEST_LAST5_AVG: {last_5_avg:.4f}')
+print(f'TEST_DECREASED: {decreased}')
 print(f'TEST_FINITE: {all_finite}')
 print(f'TEST_TIME: {time.time()-t0:.1f}s')
-print(f'TEST_PASS: {all_finite}')
+print(f'TEST_PASS: {all_finite and decreased}')
 " 600
 
 # Summary
