@@ -1,0 +1,38 @@
+
+=== Chidori Test Suite ===
+Server:  localhost:43212
+Python:  /home/fabricio/chidori/chidori-worker/../.venv/bin/python
+Build:   /home/fabricio/chidori/chidori-worker/build
+
+  test_pytorch.py (basic ops)         FAIL  (32s, exit=124)
+    If you want to use the NVIDIA GeForce RTX 5090 GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+    
+      queued_call()
+  test_train.py (matmul 4096)         FAIL  (122s, exit=124)
+      queued_call()
+    /home/fabricio/chidori/chidori-worker/tests/test_train.py:32: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /root/pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:330.)
+      c = torch.mm(a, b)
+  test_training_fp16.py (FP16)        FAIL  (62s, exit=124)
+      queued_call()
+    /home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/linear.py:134: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /root/pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:330.)
+      return F.linear(input, self.weight, self.bias)
+  test_training.py (FP32 train)       FAIL  (122s, exit=124)
+      queued_call()
+    /home/fabricio/chidori/.venv/lib/python3.14/site-packages/torch/nn/modules/linear.py:134: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /root/pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:330.)
+      return F.linear(input, self.weight, self.bias)
+  test_inference.py (TinyLlama)       FAIL  (9s, exit=1)
+        ) from e
+    ModuleNotFoundError: Could not import module 'LlamaForCausalLM'. Are this object's requirements defined correctly?
+    [chidori] SOCKET CLOSED at src/client/chidori_client.c:6053
+
+=== Results ===
+0/5 passed, 5 failed
+
+Failures:
+  - test_pytorch.py (basic ops) (exit 124)
+  - test_train.py (matmul 4096) (exit 124)
+  - test_training_fp16.py (FP16) (exit 124)
+  - test_training.py (FP32 train) (exit 124)
+  - test_inference.py (TinyLlama) (exit 1)
+
+SOME TESTS FAILED
