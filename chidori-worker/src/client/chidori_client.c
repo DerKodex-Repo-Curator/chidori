@@ -1343,6 +1343,8 @@ static cudaError_t g_last_error = 0;
 /* g_device_count_cache declared in globals section above */
 
 cudaError_t cudaGetDeviceCount(int *count) {
+    fprintf(stderr, "[chidori] cudaGetDeviceCount CALLED (cache=%d, partial=%d, local=%d)\n",
+            g_device_count_cache, g_partial_offload, g_local_device_count);
     if (g_device_count_cache >= 0) {
         *count = g_device_count_cache;
         return cudaSuccess;
