@@ -813,6 +813,8 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
 
 CUresult cuInit(unsigned int flags) {
     (void)flags;
+    /* Reentrance guard: when real driver's cuInit calls back into us, just succeed */
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS;
     init_real_cuda(); /* Initialize partial offload if CHIDORI_LOCAL_DEVICES is set */
     g_initialized = 1;
     /* For partial offload: init the REAL local driver too */
