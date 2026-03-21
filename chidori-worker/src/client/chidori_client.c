@@ -6103,6 +6103,7 @@ static void *lookup_intercepted_symbol(const char *symbol) {
  */
 CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint64_t flags) {
     (void)cudaVersion; (void)flags;
+    fprintf(stderr, "[chidori] cuGetProcAddress('%s') CALLED\n", symbol ? symbol : "NULL");
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
     void *ours = lookup_intercepted_symbol(symbol);
