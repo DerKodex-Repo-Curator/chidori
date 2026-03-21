@@ -1740,6 +1740,32 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
 }
 
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, void *stream) {
+    /* Route to local GPU via Driver API if current device is local */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        ensure_real_cuda_init();
+        g_in_real_cuda++;
+        CUresult r = CUDA_SUCCESS;
+        switch (kind) {
+        case 1: /* HtoD */
+            if (g_real.cuMemcpyHtoD_v2)
+                r = g_real.cuMemcpyHtoD_v2((CUdeviceptr)(uintptr_t)dst, src, count);
+            break;
+        case 2: /* DtoH */
+            if (g_real.cuMemcpyDtoH_v2)
+                r = g_real.cuMemcpyDtoH_v2(dst, (CUdeviceptr)(uintptr_t)src, count);
+            break;
+        case 3: /* DtoD */
+            if (g_real.cuMemcpyDtoD_v2)
+                r = g_real.cuMemcpyDtoD_v2((CUdeviceptr)(uintptr_t)dst, (CUdeviceptr)(uintptr_t)src, count);
+            break;
+        default:
+            memcpy(dst, src, count);
+            break;
+        }
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
     cudaError_t r;
 
     switch (kind) {
