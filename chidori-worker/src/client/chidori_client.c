@@ -6087,24 +6087,23 @@ static const char *g_intercepted_symbols[] = {
 /*
  * dlsym interception — the KEY to partial GPU offloading.
  *
- * We save the real dlsym pointer at library load time (constructor),
- * then override dlsym to intercept CUDA symbol lookups.
+ * We save the real dlsym at constructor time using dlvsym (which we
+ * DON'T override). Then our dlsym() checks for CUDA symbols.
  */
-typedef void *(*real_dlsym_fn)(void *, const char *);
-static real_dlsym_fn g_real_dlsym = NULL;
+typedef void *(*real_dlsym_t)(void *, const char *);
+static real_dlsym_t g_real_dlsym = NULL;
 
-__attribute__((constructor(101)))  /* Run early, before other constructors */
+__attribute__((constructor(101)))
 static void init_real_dlsym(void) {
-    /* RTLD_NEXT finds the next dlsym in the chain (glibc's) */
-    /* We can't use dlsym to find dlsym — use the GNU extension */
-    extern void *_dl_sym(void *, const char *, void *);
-    g_real_dlsym = (real_dlsym_fn)_dl_sym(RTLD_NEXT, "dlsym", (void *)init_real_dlsym);
+    /* dlvsym finds the GLIBC-versioned dlsym, not our override */
+    g_real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+    if (!g_real_dlsym)
+        g_real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
 }
 
 static void *lookup_intercepted_symbol(const char *symbol) {
     for (int i = 0; g_intercepted_symbols[i] != NULL; i++) {
         if (strcmp(symbol, g_intercepted_symbols[i]) == 0) {
-            /* Resolve OUR function via the real dlsym */
             if (g_real_dlsym)
                 return g_real_dlsym(RTLD_DEFAULT, symbol);
             return NULL;
@@ -6114,19 +6113,15 @@ static void *lookup_intercepted_symbol(const char *symbol) {
 }
 
 void *dlsym(void *handle, const char *symbol) {
-    /* Check if this is a CUDA driver symbol we intercept */
     if (symbol && symbol[0] == 'c' && symbol[1] == 'u') {
         void *ours = lookup_intercepted_symbol(symbol);
-        if (ours) {
+        if (ours)
             return ours;
-        }
     }
-    /* Forward everything else to the real dlsym */
     if (g_real_dlsym)
         return g_real_dlsym(handle, symbol);
-    /* Fallback if constructor hasn't run yet */
-    extern void *_dl_sym(void *, const char *, void *);
-    return _dl_sym(handle, symbol, (void *)dlsym);
+    /* Fallback before constructor runs */
+    return NULL;
 }
 
 /*
