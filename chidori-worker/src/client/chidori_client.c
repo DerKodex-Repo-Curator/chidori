@@ -6165,17 +6165,12 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
     (void)cudaVersion; (void)flags;
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
-    /* Partial offload: forward to real driver so cudart gets real function pointers.
-     * Our LD_PRELOAD interception handles the actual routing via g_in_real_cuda. */
-    if (g_partial_offload && g_real_cuda_handle) {
-        typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
-        static fn_t real_fn = NULL;
-        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
-        if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
-    }
-
-    /* Non-partial mode: return our intercepted symbols.
-     * Skip "cuGetProcAddress" itself to prevent infinite recursion. */
+    /* Return OUR intercepted functions for ALL modes (including partial offload).
+     * Our functions handle the local/remote routing via g_in_real_cuda guard.
+     * If we returned real driver pointers here, cudart would bypass our
+     * interception for ALL operations including remote device kernel launches.
+     *
+     * Exception: cuGetProcAddress itself — prevent infinite recursion. */
     if (strcmp(symbol, "cuGetProcAddress") != 0 &&
         strcmp(symbol, "cuGetProcAddress_v2") != 0) {
         void *ours = lookup_intercepted_symbol(symbol);
@@ -6183,6 +6178,14 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
             *pfn = ours;
             return CUDA_SUCCESS;
         }
+    }
+
+    /* Symbol not in our table — forward to real driver if available */
+    if (g_real_cuda_handle) {
+        typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
+        if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
     }
 
     *pfn = NULL;
