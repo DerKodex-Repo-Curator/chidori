@@ -828,9 +828,8 @@ CUresult cuDriverGetVersion(int *version) {
 }
 
 CUresult cuDeviceGetCount(int *count) {
-    /* For partial offload: NEVER forward to real driver (it only sees local GPUs).
-     * Always return our merged count. Only forward when inside real CUDA AND
-     * not in partial offload mode. */
+    /* Ensure partial offload is initialized before returning count */
+    init_real_cuda();
     if (g_in_real_cuda && !g_partial_offload && g_real.cuDeviceGetCount)
         return g_real.cuDeviceGetCount(count);
     int remote_count = 0;
@@ -1343,8 +1342,8 @@ static cudaError_t g_last_error = 0;
 /* g_device_count_cache declared in globals section above */
 
 cudaError_t cudaGetDeviceCount(int *count) {
-    fprintf(stderr, "[chidori] cudaGetDeviceCount CALLED (cache=%d, partial=%d, local=%d)\n",
-            g_device_count_cache, g_partial_offload, g_local_device_count);
+    /* Ensure partial offload is initialized BEFORE returning count */
+    init_real_cuda();
     if (g_device_count_cache >= 0) {
         *count = g_device_count_cache;
         return cudaSuccess;
