@@ -6163,25 +6163,25 @@ static void *lookup_intercepted_symbol(const char *symbol) {
  */
 CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint64_t flags) {
     (void)cudaVersion; (void)flags;
-    fprintf(stderr, "[chidori] cuGetProcAddress('%s') CALLED\n", symbol ? symbol : "NULL");
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
-    /* When inside real CUDA, forward to real driver's cuGetProcAddress */
-    if (g_in_real_cuda > 0 && g_real_cuda_handle) {
+    /* Always forward to real driver — cudart needs this for its internal init.
+     * Returning our own pointers here causes infinite recursion (cuGetProcAddress
+     * asking for cuGetProcAddress) and breaks cudart's driver symbol resolution. */
+    if (g_real_cuda_handle) {
         typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
-        fn_t real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
+        static fn_t real_fn = NULL;
+        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
         if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
     }
 
+    /* No real driver available — return our intercepted version if we have one */
     void *ours = lookup_intercepted_symbol(symbol);
     if (ours) {
         *pfn = ours;
-        LOG_DEBUG("cuGetProcAddress('%s') → OUR interception", symbol);
         return CUDA_SUCCESS;
     }
 
-    /* For non-intercepted symbols, return NULL (let caller handle) */
-    LOG_DEBUG("cuGetProcAddress('%s') → not intercepted", symbol);
     *pfn = NULL;
     return CUDA_ERROR_NOT_FOUND;
 }
