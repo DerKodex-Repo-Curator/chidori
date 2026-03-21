@@ -1411,7 +1411,7 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
      */
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
 
-    memset(prop, 0, 1032);
+    memset(prop, 0, 1008); /* sizeof(cudaDeviceProp) — CUDA 13.x = 1008 */
 
     char *p = (char *)prop;
     int val;
