@@ -6084,39 +6084,49 @@ static const char *g_intercepted_symbols[] = {
     NULL
 };
 
-/* Use __libc_dlsym to avoid recursion when we intercept dlsym */
-extern void *__libc_dlsym(void *handle, const char *symbol);
+/*
+ * dlsym interception — the KEY to partial GPU offloading.
+ *
+ * We save the real dlsym pointer at library load time (constructor),
+ * then override dlsym to intercept CUDA symbol lookups.
+ */
+typedef void *(*real_dlsym_fn)(void *, const char *);
+static real_dlsym_fn g_real_dlsym = NULL;
+
+__attribute__((constructor(101)))  /* Run early, before other constructors */
+static void init_real_dlsym(void) {
+    /* RTLD_NEXT finds the next dlsym in the chain (glibc's) */
+    /* We can't use dlsym to find dlsym — use the GNU extension */
+    extern void *_dl_sym(void *, const char *, void *);
+    g_real_dlsym = (real_dlsym_fn)_dl_sym(RTLD_NEXT, "dlsym", (void *)init_real_dlsym);
+}
 
 static void *lookup_intercepted_symbol(const char *symbol) {
     for (int i = 0; g_intercepted_symbols[i] != NULL; i++) {
         if (strcmp(symbol, g_intercepted_symbols[i]) == 0) {
-            /* Resolve OUR function via __libc_dlsym to avoid recursion */
-            return __libc_dlsym(RTLD_DEFAULT, symbol);
+            /* Resolve OUR function via the real dlsym */
+            if (g_real_dlsym)
+                return g_real_dlsym(RTLD_DEFAULT, symbol);
+            return NULL;
         }
     }
     return NULL;
 }
 
-/*
- * dlsym interception — the KEY to partial GPU offloading.
- *
- * PyTorch (via libcudart) internally calls dlsym() to resolve CUDA driver
- * symbols from libcuda.so. Even though our library IS LD_PRELOAD'd as
- * libcuda.so.1, libcudart may use a specific handle from dlopen() that
- * resolves to the real driver. By intercepting dlsym itself, we ensure
- * ALL CUDA symbol lookups return our function pointers.
- */
 void *dlsym(void *handle, const char *symbol) {
     /* Check if this is a CUDA driver symbol we intercept */
     if (symbol && symbol[0] == 'c' && symbol[1] == 'u') {
         void *ours = lookup_intercepted_symbol(symbol);
         if (ours) {
-            LOG_DEBUG("dlsym('%s') → OUR interception", symbol);
             return ours;
         }
     }
     /* Forward everything else to the real dlsym */
-    return __libc_dlsym(handle, symbol);
+    if (g_real_dlsym)
+        return g_real_dlsym(handle, symbol);
+    /* Fallback if constructor hasn't run yet */
+    extern void *_dl_sym(void *, const char *, void *);
+    return _dl_sym(handle, symbol, (void *)dlsym);
 }
 
 /*
