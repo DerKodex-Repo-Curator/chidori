@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <dlfcn.h>
+#include <zstd.h>
 
 #include "chidori_protocol.h"
 #include "handle_map.h"
@@ -1390,42 +1391,132 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &handle, sizeof(handle));
         }
 
-        /* Driver API failed — try Runtime API for cross-arch */
-        if (s_verbose)
-            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: cuModuleLoadData failed (%d), trying Runtime API\n",
-                    (int)res);
+        /* Driver API failed — parse fat binary, decompress entries (zstd), retry.
+         *
+         * Fat binary format (0xba55ed50):
+         *   [0..3]  magic
+         *   [6..7]  header_size
+         *   [8..15] fat_size
+         * Each entry after the outer header:
+         *   [0..1]  type (1=PTX, 2=ELF)
+         *   [4..7]  entry_header_size
+         *   [8..15] uncompressed_size
+         *   [16..19] compressed_size (0 = not compressed)
+         *   [20..23] flags (bit 0x40 = zstd compressed)
+         *   [28..31] sm_version
+         */
+        {
+            const uint8_t *fb = (const uint8_t *)payload;
+            uint32_t magic = 0;
+            memcpy(&magic, fb, 4);
+            if (magic != 0xba55ed50 || req->payload_size < 16) {
+                fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: bad magic 0x%08x\n", magic);
+                return chidori_send_response(fd, req->seq_num, (int32_t)res, NULL, 0);
+            }
 
-        init_runtime_registration();
-        if (!g_rt_RegisterFatBinary) {
-            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: dlsym(__cudaRegisterFatBinary) failed\n");
-            return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_ERROR_NOT_SUPPORTED, NULL, 0);
+            uint16_t outer_hdr = 0;
+            memcpy(&outer_hdr, fb + 6, 2);
+            if (outer_hdr < 16) outer_hdr = 16;
+            uint64_t fat_size = 0;
+            memcpy(&fat_size, fb + 8, 8);
+            if (fat_size > req->payload_size) fat_size = req->payload_size;
+
+            /* Get server's SM version */
+            int dev_major = 0, dev_minor = 0;
+            cuDeviceGetAttribute(&dev_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, g_devices[0]);
+            cuDeviceGetAttribute(&dev_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, g_devices[0]);
+            uint32_t server_sm = dev_major * 10 + dev_minor;
+
+            /* Scan entries: prefer ELF matching server SM, fallback to PTX */
+            const uint8_t *best_data = NULL;
+            uint64_t best_uncomp = 0;
+            uint32_t best_comp = 0;
+            uint32_t best_flags = 0;
+            int best_type = 0; /* 1=PTX, 2=ELF */
+
+            size_t pos = outer_hdr;
+            while (pos + 16 <= fat_size) {
+                uint16_t etype = 0; memcpy(&etype, fb + pos, 2);
+                uint32_t ehdr = 0;  memcpy(&ehdr, fb + pos + 4, 4);
+                uint64_t uncomp = 0; memcpy(&uncomp, fb + pos + 8, 8);
+                uint32_t comp = 0;  if (ehdr >= 20) memcpy(&comp, fb + pos + 16, 4);
+                uint32_t flags = 0; if (ehdr >= 24) memcpy(&flags, fb + pos + 20, 4);
+                uint32_t sm = 0;    if (ehdr >= 32) memcpy(&sm, fb + pos + 28, 4);
+
+                if (ehdr < 16) ehdr = 16;
+                uint32_t file_sz = (comp > 0 && comp < uncomp) ? comp : (uint32_t)uncomp;
+                if (uncomp == 0 || pos + ehdr + file_sz > fat_size) break;
+
+                /* Prefer: ELF matching server SM > PTX (any) */
+                if (etype == 2 && sm == server_sm) {
+                    best_data = fb + pos + ehdr;
+                    best_uncomp = uncomp;
+                    best_comp = comp;
+                    best_flags = flags;
+                    best_type = 2;
+                } else if (etype == 1 && best_type != 2) {
+                    best_data = fb + pos + ehdr;
+                    best_uncomp = uncomp;
+                    best_comp = comp;
+                    best_flags = flags;
+                    best_type = 1;
+                }
+
+                pos += ehdr + file_sz;
+                if (pos & 7) pos = (pos + 7) & ~(size_t)7;
+            }
+
+            if (best_data) {
+                uint32_t file_sz = (best_comp > 0 && best_comp < best_uncomp)
+                                   ? best_comp : (uint32_t)best_uncomp;
+                void *raw = NULL;
+                size_t raw_size = 0;
+
+                if (best_flags & 0x40) {
+                    /* Zstd-compressed entry — decompress */
+                    raw_size = ZSTD_getFrameContentSize(best_data, file_sz);
+                    if (raw_size == ZSTD_CONTENTSIZE_ERROR || raw_size == ZSTD_CONTENTSIZE_UNKNOWN)
+                        raw_size = (size_t)best_uncomp;
+                    raw = malloc(raw_size);
+                    if (raw) {
+                        size_t result = ZSTD_decompress(raw, raw_size, best_data, file_sz);
+                        if (ZSTD_isError(result)) {
+                            fprintf(stderr, "[cuda_dispatch] zstd decompress failed: %s\n",
+                                    ZSTD_getErrorName(result));
+                            free(raw);
+                            raw = NULL;
+                        } else {
+                            raw_size = result;
+                            fprintf(stderr, "[cuda_dispatch] zstd decompressed: %zu -> %zu bytes (type=%d)\n",
+                                    (size_t)file_sz, raw_size, best_type);
+                        }
+                    }
+                } else {
+                    /* Uncompressed — use directly */
+                    raw = (void *)best_data;
+                    raw_size = file_sz;
+                }
+
+                if (raw) {
+                    res = cuModuleLoadData(&mod, raw);
+                    if (res == CUDA_SUCCESS) {
+                        uint64_t handle = alloc_handle();
+                        hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+                        fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: zstd+cuModuleLoadData SUCCESS "
+                                "(type=%d, handle=0x%llx)\n", best_type, (unsigned long long)handle);
+                        if ((best_flags & 0x40) && raw != best_data) free(raw);
+                        return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS,
+                                                     &handle, sizeof(handle));
+                    }
+                    fprintf(stderr, "[cuda_dispatch] cuModuleLoadData after decompress: %d\n", (int)res);
+                    if ((best_flags & 0x40) && raw != best_data) free(raw);
+                }
+            }
         }
 
-        struct { int magic; int version; const void *data; void *filename; } wrapper;
-        wrapper.magic = 0x466243b1;
-        wrapper.version = 1;
-        wrapper.data = payload;
-        wrapper.filename = NULL;
-
-        void **rt_handle = g_rt_RegisterFatBinary(&wrapper);
-        if (!rt_handle) {
-            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: __cudaRegisterFatBinary returned NULL\n");
-            return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_ERROR_INVALID_IMAGE, NULL, 0);
-        }
-
-        if (g_rt_RegisterFatBinaryEnd)
-            g_rt_RegisterFatBinaryEnd(rt_handle);
-
-        /* Store the runtime handle with bit 63 set to distinguish from Driver API modules */
-        uint64_t rt_val = (uint64_t)(uintptr_t)rt_handle | (1ULL << 63);
-        uint64_t handle = alloc_handle();
-        hmap_put(&g_modules, handle, rt_val);
-
-        if (s_verbose)
-            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Runtime API success, handle=0x%llx (rt_handle=%p)\n",
-                    (unsigned long long)handle, (void *)rt_handle);
-
-        return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &handle, sizeof(handle));
+        fprintf(stderr, "[cuda_dispatch] RegisterFatBinary FAILED: size=%u res=%d\n",
+                req->payload_size, (int)res);
+        return chidori_send_response(fd, req->seq_num, (int32_t)res, NULL, 0);
     }
 
     case CHIDORI_CUDA_REGISTER_FUNCTION: {
