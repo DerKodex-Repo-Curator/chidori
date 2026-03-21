@@ -6084,44 +6084,47 @@ static const char *g_intercepted_symbols[] = {
     NULL
 };
 
-/*
- * dlsym interception — the KEY to partial GPU offloading.
- *
- * We save the real dlsym at constructor time using dlvsym (which we
- * DON'T override). Then our dlsym() checks for CUDA symbols.
- */
-typedef void *(*real_dlsym_t)(void *, const char *);
-static real_dlsym_t g_real_dlsym = NULL;
-
-__attribute__((constructor(101)))
-static void init_real_dlsym(void) {
-    /* dlvsym finds the GLIBC-versioned dlsym, not our override */
-    g_real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
-    if (!g_real_dlsym)
-        g_real_dlsym = (real_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
-}
-
 static void *lookup_intercepted_symbol(const char *symbol) {
     for (int i = 0; g_intercepted_symbols[i] != NULL; i++) {
-        if (strcmp(symbol, g_intercepted_symbols[i]) == 0) {
-            if (g_real_dlsym)
-                return g_real_dlsym(RTLD_DEFAULT, symbol);
-            return NULL;
-        }
+        if (strcmp(symbol, g_intercepted_symbols[i]) == 0)
+            return dlsym(RTLD_DEFAULT, symbol);
     }
     return NULL;
 }
 
-void *dlsym(void *handle, const char *symbol) {
-    if (symbol && symbol[0] == 'c' && symbol[1] == 'u') {
-        void *ours = lookup_intercepted_symbol(symbol);
-        if (ours)
-            return ours;
+/*
+ * cuGetProcAddress / cuGetProcAddress_v2 — CUDA 11.3+ function pointer resolver.
+ *
+ * This is the CUDA Driver API equivalent of cudaGetDriverEntryPoint.
+ * PyTorch's libcudart uses this internally to resolve driver symbols.
+ * By intercepting it, we ensure ALL driver symbol lookups return our
+ * function pointers for partial GPU offloading.
+ */
+CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint64_t flags) {
+    (void)cudaVersion; (void)flags;
+    if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
+
+    void *ours = lookup_intercepted_symbol(symbol);
+    if (ours) {
+        *pfn = ours;
+        LOG_DEBUG("cuGetProcAddress('%s') → OUR interception", symbol);
+        return CUDA_SUCCESS;
     }
-    if (g_real_dlsym)
-        return g_real_dlsym(handle, symbol);
-    /* Fallback before constructor runs */
-    return NULL;
+
+    /* Not intercepted — let the real driver handle it */
+    if (g_in_real_cuda) return CUDA_ERROR_NOT_FOUND;
+
+    /* For non-intercepted symbols, return NULL (let caller handle) */
+    LOG_DEBUG("cuGetProcAddress('%s') → not intercepted", symbol);
+    *pfn = NULL;
+    return CUDA_ERROR_NOT_FOUND;
+}
+
+CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
+                              uint64_t flags, void *symbolStatus) {
+    CUresult r = cuGetProcAddress(symbol, pfn, cudaVersion, flags);
+    if (symbolStatus) *(int *)symbolStatus = (r == CUDA_SUCCESS) ? 1 : 0;
+    return r;
 }
 
 /*
