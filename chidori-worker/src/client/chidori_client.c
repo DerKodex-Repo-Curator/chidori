@@ -5810,20 +5810,33 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                 blockDim.x, blockDim.y, blockDim.z,
                 num_params, total_ps);
 
-    /* Debug: scan param buffer for host pointers that shouldn't be in GPU kernel args */
+    /* Debug: scan param buffer for host pointers that shouldn't be in GPU kernel args.
+     * In partial offload mode, kernel launches on remote devices might contain
+     * host pointers (e.g., UVA-accessible metadata) that work locally but fail remotely. */
     if (param_buf && total_ps >= 8 && !is_local_device(g_current_device)) {
         for (int off = 0; off + 8 <= total_ps; off += 8) {
             uint64_t val = 0;
             memcpy(&val, param_buf + off, 8);
-            /* Host addresses are typically in 0x5xxx or 0x7fxx range for userspace */
-            if (val >= 0x100000000ULL && val < 0x800000000000ULL &&
-                (val >> 40) != 0x70 && (val >> 40) != 0x7e && (val >> 40) != 0x7a &&
-                (val >> 40) != 0x7b && (val >> 40) != 0x7c && (val >> 40) != 0x7d) {
-                fprintf(stderr, "[chidori-launch] WARNING: param_buf[%d] = 0x%llx looks like HOST address "
-                        "(func=%s, dev=%d)\n",
+            /* Check if this looks like a host user-space address (0x55... or similar)
+             * but NOT a GPU address (GPU addresses on CUDA UVA are typically 0x7x...) */
+            if (val >= 0x10000000000ULL && val < 0x60000000000ULL) {
+                /* This is almost certainly a host heap address (PIE binary range) */
+                fprintf(stderr, "[chidori-launch] HOST_PTR: param[%d]=0x%llx dev=%d func=%s\n",
                         off, (unsigned long long)val,
-                        g_registered_functions[func_idx].deviceName,
-                        g_current_device);
+                        g_current_device,
+                        g_registered_functions[func_idx].deviceName);
+                /* Dump what the host pointer points to (first 32 bytes) */
+                fprintf(stderr, "[chidori-launch]   *ptr = ");
+                const uint8_t *hp = (const uint8_t *)(uintptr_t)val;
+                for (int b = 0; b < 32; b++)
+                    fprintf(stderr, "%02x", hp[b]);
+                fprintf(stderr, "\n");
+                /* Also print param layout */
+                for (int i = 0; i < num_params; i++) {
+                    fprintf(stderr, "[chidori-launch]   param[%d] offset=%d size=%d\n",
+                            i, g_registered_functions[func_idx].params[i].offset,
+                            g_registered_functions[func_idx].params[i].size);
+                }
             }
         }
     }
