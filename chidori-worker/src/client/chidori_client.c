@@ -340,19 +340,28 @@ static inline void *ensure_real_cublas(void) {
      * from finding our libcuda.so.1 symlink when resolving cuBLAS's dependencies.
      * This forces it to use the real NVIDIA driver. */
     if (g_partial_offload) {
-        /* Save and unset LD_LIBRARY_PATH to prevent finding our libcuda.so.1 */
+        /* For local device cuBLAS: must use DEEPBIND to isolate from our interceptors.
+         * PyTorch's cuBLAS 12 can't be DEEPBIND'd (same SONAME = same handle).
+         * Use the SYSTEM cuBLAS instead (different SONAME = separate library).
+         * Remove LD_LIBRARY_PATH to prevent finding our libcuda.so.1 symlink. */
         const char *saved_ldpath = getenv("LD_LIBRARY_PATH");
         char *ldpath_copy = saved_ldpath ? strdup(saved_ldpath) : NULL;
         if (saved_ldpath) unsetenv("LD_LIBRARY_PATH");
 
-        g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_DEEPBIND);
-        if (!g_real_cublas_handle)
-            g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_DEEPBIND);
+        /* Try system cuBLAS paths with DEEPBIND */
+        static const char *cublas_paths[] = {
+            "/opt/cuda/lib64/libcublas.so",    /* System CUDA install */
+            "/usr/local/cuda/lib64/libcublas.so",
+            "/usr/lib/x86_64-linux-gnu/libcublas.so",
+            "/usr/lib64/libcublas.so",
+            NULL
+        };
+        for (int i = 0; cublas_paths[i] && !g_real_cublas_handle; i++) {
+            g_real_cublas_handle = dlopen(cublas_paths[i], RTLD_LAZY | RTLD_DEEPBIND);
+        }
 
-        /* Restore LD_LIBRARY_PATH */
         if (ldpath_copy) { setenv("LD_LIBRARY_PATH", ldpath_copy, 1); free(ldpath_copy); }
     } else {
-        /* Non-partial: use NOLOAD to get PyTorch's already-loaded cuBLAS */
         g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_NOLOAD);
         if (!g_real_cublas_handle)
             g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_NOLOAD);
@@ -6237,9 +6246,16 @@ static inline void *ensure_real_cublaslt(void) {
         const char *saved_ldpath = getenv("LD_LIBRARY_PATH");
         char *ldpath_copy = saved_ldpath ? strdup(saved_ldpath) : NULL;
         if (saved_ldpath) unsetenv("LD_LIBRARY_PATH");
-        g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY | RTLD_DEEPBIND);
-        if (!g_real_cublaslt_handle)
-            g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY | RTLD_DEEPBIND);
+        static const char *lt_paths[] = {
+            "/opt/cuda/lib64/libcublasLt.so",
+            "/usr/local/cuda/lib64/libcublasLt.so",
+            "/usr/lib/x86_64-linux-gnu/libcublasLt.so",
+            "/usr/lib64/libcublasLt.so",
+            NULL
+        };
+        for (int i = 0; lt_paths[i] && !g_real_cublaslt_handle; i++) {
+            g_real_cublaslt_handle = dlopen(lt_paths[i], RTLD_LAZY | RTLD_DEEPBIND);
+        }
         if (ldpath_copy) { setenv("LD_LIBRARY_PATH", ldpath_copy, 1); free(ldpath_copy); }
     } else {
         g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY | RTLD_NOLOAD);
