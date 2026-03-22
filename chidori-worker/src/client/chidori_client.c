@@ -5042,18 +5042,21 @@ cudaError_t cudaStreamQuery(void *stream) {
 }
 
 cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
-    (void)flags;
+    (void)flags; (void)stream;
     /* For cross-device copy: if event is local, synchronize it directly.
-     * The event was created and recorded on local device — waiting for it
-     * ensures the DtoH copy completed before HtoD starts on remote device. */
-    if (g_partial_offload && g_real.cuEventSynchronize && event) {
+     * Must temporarily activate local context — it may have been deactivated
+     * when we switched to the remote device. */
+    if (g_partial_offload && g_real.cuEventSynchronize && event && g_local_ctx) {
         g_in_real_cuda++;
+        /* Save and restore context around sync */
+        CUcontext saved_ctx = NULL;
+        if (g_real.cuCtxGetCurrent) g_real.cuCtxGetCurrent(&saved_ctx);
+        if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(g_local_ctx);
         CUresult r = g_real.cuEventSynchronize((CUevent)event);
+        if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(saved_ctx);
         g_in_real_cuda--;
         if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
-        /* If it's not a local event, fall through to no-op */
     }
-    (void)stream;
     g_last_error = cudaSuccess;
     return cudaSuccess;
 }
