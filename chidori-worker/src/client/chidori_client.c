@@ -92,13 +92,21 @@ void *dlopen(const char *filename, int flags) {
         real_dlopen = __real_dlsym(RTLD_NEXT, "dlopen");
     }
 
-    /* Redirect libcuda.so.1 dlopen to real driver when:
-     * 1. Explicitly enabled (g_dlopen_redirect_active, during cuBLAS create), OR
-     * 2. Inside a real CUDA call (g_in_real_cuda > 0, during cuBLAS GemmEx etc.)
-     * This ensures cuBLAS gets real driver functions for ALL operations,
-     * not just initialization. Needed for fp16 GemmEx which lazily loads kernels. */
-    if ((g_dlopen_redirect_active || g_in_real_cuda > 0) &&
-        g_real_cuda_handle_for_dlopen && filename &&
+    /* ALWAYS redirect dlopen("libcuda.so.1") to the real NVIDIA driver.
+     *
+     * NVIDIA libraries (cuBLAS, cublasLt, cuDNN, etc.) dlopen libcuda.so.1
+     * during their constructors and cache driver function pointers via
+     * dlsym → cuGetProcAddress. If they get our library instead of the
+     * real driver, they cache our intercepted functions, which breaks
+     * cuBLAS FP16 GemmEx (CUBLAS_STATUS_NOT_INITIALIZED).
+     *
+     * By always redirecting to the real driver:
+     * - NVIDIA libs get real driver function pointers → FP16 works
+     * - Our cuBLAS PLT interception still handles local/remote routing
+     * - Remote operations go through our cuBLAS interceptors → RPC
+     * - cudart's cuGetProcAddress is intercepted separately (via PLT)
+     *   to maintain our virtual device layout for PyTorch */
+    if (g_real_cuda_handle_for_dlopen && filename &&
         (strcmp(filename, "libcuda.so.1") == 0 ||
          strcmp(filename, "libcuda.so") == 0)) {
         return g_real_cuda_handle_for_dlopen;
