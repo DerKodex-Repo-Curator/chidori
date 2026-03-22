@@ -226,15 +226,13 @@ void *dlsym(void *handle, const char *symbol) {
          * MINIMAL set: only functions that take device ordinals or affect
          * device context. Avoid intercepting cuMemAlloc etc. here to
          * prevent hanging during cuBLAS lazy init. */
+        /* MINIMAL: only primary context functions that take device ordinals.
+         * cuDeviceGetCount/Get/GetAttribute are NOT intercepted here to
+         * avoid init hangs — cuBLAS needs real values from those. */
         static const char *g_virtual_device_symbols[] = {
-            "cuDeviceGetCount", "cuDeviceGet", "cuDeviceGetName",
-            "cuDeviceGetAttribute", "cuDeviceGetUuid",
-            "cuDeviceTotalMem", "cuDeviceTotalMem_v2",
             "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease",
             "cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxGetState",
-            "cuDevicePrimaryCtxSetFlags", "cuDevicePrimaryCtxSetFlags_v2",
-            "cuDevicePrimaryCtxReset", "cuDevicePrimaryCtxReset_v2",
-            "cuDeviceGetPCIBusId",
+            "cuDevicePrimaryCtxSetFlags_v2", "cuDevicePrimaryCtxReset_v2",
             NULL
         };
         for (int i = 0; g_virtual_device_symbols[i] != NULL; i++) {
