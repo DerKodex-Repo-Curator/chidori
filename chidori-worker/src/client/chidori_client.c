@@ -63,34 +63,19 @@ static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real 
  * ============================================================================
  */
 static void *(*g_real_dlsym_fn)(void *, const char *) = NULL;
-static void *(*g_real_dlvsym_fn)(void *, const char *, const char *) = NULL;
 
-/* Get the real glibc dlvsym via _dl_sym or linker tricks.
- * Called once at startup BEFORE our dlvsym override is active. */
-extern void *_dl_sym(void *, const char *, void *) __attribute__((weak));
+/* We do NOT override dlvsym — it remains glibc's. We can safely call it
+ * to bootstrap the real dlsym. Our only override is dlsym(). */
+extern void *dlvsym(void *handle, const char *symbol, const char *version);
 
 static void init_real_dlsym(void) {
     if (g_real_dlsym_fn) return;
-    /* First, get glibc's real dlvsym so we can resolve versioned dlsym.
-     * We can't call dlvsym() directly because our override intercepts it.
-     * Use _dl_sym (glibc internal, weak) as bootstrap. */
-    if (_dl_sym) {
-        g_real_dlvsym_fn = (void *(*)(void *, const char *, const char *))
-            _dl_sym(RTLD_NEXT, "dlvsym", (void *)init_real_dlsym);
-    }
-    if (g_real_dlvsym_fn) {
-        g_real_dlsym_fn = (void *(*)(void *, const char *))
-            g_real_dlvsym_fn(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
-    }
+    /* Use glibc's dlvsym (NOT overridden) to get versioned dlsym.
+     * This gives us the real glibc dlsym, bypassing our override. */
+    g_real_dlsym_fn = (void *(*)(void *, const char *))
+        dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
     if (!g_real_dlsym_fn) {
-        /* Last resort: try _dl_sym for dlsym directly */
-        if (_dl_sym) {
-            g_real_dlsym_fn = (void *(*)(void *, const char *))
-                _dl_sym(RTLD_NEXT, "dlsym", (void *)init_real_dlsym);
-        }
-    }
-    if (!g_real_dlsym_fn) {
-        fprintf(stderr, "[chidori] FATAL: could not bootstrap real dlsym\n");
+        fprintf(stderr, "[chidori] WARNING: dlvsym failed to resolve real dlsym\n");
     }
 }
 
@@ -213,27 +198,9 @@ void *dlsym(void *handle, const char *symbol) {
     return __real_dlsym(handle, symbol);
 }
 
-/* Also intercept dlvsym — PyTorch may use versioned symbol resolution */
-void *dlvsym(void *handle, const char *symbol, const char *version) {
-    /* Use the real dlvsym stored during bootstrap */
-    if (!g_real_dlvsym_fn) init_real_dlsym();
-
-    /* Same interception logic as dlsym for cuBLAS symbols */
-    if (g_in_real_cuda == 0 && symbol) {
-        for (int i = 0; g_intercepted_cublas_symbols[i] != NULL; i++) {
-            if (strcmp(symbol, g_intercepted_cublas_symbols[i]) == 0) {
-                void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
-                if (ours) {
-                    fprintf(stderr, "[chidori-dlvsym] %s@%s → OUR %p\n", symbol, version ? version : "?", ours);
-                    return ours;
-                }
-                break;
-            }
-        }
-    }
-
-    return g_real_dlvsym_fn ? g_real_dlvsym_fn(handle, symbol, version) : NULL;
-}
+/* NOTE: We do NOT override dlvsym. If PyTorch uses dlvsym for cuBLAS
+ * symbol resolution, we'll need to add an interceptor here. For now,
+ * dlsym interception should catch the common case. */
 
 /*
  * ============================================================================
