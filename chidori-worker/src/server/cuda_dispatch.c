@@ -1380,7 +1380,13 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * client -> sm_120 server). The Runtime handle is stored with bit 63
          * set so REGISTER_FUNCTION knows to use the Runtime API path. */
         CUmodule mod;
+
+        /* Ensure we have an active CUDA context before loading modules */
+        ensure_device_context(0);
+
         res = cuModuleLoadData(&mod, payload);
+        fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: fast-path cuModuleLoadData=%d (size=%u)\n",
+                (int)res, req->payload_size);
         if (res == CUDA_SUCCESS) {
             /* Same-arch: store as a normal Driver API module (no bit 63) */
             uint64_t handle = alloc_handle();
@@ -1532,6 +1538,41 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     if ((best_flags & 0x40) && raw != best_data) free(raw);
                 }
             }
+        }
+
+        /* ---- Last resort: __cudaRegisterFatBinary (Runtime API) ----
+         * This handles cases where cuModuleLoadData fails (e.g., compressed cubins
+         * that the driver API can't parse, or context state issues). The Runtime
+         * API handles fat binary parsing internally and supports PTX JIT. */
+        init_runtime_registration();
+        if (g_rt_RegisterFatBinary) {
+            /* Build the __fatBinC_Wrapper struct that __cudaRegisterFatBinary expects */
+            struct {
+                int magic;
+                int version;
+                const void *data;
+                void *filename;
+            } wrapper;
+            wrapper.magic = 0x466243b1;   /* __cudaFatMAGIC2 */
+            wrapper.version = 1;
+            wrapper.data = payload;
+            wrapper.filename = NULL;
+
+            void **rt_handle = g_rt_RegisterFatBinary(&wrapper);
+            if (rt_handle) {
+                if (g_rt_RegisterFatBinaryEnd)
+                    g_rt_RegisterFatBinaryEnd(rt_handle);
+
+                uint64_t handle = alloc_handle();
+                /* Store with bit 63 set to indicate Runtime API module */
+                hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
+                fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Runtime API fallback SUCCESS "
+                        "(handle=0x%llx, rt_handle=%p)\n",
+                        (unsigned long long)handle, (void *)rt_handle);
+                return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS,
+                                             &handle, sizeof(handle));
+            }
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Runtime API fallback also failed\n");
         }
 
         fprintf(stderr, "[cuda_dispatch] RegisterFatBinary FAILED: size=%u res=%d\n",
