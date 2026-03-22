@@ -1667,8 +1667,9 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
      *   404: int computeMode
      */
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
+    fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    memset(prop, 0, 1008); /* sizeof(cudaDeviceProp) — CUDA 13.x = 1008 */
+    memset(prop, 0, 2048); /* sizeof(cudaDeviceProp) — oversized for safety */
 
     char *p = (char *)prop;
     int val;
