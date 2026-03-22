@@ -5048,11 +5048,13 @@ cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
      * when we switched to the remote device. */
     if (g_partial_offload && g_real.cuEventSynchronize && event && g_local_ctx) {
         g_in_real_cuda++;
-        /* Save and restore context around sync */
         CUcontext saved_ctx = NULL;
         if (g_real.cuCtxGetCurrent) g_real.cuCtxGetCurrent(&saved_ctx);
+        fprintf(stderr, "[chidori] cudaStreamWaitEvent: event=%p ctx_before=%p local_ctx=%p dev=%d\n",
+                event, (void*)saved_ctx, (void*)g_local_ctx, g_current_device);
         if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(g_local_ctx);
         CUresult r = g_real.cuEventSynchronize((CUevent)event);
+        fprintf(stderr, "[chidori] cudaStreamWaitEvent: cuEventSynchronize=%d\n", r);
         if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(saved_ctx);
         g_in_real_cuda--;
         if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
