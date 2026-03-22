@@ -1,5 +1,83 @@
 # Updates Log - Partial GPU Offloading
 
+## Session: 2026-03-22 (continued) - cuBLAS Local Routing FIXED
+
+### MILESTONE: cuBLAS matmul on local GPU works!
+```
+Devices: 2
+cuda:0 tensor: [1.0, 2.0, 3.0]   <- LOCAL GPU
+cuda:1 tensor: [4.0, 5.0, 6.0]   <- REMOTE SERVER
+cuda:0 matmul err=0.000042        <- LOCAL cuBLAS WORKING!
+cuda:1 matmul err=0.000042        <- REMOTE cuBLAS still works
+=== ALL PARTIAL OFFLOAD TESTS PASSED ===
+```
+
+### Root Cause Found: cuBLAS uses dlopen+dlsym, NOT PLT
+- `readelf -d libcublas.so` shows NO DT_NEEDED for libcuda.so.1
+- cuBLAS imports: dlopen@GLIBC, dlsym@GLIBC (runtime resolution)
+- DEEPBIND was NEVER going to work (only affects PLT, not dlsym)
+- With LD_LIBRARY_PATH=build, cuBLAS's dlopen("libcuda.so.1") found our
+  symlink (SONAME libchidori.so) → got our intercepted functions → error 14
+
+### The Fix: dlopen interception with thread-local flag
+1. Intercept `dlopen()` in our LD_PRELOAD library
+2. Thread-local flag `g_dlopen_redirect_active` (default 0)
+3. Set flag=1 ONLY around cublasCreate_v2 call
+4. When flag=1 and dlopen("libcuda.so.1") is called, return real driver handle
+5. cuBLAS gets real NVIDIA driver functions via dlsym → no reentrance → works
+
+### What was also needed (but insufficient alone)
+- is_local_device() routing added to: cuModuleLoadData, cuModuleGetFunction,
+  cuModuleUnload, cuLaunchKernel (Driver API), cuFuncGetAttribute,
+  cuMemsetD8_v2, cuMemsetD32_v2
+- PyTorch's cuBLAS via RTLD_NOLOAD (not system CUDA 13.1 cuBLAS)
+
+### What was tried and REJECTED
+- **dlmopen**: Too dangerous for CUDA (pthread bugs in secondary namespaces,
+  TLS exhaustion, STB_GNU_UNIQUE leakage, zero prior art with NVIDIA libs)
+- **DEEPBIND**: Useless — cuBLAS uses dlsym not PLT
+- **Remove LD_LIBRARY_PATH=build**: Breaks PyTorch's NVRTC module (also
+  uses dlopen+dlsym, needs our intercepted functions for device 1)
+- **Blanket dlopen redirect**: Breaks PyTorch CUDA init (_hasPrimaryContext
+  on device 1 via real driver → "invalid device ordinal")
+
+### MILESTONE: Kernel launch on local GPU ALSO WORKS!
+```
+cuda:0 randn: [0.192, -0.333, -2.266, 1.357]  <- LOCAL KERNEL LAUNCH!
+cuda:1 randn: [0.890, 0.147, -1.272, 0.703]   <- REMOTE KERNEL LAUNCH
+=== ALL PARTIAL OFFLOAD TESTS PASSED ===
+```
+
+### MILESTONE: GPU-to-GPU Cross-Device Copy WORKS!
+```
+cuda:0->cuda:1: [1.0, 2.0, 3.0]   <- LOCAL → REMOTE
+cuda:1->cuda:0: [1.0, 2.0, 3.0]   <- REMOTE → LOCAL
+=== ALL CPU-GPU AND GPU-GPU OFFLOAD TESTS PASSED ===
+```
+Root cause: PyTorch's `copy_device_to_device` uses `cudaMemcpyAsync(D2D)` with UVA,
+but local/remote pointers are on different machines. Fixed by intercepting D2D memcpy
+when src/dst are on different devices (via pointer-to-device tracker), staging through CPU.
+
+Also fixed: cudaDeviceCanAccessPeer (was sending RPC with invalid device nums),
+CUDA event routing (events created on wrong device), cudaStreamWaitEvent (context
+deactivation + remote event handles), cudaEventRecordWithFlags (missing interception).
+
+### Kernel Launch FPE Root Cause
+- `maxThreadsPerMultiProcessor` was 0 → FPE (division by zero in RNG config)
+- Our `cudaGetDeviceProperties` wrote attr 39 at WRONG offset (460)
+- PyTorch (CUDA 12.8) reads it from offset 624 (struct layout diverged)
+- Empirically determined correct offsets using CHIDORI_OFFSET_DIAG pattern fill
+
+### Commits
+- 28620ed: fix: add is_local_device routing to cuModule/cuLaunchKernel/cuMemset
+- 50414fb: fix: use PyTorch's cuBLAS (RTLD_NOLOAD) instead of system CUDA 13.x
+- 2f5f6a4: fix: intercept dlopen to redirect libcuda.so.1 to real driver for cuBLAS
+- 34c6eb4: fix: only redirect dlopen during cuBLAS init, not PyTorch CUDA init
+- 835147d: fix: correct cudaDeviceAttr enum values
+- 8dbb1ac: fix: correct cudaDeviceProp struct offsets for CUDA 12.8
+
+---
+
 ## Session: 2026-03-22
 
 ### MILESTONE ACHIEVED: Basic Partial GPU Offloading Works!
