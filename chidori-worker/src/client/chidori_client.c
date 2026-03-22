@@ -122,12 +122,11 @@ void *dlopen(const char *filename, int flags) {
         real_dlopen = __real_dlsym(RTLD_NEXT, "dlopen");
     }
 
-    /* ALWAYS redirect dlopen("libcuda.so.1") to the real NVIDIA driver.
-     * This gives cuBLAS/cublasLt real driver function pointers for FP16.
-     * Our dlsym interceptor ensures that DRIVER API symbols (cuDeviceGetCount,
-     * cuDevicePrimaryCtxRetain, etc.) still return OUR versions for virtual
-     * device routing, even when resolved from the real driver handle. */
-    if (g_real_cuda_handle_for_dlopen && filename &&
+    /* Redirect libcuda.so.1 dlopen to real driver when inside a real
+     * CUDA/cuBLAS call. This gives cuBLAS real driver functions for its
+     * internal operations on the local GPU. */
+    if ((g_dlopen_redirect_active || g_in_real_cuda > 0) &&
+        g_real_cuda_handle_for_dlopen && filename &&
         (strcmp(filename, "libcuda.so.1") == 0 ||
          strcmp(filename, "libcuda.so") == 0)) {
         return g_real_cuda_handle_for_dlopen;
