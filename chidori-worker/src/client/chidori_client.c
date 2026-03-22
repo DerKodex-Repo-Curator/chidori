@@ -2683,10 +2683,14 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
 
 static uint64_t g_last_cublas_handle = 0; /* Track last cuBLAS handle for cublasLt translation */
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
+    { char _b[128]; int _l = snprintf(_b, sizeof(_b), "[TRACE] cublasCreate_v2 dev=%d local=%d\n", g_current_device, is_local_device(g_current_device));
+      if (_l > 0) write(STDERR_FILENO, _b, _l); }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (local_h) {
+            { char _b[128]; int _l = snprintf(_b, sizeof(_b), "[TRACE] cublasCreate_v2 → LOCAL handle=%p\n", (void*)local_h);
+              if (_l > 0) write(STDERR_FILENO, _b, _l); }
             *handle = local_h;
             return CUBLAS_STATUS_SUCCESS;
         }
