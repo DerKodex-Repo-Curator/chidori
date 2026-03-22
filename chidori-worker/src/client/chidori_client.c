@@ -122,14 +122,12 @@ void *dlopen(const char *filename, int flags) {
         real_dlopen = __real_dlsym(RTLD_NEXT, "dlopen");
     }
 
-    /* Redirect libcuda.so.1 dlopen to real driver when:
-     * 1. Explicitly enabled (g_dlopen_redirect_active, during cuBLAS create), OR
-     * 2. Inside a real CUDA call (g_in_real_cuda > 0, during cuBLAS GemmEx etc.)
-     * This ensures cuBLAS gets real driver functions for internal operations,
-     * while other libraries (libc10_cuda, cudart) get our interceptor to handle
-     * virtual device routing. */
-    if ((g_dlopen_redirect_active || g_in_real_cuda > 0) &&
-        g_real_cuda_handle_for_dlopen && filename &&
+    /* ALWAYS redirect dlopen("libcuda.so.1") to the real NVIDIA driver.
+     * This gives cuBLAS/cublasLt real driver function pointers for FP16.
+     * Our dlsym interceptor ensures that DRIVER API symbols (cuDeviceGetCount,
+     * cuDevicePrimaryCtxRetain, etc.) still return OUR versions for virtual
+     * device routing, even when resolved from the real driver handle. */
+    if (g_real_cuda_handle_for_dlopen && filename &&
         (strcmp(filename, "libcuda.so.1") == 0 ||
          strcmp(filename, "libcuda.so") == 0)) {
         return g_real_cuda_handle_for_dlopen;
@@ -213,12 +211,35 @@ void *dlsym(void *handle, const char *symbol) {
     if (symbol) {
         for (int i = 0; g_intercepted_cublas_symbols[i] != NULL; i++) {
             if (strcmp(symbol, g_intercepted_cublas_symbols[i]) == 0) {
-                /* Return OUR version so local/remote routing works */
                 void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
-                if (ours) {
-                    return ours;
-                }
-                break;  /* symbol matched but we couldn't find ours — fall through */
+                if (ours) return ours;
+                break;
+            }
+        }
+        /* Also intercept CUDA driver API symbols that need virtual device routing.
+         * Without this, libraries that dlopen the real driver and dlsym driver
+         * functions would bypass our interception entirely. This is needed when
+         * always-redirect dlopen gives libraries the real driver handle. */
+        static const char *driver_syms[] = {
+            "cuDeviceGetCount", "cuDeviceGet", "cuDeviceGetName",
+            "cuDeviceGetAttribute", "cuDeviceTotalMem", "cuDeviceTotalMem_v2",
+            "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease",
+            "cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxGetState",
+            "cuDevicePrimaryCtxSetFlags", "cuDevicePrimaryCtxSetFlags_v2",
+            "cuDevicePrimaryCtxReset", "cuDevicePrimaryCtxReset_v2",
+            "cuCtxGetCurrent", "cuCtxSetCurrent", "cuCtxSynchronize",
+            "cuMemAlloc", "cuMemAlloc_v2", "cuMemFree", "cuMemFree_v2",
+            "cuMemcpyHtoD", "cuMemcpyHtoD_v2", "cuMemcpyDtoH", "cuMemcpyDtoH_v2",
+            "cuMemGetInfo", "cuMemGetInfo_v2",
+            "cuInit", "cuDriverGetVersion",
+            "cuGetProcAddress", "cuGetProcAddress_v2",
+            NULL
+        };
+        for (int i = 0; driver_syms[i] != NULL; i++) {
+            if (strcmp(symbol, driver_syms[i]) == 0) {
+                void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
+                if (ours) return ours;
+                break;
             }
         }
     }
