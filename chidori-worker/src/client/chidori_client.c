@@ -216,32 +216,6 @@ void *dlsym(void *handle, const char *symbol) {
                 break;
             }
         }
-        /* Also intercept CUDA driver API symbols that need virtual device routing.
-         * Without this, libraries that dlopen the real driver and dlsym driver
-         * functions would bypass our interception entirely. This is needed when
-         * always-redirect dlopen gives libraries the real driver handle. */
-        static const char *driver_syms[] = {
-            "cuDeviceGetCount", "cuDeviceGet", "cuDeviceGetName",
-            "cuDeviceGetAttribute", "cuDeviceTotalMem", "cuDeviceTotalMem_v2",
-            "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease",
-            "cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxGetState",
-            "cuDevicePrimaryCtxSetFlags", "cuDevicePrimaryCtxSetFlags_v2",
-            "cuDevicePrimaryCtxReset", "cuDevicePrimaryCtxReset_v2",
-            "cuCtxGetCurrent", "cuCtxSetCurrent", "cuCtxSynchronize",
-            "cuMemAlloc", "cuMemAlloc_v2", "cuMemFree", "cuMemFree_v2",
-            "cuMemcpyHtoD", "cuMemcpyHtoD_v2", "cuMemcpyDtoH", "cuMemcpyDtoH_v2",
-            "cuMemGetInfo", "cuMemGetInfo_v2",
-            "cuInit", "cuDriverGetVersion",
-            "cuGetProcAddress", "cuGetProcAddress_v2",
-            NULL
-        };
-        for (int i = 0; driver_syms[i] != NULL; i++) {
-            if (strcmp(symbol, driver_syms[i]) == 0) {
-                void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
-                if (ours) return ours;
-                break;
-            }
-        }
     }
 
     /* All other symbols: return the real result */
