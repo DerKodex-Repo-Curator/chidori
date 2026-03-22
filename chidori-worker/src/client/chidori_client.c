@@ -56,8 +56,15 @@ static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real 
  * constructors run. This ensures our dlopen redirect is active when cuBLAS,
  * cublasLt, cuDNN etc. call dlopen("libcuda.so.1") during their init.
  * Priority 101 runs before default constructors (priority 65535). */
-/* Early constructor removed — it caused issues with library loading order.
- * g_real_cuda_handle_for_dlopen is set by init_real_cuda() instead. */
+/* Auto-set TORCH_BLAS_PREFER_CUBLASLT=1 for partial offload.
+ * PyTorch's cublasGemmEx path caches driver function pointers that see
+ * our virtual device count, causing NOT_INITIALIZED for FP16. The cublasLt
+ * path works because our cublasLt routing handles descriptors properly.
+ * This env var forces PyTorch to use cublasLt for ALL GEMM ops. */
+__attribute__((constructor))
+static void auto_prefer_cublaslt(void) {
+    setenv("TORCH_BLAS_PREFER_CUBLASLT", "1", 0); /* 0 = don't overwrite if set */
+}
 
 /*
  * ============================================================================
