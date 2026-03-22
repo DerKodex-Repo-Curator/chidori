@@ -306,6 +306,10 @@ static int g_fatbin_passthrough = -1;    /* 1 if CHIDORI_FATBIN_PASSTHROUGH=1: s
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
 static int g_current_device = 0;         /* current active device (global) */
+/* Track remote GPU address range to distinguish GPU vs host pointers.
+ * Updated on each remote cudaMalloc return. */
+static uint64_t g_remote_gpu_addr_min = UINT64_MAX;
+static uint64_t g_remote_gpu_addr_max = 0;
 
 /*
  * Deferred init mode (CHIDORI_DEFERRED_INIT=1):
@@ -2239,6 +2243,9 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
     if (r == cudaSuccess) {
         *devPtr = (void *)(uintptr_t)ptr64;
         alloc_track_add(ptr64, size, g_current_device);
+        /* Track remote GPU address range for host pointer detection */
+        if (ptr64 < g_remote_gpu_addr_min) g_remote_gpu_addr_min = ptr64;
+        if (ptr64 + size > g_remote_gpu_addr_max) g_remote_gpu_addr_max = ptr64 + size;
     }
     g_last_error = r;
     return r;
@@ -5824,8 +5831,28 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
         for (int off = 0; off + 8 <= total_ps; off += 8) {
             uint64_t val = 0;
             memcpy(&val, param_buf + off, 8);
-            /* Detect host user-space heap addresses (PIE binary range: 0x55...-0x5f...) */
-            if (val >= 0x10000000000ULL && val < 0x600000000000ULL) {
+            /* Detect host pointers: any plausible address that is NOT in the
+             * known remote GPU address range. GPU addresses cluster in a specific
+             * region (e.g., 0x7d4c...). Anything outside that range but still
+             * looking like a valid address is likely host memory (UVA-accessible
+             * on local GPU but inaccessible on remote GPU). */
+            int is_host_ptr = 0;
+            if (val >= 0x10000000000ULL && val < 0x800000000000ULL) {
+                /* Looks like a valid 48-bit userspace address */
+                if (g_remote_gpu_addr_min < g_remote_gpu_addr_max) {
+                    /* We have a known GPU range — check if val is outside it.
+                     * Allow some margin (GPU allocations cluster together). */
+                    uint64_t gpu_base = g_remote_gpu_addr_min & ~0xFFFFFFFFULL; /* align to 4GB */
+                    uint64_t gpu_top = (g_remote_gpu_addr_max + 0xFFFFFFFFULL) & ~0xFFFFFFFFULL;
+                    if (val < gpu_base || val >= gpu_top)
+                        is_host_ptr = 1;
+                } else {
+                    /* No GPU range known yet — use heuristic (PIE heap range) */
+                    if (val < 0x600000000000ULL)
+                        is_host_ptr = 1;
+                }
+            }
+            if (is_host_ptr) {
                 /* Copy 256 bytes from host pointer to remote device memory.
                  * OffsetCalculator and similar metadata structs are typically < 128 bytes. */
                 size_t copy_size = 256;
