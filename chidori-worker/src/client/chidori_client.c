@@ -6980,6 +6980,17 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
     (void)cudaVersion; (void)flags;
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
+    /* REENTRANCE GUARD: When inside a real CUDA/cuBLAS call (g_in_real_cuda > 0),
+     * return REAL driver function pointers so internal operations (cuBLAS init,
+     * cudart handshake, etc.) work correctly against the real GPU. Without this,
+     * cuBLAS gets our intercepted pointers during init → CUBLAS_STATUS_INTERNAL_ERROR. */
+    if (g_in_real_cuda > 0 && g_real_cuda_handle) {
+        typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
+        if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
+    }
+
     /* Return OUR intercepted functions for ALL modes (including partial offload).
      * Our functions handle the local/remote routing via g_in_real_cuda guard.
      * If we returned real driver pointers here, cudart would bypass our
