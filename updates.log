@@ -76,6 +76,26 @@ PASS: async mode (no CUDA_LAUNCH_BLOCKING)
 Training confirmed: forward + backward + optimizer step on BOTH devices.
 Losses decrease properly = learning is happening. Async mode works.
 
+### Remaining Issues (Advanced Tests)
+1. **FP16 cuBLAS GemmEx**: PyTorch caches cublasGemmEx via dlsym(cublas_handle),
+   bypassing our PLT interception entirely. The cached pointer goes to real cuBLAS
+   which has our intercepted driver functions → fails for fp16 tensor ops.
+   **Fix needed**: intercept dlsym to return our functions for cuBLAS symbols,
+   OR intercept at cuGetProcAddress level (HAMi-core approach).
+2. **CUTLASS scaled_dot_product_attention**: "no kernel found to launch"
+   Related to cuBLAS issue — CUTLASS selects kernels via cached device properties.
+3. **Split model backward**: crashes (core dump) during cross-device gradient flow.
+
+### Advanced Test Results (19 basic PASS, 5 advanced FAIL)
+- large_matmul_2048: PASS (local=1.2s remote=8.4s)
+- chained_matmul: PASS
+- matmul_fp16: FAIL (CUBLAS_STATUS_NOT_INITIALIZED — dlsym bypass)
+- transformer_block: FAIL (cutlassF no kernel — needs dlsym fix)
+- gradient_accumulation: FAIL (loss didn't decrease — needs debugging)
+- model_state_dict_transfer: PASS
+- split_model_forward: PASS
+- split_model_training: CRASH
+
 ### MILESTONE: REAL REMOTE TEST — Lenovo → Vast.ai over internet
 ```
 Client: Lenovo (RTX 4090 Laptop, local GPU = device 0)
