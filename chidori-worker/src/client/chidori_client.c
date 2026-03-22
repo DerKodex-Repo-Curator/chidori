@@ -1225,16 +1225,6 @@ CUresult cuDeviceGetCount(int *count) {
     if (g_in_real_cuda > 0 && g_real.cuDeviceGetCount)
         return g_real.cuDeviceGetCount(count); /* reentrance: return REAL device count */
     if (!count) return CUDA_ERROR_INVALID_VALUE;
-    /* LOCAL DEVICE CONTEXT: When the current device is local AND we're
-     * not inside one of our explicit cuBLAS wrappers (g_in_real_cuda==0),
-     * a NVIDIA library (cuBLAS, cuBLASLt) may be calling through cached
-     * function pointers obtained via cuGetProcAddress. These libraries
-     * expect to see the REAL device count, not our virtual count.
-     * Returning 2 devices when the handle was created seeing 1 causes
-     * cuBLAS to return CUBLAS_STATUS_NOT_INITIALIZED for FP16 GemmEx. */
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuDeviceGetCount) {
-        return g_real.cuDeviceGetCount(count);
-    }
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
