@@ -223,10 +223,8 @@ void *dlsym(void *handle, const char *symbol) {
                 /* Return OUR version so local/remote routing works */
                 void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
                 if (ours) {
-                    fprintf(stderr, "[chidori-dlsym] %s → OUR %p (handle=%p)\n", symbol, ours, handle);
                     return ours;
                 }
-                fprintf(stderr, "[chidori-dlsym] %s MATCH but RTLD_DEFAULT returned NULL!\n", symbol);
                 break;  /* symbol matched but we couldn't find ours — fall through */
             }
         }
@@ -2813,10 +2811,6 @@ cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
 }
 
 cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
-    /* DIAG: always return NOT_SUPPORTED for FP16 math mode to trace error path */
-    if (g_partial_offload && is_local_device(g_current_device) && mode != 0) {
-        return (cublasStatus_t)15; /* CUBLAS_STATUS_NOT_SUPPORTED */
-    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasMath_t);
@@ -3132,8 +3126,6 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    /* NUCLEAR DIAGNOSTIC: if this crashes with SIGSEGV, our function was called */
-    *(volatile int *)0 = 42;
     {
         char _buf[200];
         int _len = snprintf(_buf, sizeof(_buf),
@@ -7075,7 +7067,6 @@ static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
 
 static int g_lt_handle_storage;
 cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
-    write(STDERR_FILENO, "[DIAG] cublasLtCreate\n", 22);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
@@ -7165,7 +7156,6 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
-    write(STDERR_FILENO, "[DIAG] cublasLtMatmul\n", 22);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
@@ -7259,7 +7249,6 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
 }
 
 cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
-    write(STDERR_FILENO, "[DIAG] cublasLtMatmulDescCreate\n", 32);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
@@ -7595,8 +7584,6 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
     void *preference, int requestedAlgoCount, void *heuristicResultsArray,
     int *returnAlgoCount) {
-    /* DIAG: check if this function is called during FP16 dispatch */
-    write(STDERR_FILENO, "[DIAG] cublasLtMatmulAlgoGetHeuristic CALLED\n", 45);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
