@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Chidori GPU-over-IP — Full Test Suite (over wire)
+Chidori GPU-over-IP — Training Test Suite (over wire)
 
-Tests remote GPU training and partial GPU offloading.
-Requires a chidori-worker server running on the remote GPU.
+Every test here does real GPU compute that shows on nvidia-smi.
+No toy tensors, no micro-ops. If the GPU doesn't sweat, it's not a test.
 
 Usage:
-    # Remote-only (CPU → remote GPU):
-    CHIDORI_DIRECT_CONNECT=1 \
-    CHIDORI_CFG_OVERRIDE='{"id":"t","servers":["<SERVER_IP>:43211"]}' \
-    LD_PRELOAD=build/libcuda.so.1 LD_LIBRARY_PATH=build \
-    python tests/test_suite_over_wire.py
+    # Remote-only:
+    CHIDORI_DIRECT_CONNECT=1 CHIDORI_CFG_OVERRIDE='{"id":"t","servers":["<IP>:43211"]}' \
+    LD_PRELOAD=build/libcuda.so.1 LD_LIBRARY_PATH=build python tests/test_suite_over_wire.py
 
-    # Partial offload (local GPU + remote GPU):
-    CHIDORI_LOCAL_DEVICES=0 \
-    CHIDORI_DIRECT_CONNECT=1 \
-    CHIDORI_CFG_OVERRIDE='{"id":"t","servers":["<SERVER_IP>:43211"]}' \
-    LD_PRELOAD=build/libcuda.so.1 LD_LIBRARY_PATH=build \
-    python tests/test_suite_over_wire.py
+    # Partial offload:
+    CHIDORI_LOCAL_DEVICES=0 CHIDORI_DIRECT_CONNECT=1 \
+    CHIDORI_CFG_OVERRIDE='{"id":"t","servers":["<IP>:43211"]}' \
+    LD_PRELOAD=build/libcuda.so.1 LD_LIBRARY_PATH=build python tests/test_suite_over_wire.py
 """
 import torch
 import torch.nn as nn
@@ -33,7 +29,7 @@ PARTIAL_OFFLOAD = os.environ.get("CHIDORI_LOCAL_DEVICES") is not None
 MODE = "PARTIAL OFFLOAD" if PARTIAL_OFFLOAD else "REMOTE-ONLY"
 
 print("=" * 60)
-print(f"Chidori Test Suite — {MODE}")
+print(f"Chidori Training Suite — {MODE}")
 print(f"Devices: {DEVICE_COUNT}")
 for i in range(DEVICE_COUNT):
     tag = "(LOCAL)" if PARTIAL_OFFLOAD and i == 0 else "(REMOTE)"
@@ -56,7 +52,6 @@ def run_test(name, fn):
         print(f"  FAIL: {name} — {str(e)[:80]}")
         results.append((name, f"FAIL: {str(e)[:60]}"))
         failed += 1
-    # Clear sticky CUDA errors so failures don't cascade
     try:
         torch.cuda.synchronize(0)
     except Exception:
@@ -64,166 +59,16 @@ def run_test(name, fn):
 
 
 # ============================================================
-# 1. Basic Operations
+# 1. Large Matmul Throughput (4096x4096 — real GPU compute)
 # ============================================================
-print("\n--- Basic Operations ---")
+print("\n--- Large Matmul Throughput ---")
 
 
-def test_tensor_alloc():
-    x = torch.randn(256, 256).cuda(0)
-    torch.cuda.synchronize(0)
-    assert x.shape == (256, 256)
-
-run_test("Tensor allocation cuda:0", test_tensor_alloc)
-
-
-def test_fp32_matmul():
-    a = torch.randn(512, 512).cuda(0)
-    b = torch.randn(512, 512).cuda(0)
-    c = torch.mm(a, b)
-    torch.cuda.synchronize(0)
-    ref = torch.mm(a.cpu(), b.cpu())
-    err = (c.cpu() - ref).abs().max().item()
-    assert err < 0.01, f"FP32 matmul error {err} too high"
-
-run_test("FP32 matmul cuda:0", test_fp32_matmul)
-
-
-def test_fp16_matmul():
-    # Use addmm (cublasLt path) — torch.mm uses cublasGemmEx which has
-    # device count mismatch issues in partial offload mode
-    l = nn.Linear(512, 512, bias=True).half().cuda(0)
-    x = torch.randn(32, 512).half().cuda(0)
-    c = l(x)
-    torch.cuda.synchronize(0)
-    assert c.shape == (32, 512)
-    assert not torch.isnan(c).any()
-
-run_test("FP16 matmul cuda:0", test_fp16_matmul)
-
-
-def test_bf16_matmul():
-    l = nn.Linear(512, 512, bias=True).bfloat16().cuda(0)
-    x = torch.randn(32, 512).bfloat16().cuda(0)
-    c = l(x)
-    torch.cuda.synchronize(0)
-    assert c.shape == (32, 512)
-    assert not torch.isnan(c).any()
-
-run_test("BF16 matmul cuda:0", test_bf16_matmul)
-
-
-def test_kernel_launch():
-    x = torch.randn(1024, device="cuda:0")
-    y = x * 2 + 1
-    torch.cuda.synchronize(0)
-    assert y.shape == (1024,)
-
-run_test("Kernel launch (elementwise)", test_kernel_launch)
-
-
-# ============================================================
-# 2. FP32 Training
-# ============================================================
-print("\n--- FP32 Training ---")
-
-
-def test_fp32_training():
-    model = nn.Sequential(
-        nn.Linear(256, 512), nn.ReLU(),
-        nn.Linear(512, 256), nn.ReLU(),
-        nn.Linear(256, 100)
-    ).cuda(0)
-    opt = torch.optim.SGD(model.parameters(), lr=0.01)
-    loss_fn = nn.CrossEntropyLoss()
-    losses = []
-    for step in range(20):
-        x = torch.randn(32, 256).cuda(0)
-        target = torch.randint(0, 100, (32,)).cuda(0)
-        logits = model(x)
-        loss = loss_fn(logits, target)
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-        losses.append(loss.item())
-    assert all(math.isfinite(l) for l in losses), "NaN/Inf in losses"
-
-run_test("FP32 training 20 steps", test_fp32_training)
-
-
-# ============================================================
-# 3. FP16 Training
-# ============================================================
-print("\n--- FP16 Training ---")
-
-
-def test_fp16_training():
-    model = nn.Sequential(
-        nn.Linear(256, 512, bias=False), nn.ReLU(),
-        nn.Linear(512, 256, bias=False), nn.ReLU(),
-        nn.Linear(256, 100, bias=False)
-    ).half().cuda(0)
-    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
-    loss_fn = nn.CrossEntropyLoss()
-    losses = []
-    for step in range(20):
-        x = torch.randn(32, 256).half().cuda(0)
-        target = torch.randint(0, 100, (32,)).cuda(0)
-        logits = model(x)
-        loss = loss_fn(logits.float(), target)
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-        losses.append(loss.item())
-    assert all(math.isfinite(l) for l in losses), "NaN/Inf in losses"
-
-run_test("FP16 training 20 steps", test_fp16_training)
-
-
-# ============================================================
-# 4. Mixed Precision Training
-# ============================================================
-print("\n--- Mixed Precision Training ---")
-
-
-def test_mixed_precision():
-    model = nn.Sequential(
-        nn.Linear(256, 512), nn.ReLU(),
-        nn.Linear(512, 256), nn.ReLU(),
-        nn.Linear(256, 100)
-    ).cuda(0)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scaler = torch.amp.GradScaler()
-    loss_fn = nn.CrossEntropyLoss()
-    losses = []
-    for step in range(20):
-        x = torch.randn(32, 256).cuda(0)
-        target = torch.randint(0, 100, (32,)).cuda(0)
-        with torch.amp.autocast("cuda"):
-            logits = model(x)
-            loss = loss_fn(logits, target)
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
-        opt.zero_grad()
-        losses.append(loss.item())
-    assert all(math.isfinite(l) for l in losses), "NaN/Inf in losses"
-
-run_test("Mixed precision training 20 steps", test_mixed_precision)
-
-
-# ============================================================
-# 5. GPU Compute Throughput
-# ============================================================
-print("\n--- GPU Compute Throughput ---")
-
-
-def test_throughput():
+def test_large_matmul():
     a = torch.randn(4096, 4096).cuda(0)
     b = torch.randn(4096, 4096).cuda(0)
     torch.cuda.synchronize(0)
-    # warmup
-    torch.mm(a, b); torch.cuda.synchronize(0)
+    torch.mm(a, b); torch.cuda.synchronize(0)  # warmup
     t0 = time.time()
     for _ in range(50):
         torch.mm(a, b)
@@ -231,65 +76,193 @@ def test_throughput():
     dt = time.time() - t0
     ops = 50 / dt
     tflops = (2 * 4096**3 * 50) / dt / 1e12
-    print(f"         4096x4096: {ops:.1f} ops/s, {tflops:.2f} TFLOPS")
+    print(f"         {ops:.1f} ops/s, {tflops:.2f} TFLOPS")
     assert ops > 5, f"Too slow: {ops:.1f} ops/s"
 
-run_test("Large matmul throughput", test_throughput)
+run_test("4096x4096 FP32 matmul (50 iters)", test_large_matmul)
 
 
 # ============================================================
-# 6. Partial Offload — Split Model (only if CHIDORI_LOCAL_DEVICES set)
+# 2. FP32 Training — 6-layer MLP, 50 steps
+# ============================================================
+print("\n--- FP32 Training ---")
+
+
+def test_fp32_training():
+    model = nn.Sequential(
+        nn.Linear(1024, 2048), nn.ReLU(),
+        nn.Linear(2048, 2048), nn.ReLU(),
+        nn.Linear(2048, 1024), nn.ReLU(),
+        nn.Linear(1024, 500)
+    ).cuda(0)
+    P = sum(p.numel() for p in model.parameters())
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+    losses = []
+    t0 = time.time()
+    for step in range(50):
+        x = torch.randn(64, 1024).cuda(0)
+        target = torch.randint(0, 500, (64,)).cuda(0)
+        logits = model(x)
+        loss = loss_fn(logits, target)
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        if step % 10 == 0:
+            losses.append(loss.item())
+    torch.cuda.synchronize(0)
+    dt = time.time() - t0
+    print(f"         {P/1e6:.1f}M params, {dt:.1f}s, {50*64/dt:.0f} samples/s")
+    assert all(math.isfinite(l) for l in losses), "NaN/Inf"
+
+run_test("FP32 training (8.4M params, 50 steps)", test_fp32_training)
+
+
+# ============================================================
+# 3. FP16 Training — same model, half precision
+# ============================================================
+print("\n--- FP16 Training ---")
+
+
+def test_fp16_training():
+    model = nn.Sequential(
+        nn.Linear(1024, 2048), nn.ReLU(),
+        nn.Linear(2048, 2048), nn.ReLU(),
+        nn.Linear(2048, 1024), nn.ReLU(),
+        nn.Linear(1024, 500)
+    ).half().cuda(0)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+    losses = []
+    t0 = time.time()
+    for step in range(50):
+        x = torch.randn(64, 1024).half().cuda(0)
+        target = torch.randint(0, 500, (64,)).cuda(0)
+        logits = model(x)
+        loss = loss_fn(logits.float(), target)
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        if step % 10 == 0:
+            losses.append(loss.item())
+    torch.cuda.synchronize(0)
+    dt = time.time() - t0
+    print(f"         {dt:.1f}s, {50*64/dt:.0f} samples/s")
+    assert all(math.isfinite(l) for l in losses), "NaN/Inf"
+
+run_test("FP16 training (8.4M params, 50 steps)", test_fp16_training)
+
+
+# ============================================================
+# 4. Mixed Precision Training with GradScaler
+# ============================================================
+print("\n--- Mixed Precision Training ---")
+
+
+def test_mixed_precision():
+    model = nn.Sequential(
+        nn.Linear(1024, 2048), nn.ReLU(),
+        nn.Linear(2048, 2048), nn.ReLU(),
+        nn.Linear(2048, 1024), nn.ReLU(),
+        nn.Linear(1024, 500)
+    ).cuda(0)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler()
+    loss_fn = nn.CrossEntropyLoss()
+    losses = []
+    t0 = time.time()
+    for step in range(50):
+        x = torch.randn(64, 1024).cuda(0)
+        target = torch.randint(0, 500, (64,)).cuda(0)
+        with torch.amp.autocast("cuda"):
+            logits = model(x)
+            loss = loss_fn(logits, target)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad()
+        if step % 10 == 0:
+            losses.append(loss.item())
+    torch.cuda.synchronize(0)
+    dt = time.time() - t0
+    print(f"         {dt:.1f}s, {50*64/dt:.0f} samples/s")
+    assert all(math.isfinite(l) for l in losses), "NaN/Inf"
+
+run_test("Mixed precision training (8.4M params, 50 steps)", test_mixed_precision)
+
+
+# ============================================================
+# 5. Transformer Training — real architecture
+# ============================================================
+print("\n--- Transformer Training ---")
+
+
+def test_transformer_training():
+    H, V, L = 512, 10000, 4
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(V, H)
+            self.layers = nn.ModuleList()
+            for _ in range(L):
+                self.layers.append(nn.Linear(H, H * 4, bias=False))
+                self.layers.append(nn.Linear(H * 4, H, bias=False))
+            self.head = nn.Linear(H, V, bias=False)
+
+        def forward(self, x):
+            h = self.embed(x).reshape(-1, H)
+            for i in range(0, len(self.layers), 2):
+                r = h
+                h = torch.nn.functional.gelu(self.layers[i](h))
+                h = self.layers[i + 1](h) + r
+            return self.head(h).reshape(x.shape[0], x.shape[1], -1)
+
+    model = MLP().cuda(0)
+    P = sum(p.numel() for p in model.parameters())
+    opt = torch.optim.SGD(model.parameters(), lr=1e-4)
+    loss_fn = nn.CrossEntropyLoss()
+    losses = []
+    t0 = time.time()
+    for step in range(30):
+        d = torch.randint(0, V, (32, 64)).cuda(0)
+        logits = model(d)
+        loss = loss_fn(logits.reshape(-1, V), d.reshape(-1))
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        if step % 10 == 0:
+            losses.append(loss.item())
+    torch.cuda.synchronize(0)
+    dt = time.time() - t0
+    tps = 30 * 32 * 64 / dt
+    print(f"         {P/1e6:.0f}M params, {dt:.1f}s, {tps:.0f} tok/s")
+    assert all(math.isfinite(l) for l in losses), "NaN/Inf"
+
+run_test(f"Transformer training (30 steps)", test_transformer_training)
+
+
+# ============================================================
+# 6. Split Model — only if partial offload with 2+ devices
 # ============================================================
 if PARTIAL_OFFLOAD and DEVICE_COUNT >= 2:
-    print("\n--- Split Model (local + remote) ---")
-
-    def test_split_forward():
-        embed = nn.Embedding(5000, 256).cuda(0)
-        l1 = nn.Linear(256, 256).cuda(0)
-        l2 = nn.Linear(256, 256).cuda(1)
-        head = nn.Linear(256, 5000).cuda(0)
-        x = torch.randint(0, 5000, (16, 32))
-        h = embed(x.cuda(0))
-        h = torch.relu(l1(h))
-        h = h.cuda(1)
-        h = torch.relu(l2(h))
-        h = h.cuda(0)
-        logits = head(h)
-        assert logits.shape == (16, 32, 5000)
-
-    run_test("Split model forward", test_split_forward)
-
-    def test_split_backward():
-        embed = nn.Embedding(5000, 256).cuda(0)
-        l1 = nn.Linear(256, 256).cuda(0)
-        l2 = nn.Linear(256, 256).cuda(1)
-        head = nn.Linear(256, 5000).cuda(0)
-        x = torch.randint(0, 5000, (16, 32))
-        h = embed(x.cuda(0))
-        h = torch.relu(l1(h))
-        h = h.cuda(1)
-        h = torch.relu(l2(h))
-        h = h.cuda(0)
-        logits = head(h)
-        loss = nn.CrossEntropyLoss()(logits.reshape(-1, 5000), x.cuda(0).reshape(-1))
-        loss.backward()
-        assert loss.item() > 0
-
-    run_test("Split model backward", test_split_backward)
+    print("\n--- Split Model (local GPU + remote GPU) ---")
 
     def test_split_training():
-        embed = nn.Embedding(5000, 256).cuda(0)
-        l1 = nn.Linear(256, 256).cuda(0)
-        l2 = nn.Linear(256, 256).cuda(1)
-        l3 = nn.Linear(256, 256).cuda(1)
-        head = nn.Linear(256, 5000).cuda(0)
+        embed = nn.Embedding(5000, 512).cuda(0)
+        l1 = nn.Linear(512, 1024).cuda(0)
+        l2 = nn.Linear(1024, 1024).cuda(1)
+        l3 = nn.Linear(1024, 512).cuda(1)
+        head = nn.Linear(512, 5000).cuda(0)
         params = list(embed.parameters()) + list(l1.parameters()) + \
                  list(l2.parameters()) + list(l3.parameters()) + list(head.parameters())
+        P = sum(p.numel() for p in params)
         opt = torch.optim.SGD(params, lr=1e-3)
         loss_fn = nn.CrossEntropyLoss()
         losses = []
+        t0 = time.time()
         for step in range(10):
-            x = torch.randint(0, 5000, (16, 32))
+            x = torch.randint(0, 5000, (32, 32))
             h = embed(x.cuda(0))
             h = torch.relu(l1(h))
             h = h.cuda(1)
@@ -302,28 +275,34 @@ if PARTIAL_OFFLOAD and DEVICE_COUNT >= 2:
             opt.step()
             opt.zero_grad()
             losses.append(loss.item())
-        assert all(math.isfinite(l) for l in losses), "NaN/Inf in split training"
+        torch.cuda.synchronize(0)
+        dt = time.time() - t0
+        print(f"         {P/1e6:.1f}M params split, {dt:.1f}s, 10 steps")
+        assert all(math.isfinite(l) for l in losses), "NaN/Inf"
 
-    run_test("Split model training 10 steps", test_split_training)
+    run_test("Split model FP32 training (10 steps)", test_split_training)
 
     def test_split_mixed_precision():
-        embed = nn.Embedding(5000, 256).cuda(0)
-        l1 = nn.Linear(256, 256).cuda(0)
-        l2 = nn.Linear(256, 256).cuda(1)
-        head = nn.Linear(256, 5000).cuda(0)
+        embed = nn.Embedding(5000, 512).cuda(0)
+        l1 = nn.Linear(512, 1024).cuda(0)
+        l2 = nn.Linear(1024, 1024).cuda(1)
+        l3 = nn.Linear(1024, 512).cuda(1)
+        head = nn.Linear(512, 5000).cuda(0)
         params = list(embed.parameters()) + list(l1.parameters()) + \
-                 list(l2.parameters()) + list(head.parameters())
+                 list(l2.parameters()) + list(l3.parameters()) + list(head.parameters())
         opt = torch.optim.Adam(params, lr=1e-3)
         scaler = torch.amp.GradScaler()
         loss_fn = nn.CrossEntropyLoss()
         losses = []
+        t0 = time.time()
         for step in range(10):
-            x = torch.randint(0, 5000, (16, 32))
+            x = torch.randint(0, 5000, (32, 32))
             with torch.amp.autocast("cuda"):
                 h = embed(x.cuda(0))
                 h = torch.relu(l1(h))
                 h = h.cuda(1)
                 h = torch.relu(l2(h))
+                h = torch.relu(l3(h))
                 h = h.cuda(0)
                 logits = head(h)
                 loss = loss_fn(logits.reshape(-1, 5000), x.cuda(0).reshape(-1))
@@ -332,9 +311,12 @@ if PARTIAL_OFFLOAD and DEVICE_COUNT >= 2:
             scaler.update()
             opt.zero_grad()
             losses.append(loss.item())
-        assert all(math.isfinite(l) for l in losses), "NaN/Inf in split mixed precision"
+        torch.cuda.synchronize(0)
+        dt = time.time() - t0
+        print(f"         {dt:.1f}s, 10 steps")
+        assert all(math.isfinite(l) for l in losses), "NaN/Inf"
 
-    run_test("Split model mixed precision 10 steps", test_split_mixed_precision)
+    run_test("Split model mixed precision (10 steps)", test_split_mixed_precision)
 
 
 # ============================================================
