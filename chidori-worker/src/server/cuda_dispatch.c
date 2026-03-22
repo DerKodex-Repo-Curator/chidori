@@ -67,6 +67,23 @@ static uint64_t g_next_handle = 0x10000;
 static void  *g_lt_workspace      = NULL;
 static size_t g_lt_workspace_size = 0;
 
+/* Persistent cublasLt handle — created once, reused for all cublasLt calls.
+ * Creating/destroying this on every matmul or heuristic query is extremely
+ * expensive (hundreds of times per training step). */
+static cublasLtHandle_t g_lt_handle = NULL;
+
+static cublasLtHandle_t ensure_lt_handle(void) {
+    if (!g_lt_handle) {
+        cublasStatus_t st = cublasLtCreate(&g_lt_handle);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[cublas_lt] ERROR: cublasLtCreate failed (%d)\n", (int)st);
+            return NULL;
+        }
+        fprintf(stderr, "[cublas_lt] created persistent cublasLt handle\n");
+    }
+    return g_lt_handle;
+}
+
 static uint64_t alloc_handle(void) {
     return g_next_handle++;
 }
@@ -236,6 +253,15 @@ int cuda_dispatch_init(const char *pcibus) {
 
 void cuda_dispatch_shutdown(void) {
     if (g_initialized) {
+        if (g_lt_handle) {
+            cublasLtDestroy(g_lt_handle);
+            g_lt_handle = NULL;
+        }
+        if (g_lt_workspace) {
+            cudaFree(g_lt_workspace);
+            g_lt_workspace = NULL;
+            g_lt_workspace_size = 0;
+        }
         for (int i = 0; i < g_device_count; i++) {
             if (g_contexts[i] != NULL) {
                 cuDevicePrimaryCtxRelease(g_devices[i]);
@@ -2553,8 +2579,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 mat[2].dtype, mat[2].rows, mat[2].cols, mat[2].ld,
                 mat[3].dtype, mat[3].rows, mat[3].cols, mat[3].ld, mat[0].batch);
 
-        cublasLtHandle_t ltHandle;
-        cublasLtCreate(&ltHandle);
+        cublasLtHandle_t ltHandle = ensure_lt_handle();
 
         cublasLtMatmulDesc_t opDesc;
         cublasLtMatmulDescCreate(&opDesc, (cublasComputeType_t)computeType, (cudaDataType_t)scaleType);
@@ -2598,7 +2623,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         cublasLtMatmulPreferenceDestroy(pref);
         for (int i = 0; i < 4; i++) cublasLtMatrixLayoutDestroy(descs[i]);
         cublasLtMatmulDescDestroy(opDesc);
-        cublasLtDestroy(ltHandle);
 
         uint8_t resp[4 + sizeof(cublasLtMatmulHeuristicResult_t)];
         memcpy(resp, &returnAlgoCount, 4);
@@ -2652,8 +2676,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         memcpy(&stream_wire, p, 8); p += 8;
         memcpy(algo_bytes, p, 64);
 
-        cublasLtHandle_t ltHandle;
-        cublasLtCreate(&ltHandle);
+        cublasLtHandle_t ltHandle = ensure_lt_handle();
 
         cublasLtMatmulDesc_t opDesc;
         cublasLtMatmulDescCreate(&opDesc, (cublasComputeType_t)computeType, (cudaDataType_t)scaleType);
@@ -2711,15 +2734,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 (void *)(uintptr_t)C_ptr, (void *)(uintptr_t)D_ptr,
                 (void *)stream, workspaceSize);
 
-        /* Synchronize before matmul to detect any prior errors */
-        {
-            cudaError_t pre_err = cudaDeviceSynchronize();
-            if (pre_err != cudaSuccess) {
-                fprintf(stderr, "[cublas_lt] matmul: pre-sync error=%d\n", (int)pre_err);
-                cudaGetLastError();
-            }
-        }
-
         cublasStatus_t st = cublasLtMatmul(ltHandle, opDesc,
             alpha_bytes, (void *)(uintptr_t)A_ptr, descs[0],
             (void *)(uintptr_t)B_ptr, descs[1],
@@ -2727,21 +2741,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             (void *)(uintptr_t)D_ptr, descs[3],
             algo, workspace, workspaceSize, (cudaStream_t)stream);
 
-        /* Synchronize after to catch async errors immediately */
-        {
-            cudaError_t post_err = cudaDeviceSynchronize();
-            if (post_err != cudaSuccess) {
-                fprintf(stderr, "[cublas_lt] matmul: POST-SYNC error=%d (%s)\n",
-                        (int)post_err, cudaGetErrorString(post_err));
-                cudaGetLastError();
-            }
-        }
-
         /* workspace is persistent (g_lt_workspace) — do NOT free it here */
 
         for (int i = 0; i < 4; i++) cublasLtMatrixLayoutDestroy(descs[i]);
         cublasLtMatmulDescDestroy(opDesc);
-        cublasLtDestroy(ltHandle);
 
         return chidori_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
     }
