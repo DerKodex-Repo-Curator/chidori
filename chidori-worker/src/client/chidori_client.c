@@ -6941,48 +6941,40 @@ cublasStatus_t cublasLtMatmulAlgoGetIds(cublasLtHandle_t lightHandle,
 }
 
 size_t cublasLtGetCudartVersion(void) {
-    /* ALWAYS forward to real cublasLt — cuBLAS calls this at library load time
-     * (before g_in_real_cuda is set) and caches the result. Wrong version → error 14. */
-    void *h = ensure_real_cublaslt();
-    if (h) {
-        typedef size_t (*fn_t)(void);
-        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetCudartVersion");
-        if (real_fn) return real_fn();
-    }
+    /* ALWAYS forward via RTLD_NEXT — cuBLAS calls at library load time.
+     * Can't use dlsym(handle) because our function may be in the handle's scope. */
+    typedef size_t (*fn_t)(void);
+    static fn_t real_fn = NULL;
+    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetCudartVersion");
+    if (real_fn) return real_fn();
     return 12040; /* fallback */
 }
 cublasStatus_t cublasLtGetStatusName(cublasStatus_t status, const char **str) {
-    /* ALWAYS forward — cuBLAS may call at load time */
-    void *h = ensure_real_cublaslt();
-    if (h) {
-        typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
-        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusName");
-        if (real_fn) return real_fn(status, str);
-    }
+    typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
+    static fn_t real_fn = NULL;
+    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetStatusName");
+    if (real_fn) return real_fn(status, str);
     (void)status; if (str) *str = "CUBLAS_STATUS_SUCCESS"; return CUBLAS_STATUS_SUCCESS;
 }
 cublasStatus_t cublasLtGetStatusString(cublasStatus_t status, const char **str) {
-    /* ALWAYS forward — cuBLAS may call at load time */
-    void *h = ensure_real_cublaslt();
-    if (h) {
-        typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
-        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusString");
-        if (real_fn) return real_fn(status, str);
-    }
+    typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
+    static fn_t real_fn = NULL;
+    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetStatusString");
+    if (real_fn) return real_fn(status, str);
     (void)status; if (str) *str = "success"; return CUBLAS_STATUS_SUCCESS;
 }
 size_t cublasLtGetVersion(void) {
-    /* ALWAYS forward — cuBLAS may call at load time */
-    void *h = ensure_real_cublaslt();
-    if (h) {
-        typedef size_t (*fn_t)(void);
-        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetVersion");
-        if (real_fn) return real_fn();
-    }
+    typedef size_t (*fn_t)(void);
+    static fn_t real_fn = NULL;
+    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetVersion");
+    if (real_fn) return real_fn();
     return 120405; /* fallback */
 }
 cublasStatus_t cublasLtGetProperty(int type, int *value) {
-    /* ALWAYS forward — cuBLAS may call at load time */
+    typedef cublasStatus_t (*fn_t)(int, int *);
+    static fn_t real_fn = NULL;
+    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetProperty");
+    if (real_fn) return real_fn(type, value);
     void *h = ensure_real_cublaslt();
     if (h) {
         typedef cublasStatus_t (*fn_t)(int, int *);
