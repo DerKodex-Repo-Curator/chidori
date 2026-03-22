@@ -76,6 +76,22 @@ PASS: async mode (no CUDA_LAUNCH_BLOCKING)
 Training confirmed: forward + backward + optimizer step on BOTH devices.
 Losses decrease properly = learning is happening. Async mode works.
 
+### MILESTONE: REAL REMOTE TEST — Lenovo → Vast.ai over internet
+```
+Client: Lenovo (RTX 4090 Laptop, local GPU = device 0)
+Server: Vast.ai Nevada (RTX 4090, remote GPU = device 1)
+Connection: SSH tunnel over internet
+
+PASS: tensor transfers (CPU<->GPU, GPU<->GPU cross-device)
+PASS: cuBLAS (local=0.000050, remote=0.000050)
+PASS: kernel launch (randn both devices)
+PASS: element-wise ops
+PASS: training local (losses=[2.408, 2.389, 2.371, 2.353, 2.335])
+PASS: training remote (losses=[2.488, 2.47, 2.453, 2.436, 2.419])
+PASS: async sync
+=== ALL REAL REMOTE TESTS PASSED ===
+```
+
 ### Kernel Launch FPE Root Cause
 - `maxThreadsPerMultiProcessor` was 0 → FPE (division by zero in RNG config)
 - Our `cudaGetDeviceProperties` wrote attr 39 at WRONG offset (460)
