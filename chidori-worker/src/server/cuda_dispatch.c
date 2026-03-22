@@ -61,6 +61,12 @@ static handle_map_t g_cudnn_rnn_descs;             /* cudnnRNNDescriptor_t */
 
 static uint64_t g_next_handle = 0x10000;
 
+/* Persistent workspace for cublasLtMatmul — allocated once, reused for all calls.
+ * 32 MB is sufficient for all cublasLt algorithms. */
+#define CHIDORI_LT_WORKSPACE_SIZE (32ULL * 1024 * 1024)
+static void  *g_lt_workspace      = NULL;
+static size_t g_lt_workspace_size = 0;
+
 static uint64_t alloc_handle(void) {
     return g_next_handle++;
 }
@@ -2553,6 +2559,13 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         cublasLtMatmulPreference_t pref;
         cublasLtMatmulPreferenceCreate(&pref);
+        /* Advertise 32 MB workspace so the heuristic returns the best
+         * algorithm — the server keeps a persistent workspace of this size. */
+        {
+            size_t maxWs = CHIDORI_LT_WORKSPACE_SIZE;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                  &maxWs, sizeof(maxWs));
+        }
 
         cublasLtMatmulHeuristicResult_t result;
         int returnAlgoCount = 0;
@@ -2649,33 +2662,27 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         cublasLtMatmulAlgo_t *algo = (cublasLtMatmulAlgo_t *)algo_bytes;
 
-        /* Determine workspace requirement by running heuristic with the same
-         * descriptors. Allocate workspace if needed to avoid illegal memory
-         * access from algorithms that require it. */
-        void *workspace = NULL;
-        size_t workspaceSize = 0;
-        {
-            cublasLtMatmulPreference_t pref;
-            cublasLtMatmulPreferenceCreate(&pref);
-            /* Allow up to 32 MB workspace */
-            size_t maxWs = 32 * 1024 * 1024;
-            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                  &maxWs, sizeof(maxWs));
-            cublasLtMatmulHeuristicResult_t heur;
-            int heurCount = 0;
-            cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
-                ltHandle, opDesc, descs[0], descs[1], descs[2], descs[3],
-                pref, 1, &heur, &heurCount);
-            cublasLtMatmulPreferenceDestroy(pref);
-
-            if (hst == CUBLAS_STATUS_SUCCESS && heurCount > 0 && heur.workspaceSize > 0) {
-                workspaceSize = heur.workspaceSize;
-                cudaMalloc(&workspace, workspaceSize);
-                /* Use the heuristic's algorithm which matches the workspace */
-                memcpy(algo_bytes, &heur.algo, sizeof(cublasLtMatmulAlgo_t));
-                fprintf(stderr, "[cublas_lt] allocated workspace: %zu bytes\n", workspaceSize);
+        /* Allocate persistent 32 MB workspace on first use. This buffer is
+         * reused across all cublasLtMatmul calls — avoids per-call
+         * cudaMalloc/cudaFree overhead and guarantees every algorithm has
+         * enough workspace (the previous code only allocated what the
+         * server-side heuristic reported, which could be far too small if
+         * the client chose a different algorithm). */
+        if (!g_lt_workspace) {
+            cudaError_t ws_err = cudaMalloc(&g_lt_workspace, CHIDORI_LT_WORKSPACE_SIZE);
+            if (ws_err == cudaSuccess) {
+                g_lt_workspace_size = CHIDORI_LT_WORKSPACE_SIZE;
+                fprintf(stderr, "[cublas_lt] allocated persistent workspace: %zu bytes\n",
+                        g_lt_workspace_size);
+            } else {
+                fprintf(stderr, "[cublas_lt] WARNING: workspace cudaMalloc failed (%d), "
+                        "falling back to no workspace\n", (int)ws_err);
+                g_lt_workspace = NULL;
+                g_lt_workspace_size = 0;
             }
         }
+        void *workspace = g_lt_workspace;
+        size_t workspaceSize = g_lt_workspace_size;
 
         fprintf(stderr, "[cublas_lt] matmul: A=%p B=%p C=%p D=%p stream=%p ws=%zu\n",
                 (void *)(uintptr_t)A_ptr, (void *)(uintptr_t)B_ptr,
@@ -2708,7 +2715,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             }
         }
 
-        if (workspace) cudaFree(workspace);
+        /* workspace is persistent (g_lt_workspace) — do NOT free it here */
 
         for (int i = 0; i < 4; i++) cublasLtMatrixLayoutDestroy(descs[i]);
         cublasLtMatmulDescDestroy(opDesc);
