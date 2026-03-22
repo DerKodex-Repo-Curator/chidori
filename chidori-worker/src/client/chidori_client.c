@@ -7164,7 +7164,8 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
-    write(STDERR_FILENO, "!!! cublasLtMatmul CALLED !!!\n", 30);
+    /* DIAG: return unique error to identify if called */
+    return (cublasStatus_t)15; /* CUBLAS_STATUS_NOT_SUPPORTED */
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
