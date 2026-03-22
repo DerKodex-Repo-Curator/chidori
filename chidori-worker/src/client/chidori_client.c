@@ -2161,33 +2161,21 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
     ensure_real_cuda_init();
-    /* cuBLAS needs an active CUDA context. Ensure the local device context
-     * is created and set current before calling cublasCreate_v2.
-     * This may run before cudaSetDevice(0) if PyTorch creates cuBLAS early. */
+    /* cuBLAS needs the CUDA runtime (cudart) to have fully initialized the device.
+     * A raw driver context from cuDevicePrimaryCtxRetain is NOT sufficient —
+     * cudart maintains internal state that cuBLAS depends on.
+     * Use real cudart's cudaSetDevice to do full device initialization,
+     * with g_in_real_cuda guard so our interceptors forward to real driver. */
     g_in_real_cuda++;
-    fprintf(stderr, "[chidori-diag] ensure_local_cublas_handle: g_local_ctx=%p, g_real_cuda_inited=%d, g_in_real_cuda=%d\n",
-            (void*)g_local_ctx, g_real_cuda_inited, g_in_real_cuda);
-    if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
-        CUdevice dev = 0; /* first local device */
-        CUresult cr = g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, dev);
-        fprintf(stderr, "[chidori-diag] cuDevicePrimaryCtxRetain(0) = %d, ctx=%p\n", cr, (void*)g_local_ctx);
-        if (cr != CUDA_SUCCESS) {
+    if (g_real.cudaSetDevice) {
+        int err = g_real.cudaSetDevice(0); /* real cudart: full device init for local GPU */
+        if (err != 0) {
+            fprintf(stderr, "[chidori] ensure_local_cublas_handle: real cudaSetDevice(0) failed: %d\n", err);
             g_in_real_cuda--;
             return NULL;
         }
     }
-    if (g_local_ctx && g_real.cuCtxSetCurrent) {
-        CUresult cr2 = g_real.cuCtxSetCurrent(g_local_ctx);
-        fprintf(stderr, "[chidori-diag] cuCtxSetCurrent(%p) = %d\n", (void*)g_local_ctx, cr2);
-    }
-    /* Verify context is active */
-    if (g_real.cuCtxGetCurrent) {
-        CUcontext cur = NULL;
-        g_real.cuCtxGetCurrent(&cur);
-        fprintf(stderr, "[chidori-diag] current context before cublasCreate: %p\n", (void*)cur);
-    }
     cublasStatus_t r = real_create(&g_local_cublas_handle);
-    fprintf(stderr, "[chidori-diag] cublasCreate_v2 returned: %d, handle=%p\n", r, (void*)g_local_cublas_handle);
     g_in_real_cuda--;
     if (r != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: %d\n", r);
@@ -6237,13 +6225,10 @@ static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
     create_fn real_create = (create_fn)dlsym(h, "cublasLtCreate");
     if (!real_create) return NULL;
     ensure_real_cuda_init();
-    /* Ensure local CUDA context is active before creating cublasLt handle */
+    /* Use real cudart's cudaSetDevice for full device initialization */
     g_in_real_cuda++;
-    if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
-        g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, 0);
-    }
-    if (g_local_ctx && g_real.cuCtxSetCurrent) {
-        g_real.cuCtxSetCurrent(g_local_ctx);
+    if (g_real.cudaSetDevice) {
+        g_real.cudaSetDevice(0);
     }
     cublasStatus_t r = real_create(&g_local_cublaslt_handle);
     g_in_real_cuda--;
