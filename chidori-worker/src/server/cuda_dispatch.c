@@ -1524,10 +1524,23 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     }
                 } else if (file_sz >= 2 && best_data[0] == 0xa2 &&
                            best_data[1] == 0x7f) {
-                    /* a2-prefixed cubin — skip the 1-byte header to get raw ELF */
-                    raw = (void *)(best_data + 1);
-                    raw_size = file_sz - 1;
-                    fprintf(stderr, "[cuda_dispatch] stripped a2 prefix: %zu bytes -> ELF\n", raw_size);
+                    /* a2-prefixed cubin: 0xa2 is NVIDIA's format marker byte.
+                     * After the marker, the ELF cubin data follows. The stored
+                     * size (file_sz) includes the marker, so ELF bytes = file_sz-1.
+                     * However, best_uncomp is the true uncompressed ELF size —
+                     * trailing bytes (usually zeros for section alignment) were
+                     * stripped as trivial "compression". We must restore the full
+                     * ELF by copying the stored bytes and zero-padding to
+                     * best_uncomp. */
+                    raw_size = (size_t)best_uncomp;
+                    raw = calloc(1, raw_size);
+                    if (raw) {
+                        size_t stored_elf = file_sz - 1; /* bytes after 0xa2 marker */
+                        if (stored_elf > raw_size) stored_elf = raw_size;
+                        memcpy(raw, best_data + 1, stored_elf);
+                        fprintf(stderr, "[cuda_dispatch] a2-prefix cubin: stored=%zu padded=%zu bytes -> ELF\n",
+                                stored_elf, raw_size);
+                    }
                 } else {
                     /* Raw data — try directly */
                     raw = (void *)best_data;
@@ -1541,12 +1554,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                         hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
                         fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: zstd+cuModuleLoadData SUCCESS "
                                 "(type=%d, handle=0x%llx)\n", best_type, (unsigned long long)handle);
-                        if ((best_flags & 0x40) && raw != best_data) free(raw);
+                        if (raw != (void *)best_data) free(raw);
                         return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS,
                                                      &handle, sizeof(handle));
                     }
                     fprintf(stderr, "[cuda_dispatch] cuModuleLoadData after decompress: %d\n", (int)res);
-                    if ((best_flags & 0x40) && raw != best_data) free(raw);
+                    if (raw != (void *)best_data) free(raw);
                 }
             }
         }
@@ -2636,12 +2649,42 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         cublasLtMatmulAlgo_t *algo = (cublasLtMatmulAlgo_t *)algo_bytes;
 
+        /* Determine workspace requirement by running heuristic with the same
+         * descriptors. Allocate workspace if needed to avoid illegal memory
+         * access from algorithms that require it. */
+        void *workspace = NULL;
+        size_t workspaceSize = 0;
+        {
+            cublasLtMatmulPreference_t pref;
+            cublasLtMatmulPreferenceCreate(&pref);
+            /* Allow up to 32 MB workspace */
+            size_t maxWs = 32 * 1024 * 1024;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREFERENCE_MAX_WORKSPACE_BYTES,
+                                                  &maxWs, sizeof(maxWs));
+            cublasLtMatmulHeuristicResult_t heur;
+            int heurCount = 0;
+            cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
+                ltHandle, opDesc, descs[0], descs[1], descs[2], descs[3],
+                pref, 1, &heur, &heurCount);
+            cublasLtMatmulPreferenceDestroy(pref);
+
+            if (hst == CUBLAS_STATUS_SUCCESS && heurCount > 0 && heur.workspaceSize > 0) {
+                workspaceSize = heur.workspaceSize;
+                cudaMalloc(&workspace, workspaceSize);
+                /* Use the heuristic's algorithm which matches the workspace */
+                memcpy(algo_bytes, &heur.algo, sizeof(cublasLtMatmulAlgo_t));
+                fprintf(stderr, "[cublas_lt] allocated workspace: %zu bytes\n", workspaceSize);
+            }
+        }
+
         cublasStatus_t st = cublasLtMatmul(ltHandle, opDesc,
             alpha_bytes, (void *)(uintptr_t)A_ptr, descs[0],
             (void *)(uintptr_t)B_ptr, descs[1],
             beta_bytes, (void *)(uintptr_t)C_ptr, descs[2],
             (void *)(uintptr_t)D_ptr, descs[3],
-            algo, NULL, 0, (cudaStream_t)stream);
+            algo, workspace, workspaceSize, (cudaStream_t)stream);
+
+        if (workspace) cudaFree(workspace);
 
         for (int i = 0; i < 4; i++) cublasLtMatrixLayoutDestroy(descs[i]);
         cublasLtMatmulDescDestroy(opDesc);
