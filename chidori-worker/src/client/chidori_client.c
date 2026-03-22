@@ -4745,15 +4745,36 @@ cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch,
 
 cudaError_t cudaMemcpyPeer(void *dst, int dstDevice,
                            const void *src, int srcDevice, size_t count) {
-    (void)dstDevice; (void)srcDevice;
-    return cudaMemcpy(dst, src, count, cudaMemcpyDeviceToDevice);
+    /* Same-device: direct DtoD */
+    if (srcDevice == dstDevice) {
+        return cudaMemcpy(dst, src, count, cudaMemcpyDeviceToDevice);
+    }
+    /* Cross-device: stage through CPU buffer.
+     * One device is local (real GPU), the other is remote (RPC).
+     * They can't access each other's memory directly. */
+    void *staging = malloc(count);
+    if (!staging) return (cudaError_t)2; /* cudaErrorMemoryAllocation */
+    int saved_dev = g_current_device;
+
+    /* Step 1: DtoH from source device */
+    cudaSetDevice(srcDevice);
+    cudaError_t r = cudaMemcpy(staging, src, count, cudaMemcpyDeviceToHost);
+    if (r != cudaSuccess) { free(staging); cudaSetDevice(saved_dev); return r; }
+
+    /* Step 2: HtoD to destination device */
+    cudaSetDevice(dstDevice);
+    r = cudaMemcpy(dst, staging, count, cudaMemcpyHostToDevice);
+    free(staging);
+    cudaSetDevice(saved_dev);
+    return r;
 }
 
 cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice,
                                 const void *src, int srcDevice,
                                 size_t count, void *stream) {
-    (void)dstDevice; (void)srcDevice;
-    return cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToDevice, stream);
+    /* Async cross-device: fall back to sync staging for now */
+    (void)stream;
+    return cudaMemcpyPeer(dst, dstDevice, src, srcDevice, count);
 }
 
 /* ---- Async Memset ---- */
@@ -6125,14 +6146,21 @@ CUresult cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                        CUdeviceptr srcDevice, CUcontext srcContext,
                        size_t byteCount) {
     (void)dstContext; (void)srcContext;
-    return cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
+    /* Cross-context: stage through CPU */
+    void *staging = malloc(byteCount);
+    if (!staging) return CUDA_ERROR_INVALID_VALUE;
+    CUresult r = cuMemcpyDtoH_v2(staging, srcDevice, byteCount);
+    if (r == CUDA_SUCCESS)
+        r = cuMemcpyHtoD_v2(dstDevice, staging, byteCount);
+    free(staging);
+    return r;
 }
 
 CUresult cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                             CUdeviceptr srcDevice, CUcontext srcContext,
                             size_t byteCount, CUstream hStream) {
-    (void)dstContext; (void)srcContext; (void)hStream;
-    return cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
+    (void)hStream;
+    return cuMemcpyPeer(dstDevice, dstContext, srcDevice, srcContext, byteCount);
 }
 
 CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
