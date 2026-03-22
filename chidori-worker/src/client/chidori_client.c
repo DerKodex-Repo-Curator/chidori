@@ -2175,20 +2175,18 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     typedef cublasStatus_t (*create_fn)(cublasHandle_t *);
     create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
-    /* DEEPBIND cuBLAS uses the real CUDA driver directly. We must ensure:
-     * 1) Real driver is initialized (cuInit)
-     * 2) A primary context exists for device 0
-     * 3) That context is current on this thread
-     * All done through real driver function pointers (not our interceptors). */
-    if (g_real.cuInit) g_real.cuInit(0);
-    if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
-        g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, 0);
+    /* DEEPBIND cuBLAS uses the real CUDA driver directly.
+     * Use real cudart's cudaSetDevice to do full init, then call cublasCreate.
+     * We need g_in_real_cuda so our interceptors forward cudart's internal calls. */
+    g_in_real_cuda++;
+    if (g_real.cudaSetDevice) {
+        int err = g_real.cudaSetDevice(0);
+        fprintf(stderr, "[chidori-diag] real cudaSetDevice(0) = %d\n", err);
     }
-    if (g_local_ctx && g_real.cuCtxSetCurrent) {
-        g_real.cuCtxSetCurrent(g_local_ctx);
-    }
-    /* cuBLAS loaded with DEEPBIND resolves libcuda.so.1 from the real driver */
+    g_in_real_cuda--;
+    /* Now call DEEPBIND cuBLAS — it uses real driver, context is active */
     cublasStatus_t r = real_create(&g_local_cublas_handle);
+    fprintf(stderr, "[chidori-diag] DEEPBIND cublasCreate = %d, handle=%p\n", r, (void*)g_local_cublas_handle);
     if (r != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: %d\n", r);
         g_local_cublas_handle = NULL;
