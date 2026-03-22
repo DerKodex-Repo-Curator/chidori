@@ -358,6 +358,9 @@ static inline void *ensure_real_cublas(void) {
         };
         for (int i = 0; cublas_paths[i] && !g_real_cublas_handle; i++) {
             g_real_cublas_handle = dlopen(cublas_paths[i], RTLD_LAZY | RTLD_DEEPBIND);
+            if (g_real_cublas_handle) {
+                fprintf(stderr, "[chidori] Loaded DEEPBIND cuBLAS from %s: %p\n", cublas_paths[i], g_real_cublas_handle);
+            }
         }
 
         if (ldpath_copy) { setenv("LD_LIBRARY_PATH", ldpath_copy, 1); free(ldpath_copy); }
