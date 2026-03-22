@@ -1549,11 +1549,15 @@ CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
 
 CUresult cuEventSynchronize(CUevent hEvent) {
     if (g_in_real_cuda > 0 && g_real.cuEventSynchronize) return g_real.cuEventSynchronize(hEvent);
-    /* Events can be from either device. Try local first (succeeds for local events),
-     * fall back to RPC (for remote events). This handles cross-device event sync. */
-    if (g_partial_offload && g_real.cuEventSynchronize) {
+    uintptr_t ev = (uintptr_t)hEvent;
+    /* Local events are heap-allocated (large address). Remote events are small RPC handles. */
+    if (g_partial_offload && ev > 0x100000 && g_real.cuEventSynchronize && g_local_ctx) {
         g_in_real_cuda++;
+        CUcontext saved = NULL;
+        if (g_real.cuCtxGetCurrent) g_real.cuCtxGetCurrent(&saved);
+        if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(g_local_ctx);
         CUresult r = g_real.cuEventSynchronize(hEvent);
+        if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(saved);
         g_in_real_cuda--;
         if (r == CUDA_SUCCESS) return r;
     }
@@ -5046,18 +5050,30 @@ cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
     /* For cross-device copy: if event is local, synchronize it directly.
      * Must temporarily activate local context — it may have been deactivated
      * when we switched to the remote device. */
-    if (g_partial_offload && g_real.cuEventSynchronize && event && g_local_ctx) {
-        g_in_real_cuda++;
-        CUcontext saved_ctx = NULL;
-        if (g_real.cuCtxGetCurrent) g_real.cuCtxGetCurrent(&saved_ctx);
-        fprintf(stderr, "[chidori] cudaStreamWaitEvent: event=%p ctx_before=%p local_ctx=%p dev=%d\n",
-                event, (void*)saved_ctx, (void*)g_local_ctx, g_current_device);
-        if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(g_local_ctx);
-        CUresult r = g_real.cuEventSynchronize((CUevent)event);
-        fprintf(stderr, "[chidori] cudaStreamWaitEvent: cuEventSynchronize=%d\n", r);
-        if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(saved_ctx);
-        g_in_real_cuda--;
-        if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
+    if (g_partial_offload && event) {
+        /* Remote events are small RPC handles (< 0x100000).
+         * Local events are heap-allocated pointers (large addresses).
+         * Only pass local events to the real driver. For remote events,
+         * just synchronize the device instead (ensures ordering). */
+        uintptr_t ev = (uintptr_t)event;
+        if (ev > 0x100000 && g_real.cuEventSynchronize && g_local_ctx) {
+            /* Local event: sync via real driver with local context active */
+            g_in_real_cuda++;
+            CUcontext saved_ctx = NULL;
+            if (g_real.cuCtxGetCurrent) g_real.cuCtxGetCurrent(&saved_ctx);
+            if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(g_local_ctx);
+            CUresult r = g_real.cuEventSynchronize((CUevent)event);
+            if (g_real.cuCtxSetCurrent) g_real.cuCtxSetCurrent(saved_ctx);
+            g_in_real_cuda--;
+            if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
+        } else if (ev <= 0x100000) {
+            /* Remote event: sync by synchronizing the remote device */
+            if (!is_local_device(g_current_device)) {
+                cudaError_t r = cudaDeviceSynchronize();
+                g_last_error = r;
+                return r;
+            }
+        }
     }
     g_last_error = cudaSuccess;
     return cudaSuccess;
