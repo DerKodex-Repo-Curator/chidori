@@ -5810,32 +5810,46 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                 blockDim.x, blockDim.y, blockDim.z,
                 num_params, total_ps);
 
-    /* Debug: scan param buffer for host pointers that shouldn't be in GPU kernel args.
-     * In partial offload mode, kernel launches on remote devices might contain
-     * host pointers (e.g., UVA-accessible metadata) that work locally but fail remotely. */
+    /* Host pointer fixup: scan param buffer for host pointers that won't be
+     * accessible on a remote GPU. On a local GPU, these work via CUDA UVA
+     * (the GPU can access host memory). On a remote GPU, we need to copy the
+     * pointed-to data into remote device memory and patch the pointer.
+     *
+     * Typical case: PyTorch passes OffsetCalculator/stride metadata as host
+     * pointers embedded in kernel functor parameters. */
+    #define MAX_HOST_PTR_FIXUPS 4
+    uint64_t fixup_dev_ptrs[MAX_HOST_PTR_FIXUPS];
+    int fixup_count = 0;
     if (param_buf && total_ps >= 8 && !is_local_device(g_current_device)) {
         for (int off = 0; off + 8 <= total_ps; off += 8) {
             uint64_t val = 0;
             memcpy(&val, param_buf + off, 8);
-            /* Check if this looks like a host user-space address (0x55... or similar)
-             * but NOT a GPU address (GPU addresses on CUDA UVA are typically 0x7x...) */
+            /* Detect host user-space heap addresses (PIE binary range: 0x55...-0x5f...) */
             if (val >= 0x10000000000ULL && val < 0x600000000000ULL) {
-                /* This is almost certainly a host heap address (PIE binary range) */
-                fprintf(stderr, "[chidori-launch] HOST_PTR: param[%d]=0x%llx dev=%d func=%s\n",
-                        off, (unsigned long long)val,
-                        g_current_device,
-                        g_registered_functions[func_idx].deviceName);
-                /* Dump what the host pointer points to (first 32 bytes) */
-                fprintf(stderr, "[chidori-launch]   *ptr = ");
-                const uint8_t *hp = (const uint8_t *)(uintptr_t)val;
-                for (int b = 0; b < 32; b++)
-                    fprintf(stderr, "%02x", hp[b]);
-                fprintf(stderr, "\n");
-                /* Also print param layout */
-                for (int i = 0; i < num_params; i++) {
-                    fprintf(stderr, "[chidori-launch]   param[%d] offset=%d size=%d\n",
-                            i, g_registered_functions[func_idx].params[i].offset,
-                            g_registered_functions[func_idx].params[i].size);
+                /* Copy 256 bytes from host pointer to remote device memory.
+                 * OffsetCalculator and similar metadata structs are typically < 128 bytes. */
+                size_t copy_size = 256;
+                void *dev_ptr = NULL;
+                /* cudaMalloc on the current (remote) device */
+                cudaError_t merr = cudaMalloc(&dev_ptr, copy_size);
+                if (merr == cudaSuccess && dev_ptr) {
+                    /* Copy host data to remote device */
+                    cudaError_t cerr = cudaMemcpy(dev_ptr, (void *)(uintptr_t)val, copy_size, cudaMemcpyHostToDevice);
+                    if (cerr == cudaSuccess) {
+                        uint64_t dev_val = (uint64_t)(uintptr_t)dev_ptr;
+                        memcpy(param_buf + off, &dev_val, 8);
+                        if (fixup_count < MAX_HOST_PTR_FIXUPS)
+                            fixup_dev_ptrs[fixup_count++] = dev_val;
+                        fprintf(stderr, "[chidori-launch] HOST_PTR fixup: param[%d] 0x%llx -> 0x%llx (%zu bytes)\n",
+                                off, (unsigned long long)val, (unsigned long long)dev_val, copy_size);
+                    } else {
+                        fprintf(stderr, "[chidori-launch] HOST_PTR fixup FAILED memcpy: param[%d] 0x%llx err=%d\n",
+                                off, (unsigned long long)val, (int)cerr);
+                        cudaFree(dev_ptr);
+                    }
+                } else {
+                    fprintf(stderr, "[chidori-launch] HOST_PTR fixup FAILED malloc: param[%d] 0x%llx err=%d\n",
+                            off, (unsigned long long)val, (int)merr);
                 }
             }
         }
