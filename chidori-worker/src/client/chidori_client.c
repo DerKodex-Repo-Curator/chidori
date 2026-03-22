@@ -48,9 +48,39 @@
  * driver functions via dlsym, completely bypassing our interception.
  * ============================================================================
  */
-static void *g_real_cuda_handle_for_dlopen = NULL; /* set by init_real_cuda */
+static void *g_real_cuda_handle_for_dlopen = NULL; /* set by early_init or init_real_cuda */
 static __thread int g_dlopen_redirect_active = 0;  /* 1 = redirect libcuda dlopen to real driver */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
+
+/* Early constructor: load the real NVIDIA driver BEFORE any NVIDIA library
+ * constructors run. This ensures our dlopen redirect is active when cuBLAS,
+ * cublasLt, cuDNN etc. call dlopen("libcuda.so.1") during their init.
+ * Priority 101 runs before default constructors (priority 65535). */
+__attribute__((constructor(101)))
+static void early_load_real_cuda_driver(void) {
+    /* Try standard NVIDIA driver paths */
+    static const char *paths[] = {
+        "/usr/lib/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib64/libcuda.so.1",
+        NULL
+    };
+    /* Use the real dlopen (not our interceptor — we're in early init) */
+    void *(*raw_dlopen)(const char *, int) = NULL;
+    /* At this early stage, g_real_dlsym_fn might not be set yet.
+     * Use dlvsym directly (we don't override it). */
+    extern void *dlvsym(void *, const char *, const char *);
+    void *(*real_dlsym)(void *, const char *) = (void *(*)(void *, const char *))
+        dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (real_dlsym)
+        raw_dlopen = (void *(*)(const char *, int))real_dlsym(RTLD_NEXT, "dlopen");
+    if (!raw_dlopen) return;
+
+    for (int i = 0; paths[i]; i++) {
+        g_real_cuda_handle_for_dlopen = raw_dlopen(paths[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (g_real_cuda_handle_for_dlopen) break;
+    }
+}
 
 /*
  * ============================================================================
