@@ -49,17 +49,18 @@
  * ============================================================================
  */
 static void *g_real_cuda_handle_for_dlopen = NULL; /* set by init_real_cuda */
+static __thread int g_dlopen_redirect_active = 0;  /* 1 = redirect libcuda dlopen to real driver */
 
 void *dlopen(const char *filename, int flags) {
-    /* Get real dlopen via __libc_dlopen_mode */
     static void *(*real_dlopen)(const char *, int) = NULL;
     if (!real_dlopen) {
-        /* Use dlsym(RTLD_NEXT) to find the real dlopen behind us */
         real_dlopen = dlsym(RTLD_NEXT, "dlopen");
     }
 
-    /* Redirect libcuda.so.1 requests to real driver when partial offload is active */
-    if (g_real_cuda_handle_for_dlopen && filename &&
+    /* Only redirect when explicitly enabled (during cuBLAS init).
+     * PyTorch's own dlopen("libcuda.so.1") must NOT be redirected —
+     * it needs our intercepted functions for device routing. */
+    if (g_dlopen_redirect_active && g_real_cuda_handle_for_dlopen && filename &&
         (strcmp(filename, "libcuda.so.1") == 0 ||
          strcmp(filename, "libcuda.so") == 0)) {
         return g_real_cuda_handle_for_dlopen;
@@ -2244,12 +2245,18 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     /* The DEEPBIND cuBLAS uses the real CUDA driver via its own dependency scope.
      * Our intercepted cudaSetDevice(0) sets the local GPU context via the real driver.
      * Call it to ensure the context is current (matching the ctypes test that worked). */
+    /* Ensure real CUDA context is current for the local device */
     extern int cudaSetDevice(int);
-    extern int cudaDeviceSynchronize(void);
     cudaSetDevice(0);
-    cudaDeviceSynchronize();
+
+    /* Enable dlopen redirect: cuBLAS's internal dlopen("libcuda.so.1") will
+     * return the real NVIDIA driver handle instead of our interceptor.
+     * This gives cuBLAS real driver function pointers via dlsym, avoiding
+     * the reentrance issues that cause error 14. */
+    g_dlopen_redirect_active = 1;
     cublasStatus_t r = real_create(&g_local_cublas_handle);
-    fprintf(stderr, "[chidori-diag] DEEPBIND cublasCreate = %d, handle=%p\n", r, (void*)g_local_cublas_handle);
+    g_dlopen_redirect_active = 0;
+    LOG_DEBUG("cublasCreate_v2 = %d, handle=%p", r, (void*)g_local_cublas_handle);
     if (r != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: %d\n", r);
         g_local_cublas_handle = NULL;
