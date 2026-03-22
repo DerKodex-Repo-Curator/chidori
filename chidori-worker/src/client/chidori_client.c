@@ -36,6 +36,40 @@
 
 /*
  * ============================================================================
+ * dlopen interception — redirect libcuda.so.1 to real driver for cuBLAS.
+ *
+ * cuBLAS resolves CUDA symbols via dlopen("libcuda.so.1") + dlsym().
+ * With LD_LIBRARY_PATH=build, this finds our symlink and gets our
+ * intercepted functions. This causes cublasCreate to fail (error 14)
+ * because cuBLAS's init handshake doesn't work through our routing.
+ *
+ * Fix: intercept dlopen and redirect "libcuda.so" requests to the real
+ * NVIDIA driver handle (loaded by init_real_cuda). cuBLAS gets real
+ * driver functions via dlsym, completely bypassing our interception.
+ * ============================================================================
+ */
+static void *g_real_cuda_handle_for_dlopen = NULL; /* set by init_real_cuda */
+
+void *dlopen(const char *filename, int flags) {
+    /* Get real dlopen via __libc_dlopen_mode */
+    static void *(*real_dlopen)(const char *, int) = NULL;
+    if (!real_dlopen) {
+        /* Use dlsym(RTLD_NEXT) to find the real dlopen behind us */
+        real_dlopen = dlsym(RTLD_NEXT, "dlopen");
+    }
+
+    /* Redirect libcuda.so.1 requests to real driver when partial offload is active */
+    if (g_real_cuda_handle_for_dlopen && filename &&
+        (strcmp(filename, "libcuda.so.1") == 0 ||
+         strcmp(filename, "libcuda.so") == 0)) {
+        return g_real_cuda_handle_for_dlopen;
+    }
+
+    return real_dlopen ? real_dlopen(filename, flags) : NULL;
+}
+
+/*
+ * ============================================================================
  * Centralized logging — controlled by environment variables:
  *   CHIDORI_DEBUG=1    — Connection events, device routing, errors
  *   CHIDORI_TRACE=1    — Every sync/async RPC with func_id and timing
@@ -241,6 +275,9 @@ static void init_real_cuda(void) {
             return;
         }
     }
+    /* Enable dlopen interception: cuBLAS's dlopen("libcuda.so.1") returns real driver */
+    g_real_cuda_handle_for_dlopen = g_real_cuda_handle;
+
     /* For cudart: use RTLD_NEXT since we don't replace libcudart */
     g_real_cudart_handle = RTLD_NEXT;
 
