@@ -2208,6 +2208,13 @@ cudaError_t cudaPeekAtLastError(void) {
 }
 
 cudaError_t cudaDeviceCanAccessPeer(int *canAccess, int device, int peerDevice) {
+    /* Partial offload: local and remote devices can't peer-access each other.
+     * Don't send RPC — the remote server doesn't know about our device numbering. */
+    if (g_partial_offload) {
+        if (canAccess) *canAccess = 0; /* no peer access between local+remote */
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
     struct { int32_t device; int32_t peerDevice; } req = { device, peerDevice };
     size_t len = sizeof(int32_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_CAN_ACCESS_PEER,
