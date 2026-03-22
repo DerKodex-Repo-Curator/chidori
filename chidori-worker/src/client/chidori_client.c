@@ -7075,6 +7075,7 @@ static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
 
 static int g_lt_handle_storage;
 cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
+    write(STDERR_FILENO, "[DIAG] cublasLtCreate\n", 22);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
@@ -7164,8 +7165,7 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
-    /* DIAG: return unique error to identify if called */
-    return (cublasStatus_t)15; /* CUBLAS_STATUS_NOT_SUPPORTED */
+    write(STDERR_FILENO, "[DIAG] cublasLtMatmul\n", 22);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
@@ -7259,6 +7259,7 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
 }
 
 cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
+    write(STDERR_FILENO, "[DIAG] cublasLtMatmulDescCreate\n", 32);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
