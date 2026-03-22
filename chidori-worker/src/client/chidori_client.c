@@ -2011,6 +2011,30 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
 }
 
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, void *stream) {
+    (void)stream;
+
+    /* Cross-device DtoD: stage through CPU when src and dst are on different devices */
+    if (g_partial_offload && kind == 3 /* DtoD */) {
+        int src_dev = alloc_track_device((uintptr_t)src);
+        int dst_dev = alloc_track_device((uintptr_t)dst);
+        if (src_dev >= 0 && dst_dev >= 0 && src_dev != dst_dev) {
+            /* Cross-device: DtoH from source, HtoD to destination */
+            void *staging = malloc(count);
+            if (!staging) return (cudaError_t)2;
+            int saved = g_current_device;
+            cudaSetDevice(src_dev);
+            cudaError_t r = cudaMemcpy(staging, (void*)src, count, 2 /* DtoH */);
+            if (r == cudaSuccess) {
+                cudaSetDevice(dst_dev);
+                r = cudaMemcpy(dst, staging, count, 1 /* HtoD */);
+            }
+            free(staging);
+            cudaSetDevice(saved);
+            g_last_error = r;
+            return r;
+        }
+    }
+
     /* Route to local GPU via Driver API if current device is local */
     if (g_partial_offload && is_local_device(g_current_device)) {
         ensure_real_cuda_init();
