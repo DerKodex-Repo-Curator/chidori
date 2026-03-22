@@ -2154,6 +2154,14 @@ cudaError_t cudaStreamSynchronize(void *stream) {
 }
 
 cudaError_t cudaEventCreate(void **pEvent) {
+    /* Local device: create event on real driver */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventCreate) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventCreate((CUevent *)pEvent, 0x02 /* CU_EVENT_DISABLE_TIMING */);
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
     uint64_t handle = 0;
     size_t len = sizeof(uint64_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_EVENT_CREATE, NULL, 0, &handle, &len);
@@ -2164,6 +2172,13 @@ cudaError_t cudaEventCreate(void **pEvent) {
 }
 
 cudaError_t cudaEventRecord(void *event, void *stream) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventRecord) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventRecord((CUevent)event, (CUstream)stream);
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
     struct { uint64_t event; uint64_t stream; } req;
     req.event = (uint64_t)(uintptr_t)event;
     req.stream = (uint64_t)(uintptr_t)stream;
@@ -2172,7 +2187,20 @@ cudaError_t cudaEventRecord(void *event, void *stream) {
     return r;
 }
 
+/* cudaEventRecordWithFlags — CUDA 11.1+ */
+cudaError_t cudaEventRecordWithFlags(void *event, void *stream, unsigned int flags) {
+    (void)flags;
+    return cudaEventRecord(event, stream);
+}
+
 cudaError_t cudaEventSynchronize(void *event) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventSynchronize) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventSynchronize((CUevent)event);
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)event;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_EVENT_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
     g_last_error = r;
@@ -2180,6 +2208,14 @@ cudaError_t cudaEventSynchronize(void *event) {
 }
 
 cudaError_t cudaEventDestroy(void *event) {
+    /* For simplicity, try local first then RPC — event might have been created on either */
+    if (g_partial_offload && g_real.cuEventDestroy_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventDestroy_v2((CUevent)event);
+        g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
+        /* If local destroy failed, try RPC (event might be remote) */
+    }
     uint64_t handle = (uint64_t)(uintptr_t)event;
     cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_EVENT_DESTROY, &handle, sizeof(handle));
     g_last_error = r;
@@ -4979,7 +5015,18 @@ cudaError_t cudaStreamQuery(void *stream) {
 }
 
 cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
-    (void)stream; (void)event; (void)flags;
+    (void)flags;
+    /* For cross-device copy: if event is local, synchronize it directly.
+     * The event was created and recorded on local device — waiting for it
+     * ensures the DtoH copy completed before HtoD starts on remote device. */
+    if (g_partial_offload && g_real.cuEventSynchronize && event) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventSynchronize((CUevent)event);
+        g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
+        /* If it's not a local event, fall through to no-op */
+    }
+    (void)stream;
     g_last_error = cudaSuccess;
     return cudaSuccess;
 }
@@ -5014,7 +5061,14 @@ cudaError_t cudaThreadExchangeStreamCaptureMode(int *mode) {
 /* ---- Event Management (additional) ---- */
 
 cudaError_t cudaEventCreateWithFlags(void **pEvent, unsigned int flags) {
-    (void)flags;
+    /* Local device: create with real driver using actual flags */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventCreate) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventCreate((CUevent *)pEvent, flags);
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
     return cudaEventCreate(pEvent);
 }
 
