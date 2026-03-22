@@ -3126,13 +3126,6 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    {
-        char _buf[200];
-        int _len = snprintf(_buf, sizeof(_buf),
-            "[chidori] cublasGemmEx ENTERED m=%d n=%d k=%d Atype=%d compute=%d dev=%d\n",
-            m, n, k, Atype, computeType, g_current_device);
-        if (_len > 0) write(STDERR_FILENO, _buf, _len);
-    }
 
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
@@ -7156,11 +7149,6 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
-    {
-        char _b[80]; int _l = snprintf(_b, sizeof(_b), "[chidori] cublasLtMatmul dev=%d local=%d reent=%d\n",
-            g_current_device, is_local_device(g_current_device), g_in_real_cuda);
-        if (_l > 0) write(STDERR_FILENO, _b, _l);
-    }
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
