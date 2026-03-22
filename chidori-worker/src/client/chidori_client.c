@@ -1140,7 +1140,7 @@ CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t byteCount)
 }
 
 CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t byteCount) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuMemcpyDtoD_v2) return g_real.cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount); /* reentrance: forward to real driver */
     struct { uint64_t dst; uint64_t src; uint64_t size; } req;
     req.dst = (uint64_t)dstDevice;
     req.src = (uint64_t)srcDevice;
@@ -1365,7 +1365,7 @@ CUresult cuLaunchKernel(CUfunction f,
 
 /* Stream */
 CUresult cuStreamCreate(CUstream *phStream, unsigned int flags) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuStreamCreate) return g_real.cuStreamCreate(phStream, flags); /* reentrance: forward to real driver */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuStreamCreate) {
         LOG_DEBUG("cuStreamCreate -> LOCAL (dev %d)", g_current_device);
         g_in_real_cuda++;
@@ -1378,7 +1378,7 @@ CUresult cuStreamCreate(CUstream *phStream, unsigned int flags) {
 }
 
 CUresult cuStreamDestroy_v2(CUstream hStream) {
-    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuStreamDestroy_v2) return g_real.cuStreamDestroy_v2(hStream); /* reentrance: forward to real driver */
     uint64_t handle = (uint64_t)(uintptr_t)hStream;
     return chidori_rpc_async(CHIDORI_CU_STREAM_DESTROY, &handle, sizeof(handle));
 }
@@ -1397,19 +1397,19 @@ CUresult cuStreamSynchronize(CUstream hStream) {
 
 /* Event */
 CUresult cuEventCreate(CUevent *phEvent, unsigned int flags) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuEventCreate) return g_real.cuEventCreate(phEvent, flags); /* reentrance: forward to real driver */
     size_t len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_EVENT_CREATE, &flags, sizeof(flags), phEvent, &len);
 }
 
 CUresult cuEventDestroy_v2(CUevent hEvent) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuEventDestroy_v2) return g_real.cuEventDestroy_v2(hEvent); /* reentrance: forward to real driver */
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc_async(CHIDORI_CU_EVENT_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuEventRecord) return g_real.cuEventRecord(hEvent, hStream); /* reentrance: forward to real driver */
     struct { uint64_t event; uint64_t stream; } req;
     req.event = (uint64_t)(uintptr_t)hEvent;
     req.stream = (uint64_t)(uintptr_t)hStream;
@@ -1417,7 +1417,7 @@ CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
 }
 
 CUresult cuEventSynchronize(CUevent hEvent) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda > 0 && g_real.cuEventSynchronize) return g_real.cuEventSynchronize(hEvent); /* reentrance: forward to real driver */
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc(CHIDORI_CU_EVENT_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
 }
@@ -2150,11 +2150,39 @@ static size_t chidori_cublas_scalar_size(int dtype) {
     }
 }
 
+/* Local cuBLAS handle for partial offload — lazily created */
+static cublasHandle_t g_local_cublas_handle = NULL;
+
+static cublasHandle_t ensure_local_cublas_handle(void) {
+    if (g_local_cublas_handle) return g_local_cublas_handle;
+    void *h = ensure_real_cublas();
+    if (!h) return NULL;
+    typedef cublasStatus_t (*create_fn)(cublasHandle_t *);
+    create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
+    if (!real_create) return NULL;
+    ensure_real_cuda_init();
+    g_in_real_cuda++;
+    cublasStatus_t r = real_create(&g_local_cublas_handle);
+    g_in_real_cuda--;
+    if (r != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: %d\n", r);
+        g_local_cublas_handle = NULL;
+        return NULL;
+    }
+    LOG_DEBUG("Created local cuBLAS handle: %p", (void*)g_local_cublas_handle);
+    return g_local_cublas_handle;
+}
+
 static uint64_t g_last_cublas_handle = 0; /* Track last cuBLAS handle for cublasLt translation */
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
-    /* NOTE: cuBLAS local routing deferred — cublasCreate internally calls
-     * many CUDA functions that interact with our LD_PRELOAD interceptors.
-     * For now, all cuBLAS operations go through RPC (remote server). */
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (local_h) {
+            *handle = local_h;
+            return CUBLAS_STATUS_SUCCESS;
+        }
+    }
     uint64_t h = 0;
     size_t len = sizeof(uint64_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_CREATE, NULL, 0, &h, &len);
@@ -2166,6 +2194,11 @@ cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
 }
 
 cublasStatus_t cublasDestroy_v2(cublasHandle_t handle) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        /* Don't actually destroy — we reuse the local handle */
+        return CUBLAS_STATUS_SUCCESS;
+    }
     uint64_t h = (uint64_t)(uintptr_t)handle;
     return (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_DESTROY, &h, sizeof(h), NULL, NULL);
 }
@@ -2179,6 +2212,19 @@ static int      g_cublas_mode_valid = 0;
 static int      g_cublas_stream_valid = 0;
 
 cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, CUstream stream) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, CUstream);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSetStream_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, stream);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     struct { uint64_t handle; uint64_t stream; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.stream = (uint64_t)(uintptr_t)stream;
@@ -2208,6 +2254,19 @@ cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
 }
 
 cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasMath_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSetMathMode"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, mode);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     struct __attribute__((packed)) { uint64_t handle; int32_t mode; } req;
     req.handle = (uint64_t)(uintptr_t)handle;
     req.mode = (int32_t)mode;
@@ -2235,6 +2294,19 @@ cublasStatus_t cublasGetMathMode(cublasHandle_t handle, cublasMath_t *mode) {
 static int g_cublas_version_cached = 0;
 static int g_cublas_version = 0;
 cublasStatus_t cublasGetVersion_v2(cublasHandle_t handle, int *version) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGetVersion_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, version);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     if (g_cublas_version_cached) { *version = g_cublas_version; return CUBLAS_STATUS_SUCCESS; }
     uint64_t h = (uint64_t)(uintptr_t)handle;
     int32_t v = 0;
@@ -2261,6 +2333,20 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
     const void *B, int ldb,
     const float *beta,
     void *C, int ldc) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void *, int, const void *, int, const float *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemm_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2305,6 +2391,20 @@ cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
     const double *beta,
     void *C, int ldc) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const double *, const void *, int, const void *, int, const double *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDgemm_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
@@ -2348,6 +2448,20 @@ cublasStatus_t cublasHgemm(cublasHandle_t handle,
     const void *beta,
     void *C, int ldc) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void *, int, const void *, int, const void *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasHgemm"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
@@ -2389,6 +2503,20 @@ cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
     const void *B, int Btype, int ldb,
     const float *beta,
     void *C, int Ctype, int ldc) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void *, int, int, const void *, int, int, const float *, void *, int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemmEx"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2442,6 +2570,20 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void *, int, int, const void *, int, int, const void *, void *, int, int, int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmEx"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc, computeType, algo);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
@@ -2492,6 +2634,20 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
     const float *beta,
     void *y, int incy) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, int, int, const float *, const void *, int, const void *, int, const float *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemv_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  trans;
@@ -2530,6 +2686,20 @@ cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
     const double *beta,
     void *y, int incy) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, int, int, const double *, const void *, int, const void *, int, const double *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDgemv_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  trans;
@@ -2567,6 +2737,20 @@ cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
     const void *x, int incx,
     void *y, int incy) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const float *, const void *, int, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSaxpy_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, alpha, x, incx, y, incy);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
@@ -2592,6 +2776,20 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
     int n, const double *alpha,
     const void *x, int incx,
     void *y, int incy) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const double *, const void *, int, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDaxpy_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, alpha, x, incx, y, incy);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2621,6 +2819,20 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
 cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
     int n, const void *x, int incx, float *result) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, float *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSnrm2_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, x, incx, result);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
@@ -2639,6 +2851,20 @@ cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
 
 cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle,
     int n, const void *x, int incx, double *result) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, double *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDnrm2_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, x, incx, result);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2663,6 +2889,20 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
     int n, const void *x, int incx,
     const void *y, int incy, float *result) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, const void *, int, float *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSdot_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, x, incx, y, incy, result);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
@@ -2686,6 +2926,20 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
 cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
     int n, const void *x, int incx,
     const void *y, int incy, double *result) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, const void *, int, double *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDdot_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, x, incx, y, incy, result);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2713,6 +2967,20 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
 cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
     int n, const float *alpha, void *x, int incx) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const float *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSscal_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, alpha, x, incx);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
@@ -2732,6 +3000,20 @@ cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
 
 cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
     int n, const double *alpha, void *x, int incx) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const double *, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDscal_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, alpha, x, incx);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2756,6 +3038,20 @@ cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
 cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
     int n, const void *x, int incx, void *y, int incy) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasScopy_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, x, incx, y, incy);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  n;
@@ -2777,6 +3073,20 @@ cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
 
 cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
     int n, const void *x, int incx, void *y, int incy) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, void *, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDcopy_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, n, x, incx, y, incy);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -2812,6 +3122,20 @@ cublasStatus_t cublasSgemmBatched(cublasHandle_t handle,
     const float *beta,
     void * const *Carray, int ldc,
     int batchCount) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void * const *, int, const void * const *, int, const float *, void * const *, int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemmBatched"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, Aarray, lda, Barray, ldb, beta, Carray, ldc, batchCount);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     /*
      * Wire format:
@@ -2877,6 +3201,20 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
     void *C, int ldc, long long int strideC,
     int batchCount) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void *, int, long long int, const void *, int, long long int, const float *, void *, int, long long int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemmStridedBatched"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batchCount);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     struct __attribute__((packed)) {
         uint64_t handle;
         int32_t  transa, transb;
@@ -2927,6 +3265,20 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc, long long int strideC,
     int batchCount, int computeType, int algo) {
+
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void *, int, int, long long int, const void *, int, int, long long int, const void *, void *, int, int, long long int, int, int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmStridedBatchedEx"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, Atype, lda, strideA, B, Btype, ldb, strideB, beta, C, Ctype, ldc, strideC, batchCount, computeType, algo);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
 
     struct __attribute__((packed)) {
         uint64_t handle;
@@ -5793,6 +6145,20 @@ cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle,
     void * const *Carray, int Ctype, int ldc,
     int batchCount, int computeType, int algo) {
 
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void * const *, int, int, const void * const *, int, int, const void *, void * const *, int, int, int, int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmBatchedEx"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, Aarray, Atype, lda, Barray, Btype, ldb, beta, Carray, Ctype, ldc, batchCount, computeType, algo);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+
     for (int i = 0; i < batchCount; i++) {
         cublasStatus_t r = cublasGemmEx(handle, transa, transb, m, n, k,
                                          alpha,
@@ -5811,13 +6177,73 @@ cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle,
  */
 typedef void *cublasLtHandle_t;
 
+/* Lazy-load real cuBLASLt for local device routing */
+static void *g_real_cublaslt_handle = NULL;
+static int g_cublaslt_load_attempted = 0;
+static inline void *ensure_real_cublaslt(void) {
+    if (g_real_cublaslt_handle) return g_real_cublaslt_handle;
+    if (g_cublaslt_load_attempted) return NULL;
+    g_cublaslt_load_attempted = 1;
+    g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY | RTLD_NOLOAD);
+    if (!g_real_cublaslt_handle)
+        g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!g_real_cublaslt_handle) {
+        g_in_real_cuda++;
+        g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY);
+        if (!g_real_cublaslt_handle)
+            g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY);
+        g_in_real_cuda--;
+    }
+    if (g_real_cublaslt_handle)
+        LOG_DEBUG("Loaded real cuBLASLt: %p", g_real_cublaslt_handle);
+    else
+        LOG_DEBUG("WARNING: Could not load real cuBLASLt — local device cublasLt calls will use stubs");
+    return g_real_cublaslt_handle;
+}
+
+/* Local cuBLASLt handle for partial offload — lazily created */
+static cublasLtHandle_t g_local_cublaslt_handle = NULL;
+
+static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
+    if (g_local_cublaslt_handle) return g_local_cublaslt_handle;
+    void *h = ensure_real_cublaslt();
+    if (!h) return NULL;
+    typedef cublasStatus_t (*create_fn)(cublasLtHandle_t *);
+    create_fn real_create = (create_fn)dlsym(h, "cublasLtCreate");
+    if (!real_create) return NULL;
+    ensure_real_cuda_init();
+    g_in_real_cuda++;
+    cublasStatus_t r = real_create(&g_local_cublaslt_handle);
+    g_in_real_cuda--;
+    if (r != 0) {
+        fprintf(stderr, "[chidori] ensure_local_cublaslt_handle: cublasLtCreate failed: %d\n", r);
+        g_local_cublaslt_handle = NULL;
+        return NULL;
+    }
+    LOG_DEBUG("Created local cuBLASLt handle: %p", (void*)g_local_cublaslt_handle);
+    return g_local_cublaslt_handle;
+}
+
 static int g_lt_handle_storage;
 cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        cublasLtHandle_t local_h = ensure_local_cublaslt_handle();
+        if (local_h) {
+            if (lightHandle) *lightHandle = local_h;
+            return CUBLAS_STATUS_SUCCESS;
+        }
+    }
     if (lightHandle) *lightHandle = (cublasLtHandle_t)&g_lt_handle_storage;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        /* Don't actually destroy — we reuse the local handle */
+        return CUBLAS_STATUS_SUCCESS;
+    }
     (void)lightHandle;
     return CUBLAS_STATUS_SUCCESS;
 }
@@ -5871,6 +6297,19 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, const void *, const void *, void *, const void *, void *, const void *, const void *, void *, void *, void *, const void *, void *, size_t, void *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmul"); }
+        cublasLtHandle_t local_h = ensure_local_cublaslt_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, computeDesc, alpha, A, Adesc, B, Bdesc, beta, C, Cdesc, D, Ddesc, algo, workspace, workspaceSizeInBytes, stream);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     (void)lightHandle; (void)workspace; (void)workspaceSizeInBytes; (void)C;
 
     lt_matmul_desc_t *desc = (lt_matmul_desc_t *)computeDesc;
@@ -5942,6 +6381,18 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
 }
 
 cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void **, int, int);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescCreate"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matmulDesc, computeType, scaleType);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     if (g_lt_desc_count >= LT_DESC_POOL) { if (matmulDesc) *matmulDesc = NULL; return CUBLAS_STATUS_ALLOC_FAILED; }
     lt_matmul_desc_t *d = &g_lt_descs[g_lt_desc_count++];
     memset(d, 0, sizeof(*d));
@@ -5952,12 +6403,36 @@ cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int 
 }
 
 cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescDestroy"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matmulDesc);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     (void)matmulDesc;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
                                                 const void *buf, size_t sizeInBytes) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescSetAttribute"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matmulDesc, attr, buf, sizeInBytes);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     lt_matmul_desc_t *d = (lt_matmul_desc_t *)matmulDesc;
     if (!d || !buf) return CUBLAS_STATUS_SUCCESS;
     if (attr == CUBLASLT_MATMUL_DESC_TRANSA && sizeInBytes >= 4) d->transa = *(const int *)buf;
@@ -5970,6 +6445,18 @@ cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
 cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
                                                 void *buf, size_t sizeInBytes,
                                                 size_t *sizeWritten) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescGetAttribute"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matmulDesc, attr, buf, sizeInBytes, sizeWritten);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     lt_matmul_desc_t *d = (lt_matmul_desc_t *)matmulDesc;
     if (buf) memset(buf, 0, sizeInBytes);
     if (d && buf) {
@@ -5982,6 +6469,18 @@ cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
 
 cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
                                             uint64_t rows, uint64_t cols, int64_t ld) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void **, int, uint64_t, uint64_t, int64_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutCreate"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matLayout, type, rows, cols, ld);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     if (g_lt_layout_count >= LT_DESC_POOL * 4) { if (matLayout) *matLayout = NULL; return CUBLAS_STATUS_ALLOC_FAILED; }
     lt_matrix_layout_t *l = &g_lt_layouts[g_lt_layout_count++];
     memset(l, 0, sizeof(*l));
@@ -5995,12 +6494,36 @@ cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
 }
 
 cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutDestroy"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matLayout);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     (void)matLayout;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
                                                   const void *buf, size_t sizeInBytes) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutSetAttribute"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matLayout, attr, buf, sizeInBytes);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     lt_matrix_layout_t *l = (lt_matrix_layout_t *)matLayout;
     if (!l || !buf) return CUBLAS_STATUS_SUCCESS;
     if (attr == CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT && sizeInBytes >= 4)
@@ -6013,6 +6536,18 @@ cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
 cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
                                                   void *buf, size_t sizeInBytes,
                                                   size_t *sizeWritten) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutGetAttribute"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(matLayout, attr, buf, sizeInBytes, sizeWritten);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     lt_matrix_layout_t *l = (lt_matrix_layout_t *)matLayout;
     if (buf) memset(buf, 0, sizeInBytes);
     if (l && buf) {
@@ -6026,18 +6561,54 @@ cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
 }
 
 cublasStatus_t cublasLtMatmulPreferenceCreate(void **pref) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void **);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceCreate"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(pref);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     static int fake_pref;
     if (pref) *pref = (void *)&fake_pref;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatmulPreferenceDestroy(void *pref) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceDestroy"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(pref);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     (void)pref;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatmulPreferenceSetAttribute(void *pref, int attr,
                                                       const void *buf, size_t sizeInBytes) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceSetAttribute"); }
+        if (real_fn) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(pref, attr, buf, sizeInBytes);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     (void)pref; (void)attr; (void)buf; (void)sizeInBytes;
     return CUBLAS_STATUS_SUCCESS;
 }
@@ -6046,6 +6617,19 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
     void *preference, int requestedAlgoCount, void *heuristicResultsArray,
     int *returnAlgoCount) {
+    /* LOCAL DEVICE ROUTING */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, void *, int, void *, int *);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoGetHeuristic"); }
+        cublasLtHandle_t local_h = ensure_local_cublaslt_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference, requestedAlgoCount, heuristicResultsArray, returnAlgoCount);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
     (void)lightHandle; (void)preference; (void)requestedAlgoCount;
 
     lt_matmul_desc_t *desc = (lt_matmul_desc_t *)operationDesc;
