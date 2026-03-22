@@ -34,9 +34,9 @@ $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CUDA_CFLAGS) -I src/server -o $@ $(SRC_SERVER) $(SRC_PROTO) $(LDFLAGS_SERVER)
 
-$(BUILD_DIR)/libchidori.so: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
+$(BUILD_DIR)/libchidori.so: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h src/client/chidori_client.map
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libchidori.so -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libchidori.so -Wl,--version-script=src/client/chidori_client.map -o $@ $(SRC_CLIENT) $(SRC_PROTO)
 
 $(BUILD_DIR)/libnvidia-ml.so.1: src/client/chidori_nvml.c
 	@mkdir -p $(BUILD_DIR)

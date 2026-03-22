@@ -133,6 +133,7 @@ typedef unsigned long long CUdeviceptr;
 #define CUDA_SUCCESS 0
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_VALUE 1
+#define CUDA_ERROR_INVALID_DEVICE 101
 #define CUDA_ERROR_NOT_FOUND 500
 #define CUDA_ERROR_NOT_SUPPORTED 801
 
@@ -152,9 +153,62 @@ static void *g_real_cuda_handle = NULL;   /* dlopen handle for real libcuda.so *
 static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so */
 static void *g_real_cublas_handle = NULL; /* dlopen handle for real libcublas.so */
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
+static int g_fatbin_passthrough = -1;    /* 1 if CHIDORI_FATBIN_PASSTHROUGH=1: skip all our fatbin tracking */
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
 static int g_current_device = 0;         /* current active device (global) */
+
+/*
+ * Deferred init mode (CHIDORI_DEFERRED_INIT=1):
+ * Delays init_real_cuda() until cuInit() is called, instead of calling it
+ * from __cudaRegisterFatBinary during early library loading. This ensures
+ * the real CUDA driver is only initialized AFTER the normal CUDA init sequence
+ * starts, which may fix cuBLAS FP16 issues caused by early initialization.
+ *
+ * During deferred mode, __cudaRegisterFatBinary/End/Function calls store
+ * their arguments in pending arrays. When cuInit fires, it calls
+ * init_real_cuda() and then replays all pending registrations.
+ */
+static int g_deferred_init = -1;         /* -1=unchecked, 0=off, 1=on */
+static int g_deferred_replay_done = 0;   /* 1 after pending fatbins replayed */
+
+static inline int is_deferred_init(void) {
+    if (g_deferred_init == -1) {
+        const char *v = getenv("CHIDORI_DEFERRED_INIT");
+        g_deferred_init = (v && v[0] == '1') ? 1 : 0;
+        if (g_deferred_init)
+            fprintf(stderr, "[chidori] DEFERRED INIT MODE: init_real_cuda() will be deferred until cuInit()\n");
+    }
+    return g_deferred_init;
+}
+
+/* Pending fat binary registrations for deferred replay */
+#define MAX_PENDING_FATBINS 1024
+static struct {
+    void *fatCubin;     /* original fatCubin pointer passed to __cudaRegisterFatBinary */
+    int idx;            /* index into g_fat_binaries where we stored the parsed data */
+} g_pending_fatbins[MAX_PENDING_FATBINS];
+static int g_pending_fatbin_count = 0;
+
+/* Pending __cudaRegisterFatBinaryEnd calls */
+static int g_pending_fatbin_ends[MAX_PENDING_FATBINS]; /* fat_binary index */
+static int g_pending_fatbin_end_count = 0;
+
+/* Pending __cudaRegisterFunction calls */
+#define MAX_PENDING_FUNCS 65536
+static struct {
+    int fat_idx;                /* index into g_fat_binaries */
+    const char *hostFun;
+    char *deviceFun;
+    const char *deviceName;
+    int thread_limit;
+    void *tid;
+    void *bid;
+    void *bDim;
+    void *gDim;
+    int *wSize;
+} g_pending_funcs[MAX_PENDING_FUNCS];
+static int g_pending_func_count = 0;
 
 /* Pointer-to-device tracker for cuPointerGetAttribute cross-device queries */
 #define MAX_ALLOC_TRACK 16384
@@ -249,6 +303,9 @@ static struct {
 } g_real = {0};
 
 static int g_real_cuda_initialized = 0;
+
+/* Forward declaration — defined after fat binary data structures */
+static void replay_deferred_registrations(void);
 
 static void init_real_cuda(void) {
     if (g_real_cuda_initialized) return;
@@ -390,10 +447,27 @@ static void init_real_cuda(void) {
     }
     LOG_DEBUG("Partial offload: local_devices=%s (%d local GPUs)", env, g_local_device_count);
     LOG_DEBUG("init_real_cuda: CHIDORI_LOCAL_DEVICES=%s", env);
+
+    /* In deferred init mode, replay all pending fat binary registrations now.
+     * init_real_cuda() was deferred until a normal CUDA API call (cuDeviceGetCount, etc.)
+     * instead of being called from __cudaRegisterFatBinary during library loading.
+     * The real CUDA driver and dispatch table are now loaded, so we can register
+     * all the fat binaries that were queued during the deferred period. */
+    if (is_deferred_init() && !g_deferred_replay_done) {
+        replay_deferred_registrations();
+    }
 }
 
 static inline int is_local_device(int device) {
     return g_partial_offload && ((g_local_device_mask >> device) & 1);
+}
+
+static inline int is_fatbin_passthrough(void) {
+    if (g_fatbin_passthrough == -1) {
+        const char *v = getenv("CHIDORI_FATBIN_PASSTHROUGH");
+        g_fatbin_passthrough = (v && v[0] == '1') ? 1 : 0;
+    }
+    return g_fatbin_passthrough;
 }
 
 /*
@@ -2418,12 +2492,15 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     extern int cudaSetDevice(int);
     cudaSetDevice(0);
 
-    /* Enable dlopen redirect: cuBLAS's internal dlopen("libcuda.so.1") will
-     * return the real NVIDIA driver handle instead of our interceptor.
-     * This gives cuBLAS real driver function pointers via dlsym, avoiding
-     * the reentrance issues that cause error 14. */
+    /* Enable dlopen redirect AND reentrance guard: cuBLAS's internal driver calls
+     * (cuDeviceGetCount, cuCtxGetCurrent, cuModuleLoadData, etc.) must go to the
+     * REAL driver, not through our interception layer. Without g_in_real_cuda++,
+     * cuBLAS sees 2 devices (our virtual count) but the real driver only has 1,
+     * causing CUBLAS_STATUS_INTERNAL_ERROR (14). */
     g_dlopen_redirect_active = 1;
+    g_in_real_cuda++;
     cublasStatus_t r = real_create(&g_local_cublas_handle);
+    g_in_real_cuda--;
     g_dlopen_redirect_active = 0;
     LOG_DEBUG("cublasCreate_v2 = %d, handle=%p", r, (void*)g_local_cublas_handle);
     if (r != CUBLAS_STATUS_SUCCESS) {
@@ -5198,6 +5275,7 @@ static struct {
 static int g_fat_binary_count = 0;
 
 /* Stored function registrations (not yet sent to server) */
+/* (forward-declared before, defined here after g_fat_binaries is available) */
 #define MAX_REGISTERED_FUNCTIONS 65536
 #define MAX_KERNEL_PARAMS 64
 static struct {
@@ -5210,6 +5288,73 @@ static struct {
     struct __attribute__((packed)) { int32_t offset; int32_t size; } params[MAX_KERNEL_PARAMS];
 } g_registered_functions[MAX_REGISTERED_FUNCTIONS];
 static int g_registered_function_count = 0;
+
+/*
+ * Replay deferred fat binary and function registrations.
+ * Called from cuInit AFTER init_real_cuda() and g_real.cuInit(0) have completed.
+ * This ensures the real CUDA driver is fully initialized before we register
+ * any fat binaries or functions with it.
+ */
+static void replay_deferred_registrations(void) {
+    if (g_deferred_replay_done) return;
+    g_deferred_replay_done = 1;
+
+    if (!g_partial_offload || !g_real.__cudaRegisterFatBinary) {
+        fprintf(stderr, "[chidori] deferred replay: no partial offload or no real __cudaRegisterFatBinary, skipping\n");
+        return;
+    }
+
+    fprintf(stderr, "[chidori] deferred replay: replaying %d fat binaries, %d fatbin ends, %d functions\n",
+            g_pending_fatbin_count, g_pending_fatbin_end_count, g_pending_func_count);
+
+    /* Phase 1: Replay __cudaRegisterFatBinary calls */
+    for (int i = 0; i < g_pending_fatbin_count; i++) {
+        int idx = g_pending_fatbins[i].idx;
+        void *fatCubin = g_pending_fatbins[i].fatCubin;
+        g_in_real_cuda++;
+        g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
+        g_in_real_cuda--;
+        LOG_DEBUG("deferred replay: __cudaRegisterFatBinary[%d] -> real_handle=%p", idx,
+                  (void *)g_fat_binaries[idx].real_handle);
+    }
+
+    /* Phase 2: Replay __cudaRegisterFatBinaryEnd calls */
+    if (g_real.__cudaRegisterFatBinaryEnd) {
+        for (int i = 0; i < g_pending_fatbin_end_count; i++) {
+            int idx = g_pending_fatbin_ends[i];
+            if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
+                g_in_real_cuda++;
+                g_real.__cudaRegisterFatBinaryEnd(g_fat_binaries[idx].real_handle);
+                g_in_real_cuda--;
+            }
+        }
+    }
+
+    /* Phase 3: Replay __cudaRegisterFunction calls */
+    if (g_real.__cudaRegisterFunction) {
+        for (int i = 0; i < g_pending_func_count; i++) {
+            int fat_idx = g_pending_funcs[i].fat_idx;
+            void **real_handle = (fat_idx >= 0 && fat_idx < g_fat_binary_count)
+                                 ? g_fat_binaries[fat_idx].real_handle : NULL;
+            if (real_handle) {
+                g_in_real_cuda++;
+                g_real.__cudaRegisterFunction(real_handle,
+                    g_pending_funcs[i].hostFun,
+                    g_pending_funcs[i].deviceFun,
+                    g_pending_funcs[i].deviceName,
+                    g_pending_funcs[i].thread_limit,
+                    g_pending_funcs[i].tid,
+                    g_pending_funcs[i].bid,
+                    g_pending_funcs[i].bDim,
+                    g_pending_funcs[i].gDim,
+                    g_pending_funcs[i].wSize);
+                g_in_real_cuda--;
+            }
+        }
+    }
+
+    fprintf(stderr, "[chidori] deferred replay: complete\n");
+}
 
 /* Lazily register a fat binary on the server, returns server module handle */
 static uint64_t lazy_register_fat_binary(int idx) {
@@ -5724,6 +5869,24 @@ cudaError_t cudaGetDeviceFlags(unsigned int *flags) {
  */
 void **__cudaRegisterFatBinary(void *fatCubin) {
     /*
+     * PASSTHROUGH MODE: When CHIDORI_FATBIN_PASSTHROUGH=1, skip all our fat binary
+     * tracking (size parsing, index storage, fake handles) and just forward to
+     * real __cudaRegisterFatBinary. Tests whether our tracking machinery breaks cuBLAS.
+     */
+    if (is_fatbin_passthrough()) {
+        init_real_cuda();
+        if (g_real.__cudaRegisterFatBinary) {
+            void **handle;
+            g_in_real_cuda++;
+            handle = g_real.__cudaRegisterFatBinary(fatCubin);
+            g_in_real_cuda--;
+            LOG_DEBUG("__cudaRegisterFatBinary PASSTHROUGH → real handle=%p", (void *)handle);
+            return handle;
+        }
+        LOG_DEBUG("__cudaRegisterFatBinary PASSTHROUGH: no real function, returning NULL");
+        return NULL;
+    }
+    /*
      * LAZY REGISTRATION: Store the fat binary data locally.
      * Only send to server when a kernel from this module is actually launched.
      * This avoids 50+ RPCs during PyTorch init (each ~166ms over internet).
@@ -5805,13 +5968,26 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
         g_fat_binaries[idx].server_handle = 0;
         g_fat_binaries[idx].real_handle = NULL;
 
-        /* For partial offload: also register with real CUDA for local execution */
-        init_real_cuda();
-        if (g_partial_offload && g_real.__cudaRegisterFatBinary) {
-            LOG_DEBUG("__cudaRegisterFatBinary[%d] → LOCAL + REMOTE (size=%llu)", idx, (unsigned long long)fat_size);
-            g_in_real_cuda++;
-            g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
-            g_in_real_cuda--;
+        /* For partial offload: register with real CUDA for local execution.
+         * In deferred init mode, skip init_real_cuda() here (it will be called
+         * from cuInit) and store this fatbin for later replay. */
+        if (is_deferred_init() && !g_real_cuda_initialized) {
+            /* Deferred: store for replay after cuInit */
+            if (g_pending_fatbin_count < MAX_PENDING_FATBINS) {
+                g_pending_fatbins[g_pending_fatbin_count].fatCubin = fatCubin;
+                g_pending_fatbins[g_pending_fatbin_count].idx = idx;
+                g_pending_fatbin_count++;
+                LOG_DEBUG("__cudaRegisterFatBinary[%d] DEFERRED (size=%llu, pending=%d)",
+                          idx, (unsigned long long)fat_size, g_pending_fatbin_count);
+            }
+        } else {
+            init_real_cuda();
+            if (g_partial_offload && g_real.__cudaRegisterFatBinary) {
+                LOG_DEBUG("__cudaRegisterFatBinary[%d] → LOCAL + REMOTE (size=%llu)", idx, (unsigned long long)fat_size);
+                g_in_real_cuda++;
+                g_fat_binaries[idx].real_handle = g_real.__cudaRegisterFatBinary(fatCubin);
+                g_in_real_cuda--;
+            }
         }
 
         fat_idx_storage[idx] = idx;
@@ -5823,6 +5999,22 @@ void **__cudaRegisterFatBinary(void *fatCubin) {
 }
 
 void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
+    if (is_fatbin_passthrough()) {
+        if (g_real.__cudaRegisterFatBinaryEnd) {
+            g_in_real_cuda++;
+            g_real.__cudaRegisterFatBinaryEnd(fatCubinHandle);
+            g_in_real_cuda--;
+        }
+        return;
+    }
+    /* Deferred init: store for later replay if real CUDA not yet initialized */
+    if (is_deferred_init() && !g_deferred_replay_done) {
+        int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
+        if (idx >= 0 && g_pending_fatbin_end_count < MAX_PENDING_FATBINS) {
+            g_pending_fatbin_ends[g_pending_fatbin_end_count++] = idx;
+        }
+        return;
+    }
     if (g_partial_offload && g_real.__cudaRegisterFatBinaryEnd) {
         int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
         if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
@@ -5834,6 +6026,14 @@ void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
 }
 
 void __cudaUnregisterFatBinary(void **fatCubinHandle) {
+    if (is_fatbin_passthrough()) {
+        if (g_real.__cudaUnregisterFatBinary) {
+            g_in_real_cuda++;
+            g_real.__cudaUnregisterFatBinary(fatCubinHandle);
+            g_in_real_cuda--;
+        }
+        return;
+    }
     if (g_partial_offload && g_real.__cudaUnregisterFatBinary) {
         int idx = fatCubinHandle ? *(int *)fatCubinHandle : -1;
         if (idx >= 0 && idx < g_fat_binary_count && g_fat_binaries[idx].real_handle) {
@@ -5848,6 +6048,16 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
                             char *deviceFun, const char *deviceName,
                             int thread_limit, void *tid, void *bid,
                             void *bDim, void *gDim, int *wSize) {
+    /* PASSTHROUGH: forward directly to real __cudaRegisterFunction, skip our tracking */
+    if (is_fatbin_passthrough()) {
+        if (g_real.__cudaRegisterFunction) {
+            g_in_real_cuda++;
+            g_real.__cudaRegisterFunction(fatCubinHandle, hostFun, deviceFun, deviceName,
+                                          thread_limit, tid, bid, bDim, gDim, wSize);
+            g_in_real_cuda--;
+        }
+        return;
+    }
     (void)thread_limit; (void)tid; (void)bid; (void)bDim; (void)gDim; (void)wSize;
 
     /*
@@ -5866,8 +6076,24 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
         g_registered_functions[idx].server_handle = 0; /* not yet registered */
     }
 
-    /* For partial offload: also register with real CUDA for local kernel execution */
-    if (g_partial_offload && g_real.__cudaRegisterFunction) {
+    /* For partial offload: also register with real CUDA for local kernel execution.
+     * In deferred init mode, store for replay if real CUDA not yet initialized. */
+    if (is_deferred_init() && !g_deferred_replay_done) {
+        /* Deferred: store for replay after cuInit */
+        if (g_pending_func_count < MAX_PENDING_FUNCS) {
+            g_pending_funcs[g_pending_func_count].fat_idx = fat_idx;
+            g_pending_funcs[g_pending_func_count].hostFun = hostFun;
+            g_pending_funcs[g_pending_func_count].deviceFun = deviceFun;
+            g_pending_funcs[g_pending_func_count].deviceName = deviceName;
+            g_pending_funcs[g_pending_func_count].thread_limit = thread_limit;
+            g_pending_funcs[g_pending_func_count].tid = tid;
+            g_pending_funcs[g_pending_func_count].bid = bid;
+            g_pending_funcs[g_pending_func_count].bDim = bDim;
+            g_pending_funcs[g_pending_func_count].gDim = gDim;
+            g_pending_funcs[g_pending_func_count].wSize = wSize;
+            g_pending_func_count++;
+        }
+    } else if (g_partial_offload && g_real.__cudaRegisterFunction) {
         void **real_handle = (fat_idx >= 0 && fat_idx < g_fat_binary_count)
                              ? g_fat_binaries[fat_idx].real_handle : NULL;
         if (real_handle) {
