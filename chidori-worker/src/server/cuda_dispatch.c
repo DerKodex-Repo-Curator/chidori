@@ -1384,6 +1384,17 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         /* Ensure we have an active CUDA context before loading modules */
         ensure_device_context(0);
 
+        /* Synchronize to flush any pending GPU errors from prior operations */
+        {
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: pre-sync error=%d (%s), resetting\n",
+                        (int)sync_err, cudaGetErrorString(sync_err));
+                /* Reset the error state so cuModuleLoadData has a clean context */
+                cudaGetLastError();
+            }
+        }
+
         res = cuModuleLoadData(&mod, payload);
         fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: fast-path cuModuleLoadData=%d (size=%u)\n",
                 (int)res, req->payload_size);
