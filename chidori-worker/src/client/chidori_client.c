@@ -209,8 +209,36 @@ void *dlsym(void *handle, const char *symbol) {
 
     /* Check if this is a cuBLAS/cublasLt symbol we intercept */
     if (symbol) {
+        /* cuBLAS/cublasLt symbols */
         for (int i = 0; g_intercepted_cublas_symbols[i] != NULL; i++) {
             if (strcmp(symbol, g_intercepted_cublas_symbols[i]) == 0) {
+                void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
+                if (ours) return ours;
+                break;
+            }
+        }
+        /* CUDA driver API symbols that need virtual device routing.
+         * With always-redirect dlopen, libraries get the real NVIDIA driver
+         * handle. dlsym on that handle would return real driver functions
+         * that only know about physical devices. These symbols must return
+         * OUR versions to handle virtual device ordinals (e.g., device 1
+         * maps to remote server, not a real GPU).
+         * MINIMAL set: only functions that take device ordinals or affect
+         * device context. Avoid intercepting cuMemAlloc etc. here to
+         * prevent hanging during cuBLAS lazy init. */
+        static const char *g_virtual_device_symbols[] = {
+            "cuDeviceGetCount", "cuDeviceGet", "cuDeviceGetName",
+            "cuDeviceGetAttribute", "cuDeviceGetUuid",
+            "cuDeviceTotalMem", "cuDeviceTotalMem_v2",
+            "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease",
+            "cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxGetState",
+            "cuDevicePrimaryCtxSetFlags", "cuDevicePrimaryCtxSetFlags_v2",
+            "cuDevicePrimaryCtxReset", "cuDevicePrimaryCtxReset_v2",
+            "cuDeviceGetPCIBusId",
+            NULL
+        };
+        for (int i = 0; g_virtual_device_symbols[i] != NULL; i++) {
+            if (strcmp(symbol, g_virtual_device_symbols[i]) == 0) {
                 void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
                 if (ours) return ours;
                 break;
