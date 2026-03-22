@@ -8048,17 +8048,28 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
     (void)cudaVersion; (void)flags;
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
-    /* ALWAYS return OUR intercepted functions — NEVER forward to real driver.
-     * Forwarding during reentrance causes cudart to cache real driver pointers,
-     * which then bypass our routing for ALL subsequent calls (including remote
-     * device operations). cuBLAS isolation is handled by RTLD_DEEPBIND instead.
+    /* When inside a real CUDA/cuBLAS call (g_in_real_cuda > 0), return REAL
+     * driver functions. cuBLAS caches function pointers during handle creation
+     * and uses them later for FP16 GemmEx lazy init. If these cached pointers
+     * are our intercepted versions, cuBLAS gets confused by the virtual device
+     * count and returns CUBLAS_STATUS_NOT_INITIALIZED.
      *
-     * Return OUR intercepted functions for ALL modes (including partial offload).
-     * Our functions handle the local/remote routing via g_in_real_cuda guard.
-     * If we returned real driver pointers here, cudart would bypass our
-     * interception for ALL operations including remote device kernel launches.
+     * By returning real driver functions during cuBLAS init, the cached pointers
+     * go directly to the real driver — bypassing our interception entirely for
+     * cuBLAS internal operations on the local device.
      *
-     * Exception: cuGetProcAddress itself — prevent infinite recursion. */
+     * For non-reentrant calls (g_in_real_cuda == 0), ALWAYS return OUR
+     * intercepted functions so PyTorch/cudart sees our virtual device layout. */
+    if (g_in_real_cuda > 0) {
+        /* Reentrant: return real driver functions for cuBLAS/cublasLt */
+        if (g_real_cuda_handle) {
+            typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
+            static fn_t real_fn = NULL;
+            if (!real_fn) real_fn = (fn_t)__real_dlsym(g_real_cuda_handle, "cuGetProcAddress");
+            if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
+        }
+    }
+
     if (strcmp(symbol, "cuGetProcAddress") != 0 &&
         strcmp(symbol, "cuGetProcAddress_v2") != 0) {
         void *ours = lookup_intercepted_symbol(symbol);
