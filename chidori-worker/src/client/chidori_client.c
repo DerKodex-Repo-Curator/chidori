@@ -28,6 +28,9 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <limits.h>
+/* dlvsym is a GNU extension declared in <dlfcn.h> with _GNU_SOURCE,
+ * but some compilers (clang) may not see the declaration. */
+extern void *dlvsym(void *handle, const char *symbol, const char *version);
 #ifndef RTLD_DEEPBIND
 #define RTLD_DEEPBIND 0  /* Not available on this platform */
 #endif
@@ -52,10 +55,41 @@ static void *g_real_cuda_handle_for_dlopen = NULL; /* set by init_real_cuda */
 static __thread int g_dlopen_redirect_active = 0;  /* 1 = redirect libcuda dlopen to real driver */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
 
+/*
+ * ============================================================================
+ * dlsym bootstrap — get the REAL dlsym before we override it.
+ *
+ * We use dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5") to obtain the real
+ * dlsym function pointer. We can't use dlsym(RTLD_NEXT, "dlsym") from
+ * within our own dlsym interceptor — that would be infinite recursion.
+ * All internal dlsym calls in this file go through __real_dlsym().
+ * ============================================================================
+ */
+static void *(*g_real_dlsym_fn)(void *, const char *) = NULL;
+
+static void init_real_dlsym(void) {
+    if (g_real_dlsym_fn) return;
+    /* dlvsym is a GNU extension that resolves a specific symbol version.
+     * This gets the glibc dlsym, bypassing our override. */
+    g_real_dlsym_fn = (void *(*)(void *, const char *))dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (!g_real_dlsym_fn) {
+        /* Fallback: try unversioned. This may recurse if we're already in dlsym,
+         * but if dlvsym failed we have no choice. */
+        fprintf(stderr, "[chidori] WARNING: dlvsym failed, falling back to _dl_sym\n");
+    }
+}
+
+/* Safe wrapper: all internal dlsym calls in this file MUST use this. */
+static void *__real_dlsym(void *handle, const char *symbol) {
+    if (!g_real_dlsym_fn) init_real_dlsym();
+    if (g_real_dlsym_fn) return g_real_dlsym_fn(handle, symbol);
+    return NULL;
+}
+
 void *dlopen(const char *filename, int flags) {
     static void *(*real_dlopen)(const char *, int) = NULL;
     if (!real_dlopen) {
-        real_dlopen = dlsym(RTLD_NEXT, "dlopen");
+        real_dlopen = __real_dlsym(RTLD_NEXT, "dlopen");
     }
 
     /* Redirect libcuda.so.1 dlopen to real driver when:
@@ -71,6 +105,93 @@ void *dlopen(const char *filename, int flags) {
     }
 
     return real_dlopen ? real_dlopen(filename, flags) : NULL;
+}
+
+/*
+ * ============================================================================
+ * dlsym interception — return OUR cuBLAS/cublasLt functions when PyTorch
+ * resolves them via dlsym(cublas_handle, "cublasGemmEx").
+ *
+ * Without this, PyTorch's dlsym bypasses LD_PRELOAD entirely and gets
+ * real cuBLAS function pointers. Those real functions don't know about
+ * our local/remote device routing, so FP16 matmul on the local device
+ * fails with CUBLAS_STATUS_NOT_INITIALIZED.
+ *
+ * When g_in_real_cuda > 0, we do NOT intercept — cuBLAS internal
+ * operations need real function pointers to work correctly.
+ * ============================================================================
+ */
+static const char *g_intercepted_cublas_symbols[] = {
+    /* cuBLAS core */
+    "cublasCreate_v2", "cublasDestroy_v2",
+    "cublasSetStream_v2", "cublasGetStream_v2",
+    "cublasSetMathMode", "cublasGetMathMode",
+    "cublasGetVersion_v2",
+    "cublasSetWorkspace_v2",
+    "cublasSetPointerMode_v2", "cublasGetPointerMode_v2",
+    "cublasSetAtomicsMode", "cublasGetAtomicsMode",
+    "cublasLoggerConfigure",
+    "cublasGetStatusString",
+    "cublasGetProperty",
+    /* GEMM family */
+    "cublasSgemm_v2", "cublasDgemm_v2", "cublasHgemm",
+    "cublasSgemmEx", "cublasGemmEx",
+    "cublasSgemmBatched", "cublasSgemmStridedBatched",
+    "cublasGemmStridedBatchedEx", "cublasGemmBatchedEx",
+    /* BLAS2 */
+    "cublasSgemv_v2", "cublasDgemv_v2",
+    /* BLAS1 */
+    "cublasSaxpy_v2", "cublasDaxpy_v2",
+    "cublasSnrm2_v2", "cublasDnrm2_v2",
+    "cublasSdot_v2", "cublasDdot_v2",
+    "cublasSscal_v2", "cublasDscal_v2",
+    "cublasScopy_v2", "cublasDcopy_v2",
+    /* cublasLt */
+    "cublasLtCreate", "cublasLtDestroy",
+    "cublasLtMatmul",
+    "cublasLtMatmulDescCreate", "cublasLtMatmulDescDestroy",
+    "cublasLtMatmulDescSetAttribute", "cublasLtMatmulDescGetAttribute",
+    "cublasLtMatrixLayoutCreate", "cublasLtMatrixLayoutDestroy",
+    "cublasLtMatrixLayoutSetAttribute", "cublasLtMatrixLayoutGetAttribute",
+    "cublasLtMatmulPreferenceCreate", "cublasLtMatmulPreferenceDestroy",
+    "cublasLtMatmulPreferenceSetAttribute",
+    "cublasLtMatmulAlgoGetHeuristic",
+    "cublasLtMatmulAlgoInit",
+    "cublasLtMatmulAlgoConfigSetAttribute", "cublasLtMatmulAlgoConfigGetAttribute",
+    "cublasLtMatmulAlgoCheck", "cublasLtMatmulAlgoGetIds",
+    "cublasLtGetCudartVersion", "cublasLtGetVersion",
+    "cublasLtGetStatusName", "cublasLtGetStatusString",
+    "cublasLtGetProperty",
+    "cublasLtLoggerSetCallback", "cublasLtLoggerSetLevel",
+    "cublasLtLoggerSetMask", "cublasLtLoggerSetFile",
+    NULL
+};
+
+void *dlsym(void *handle, const char *symbol) {
+    /* Bootstrap: ensure we have the real dlsym */
+    if (!g_real_dlsym_fn) init_real_dlsym();
+
+    /* If inside a real CUDA/cuBLAS call (reentrance), do NOT intercept.
+     * cuBLAS internal operations need to resolve their own symbols to
+     * real implementations, not our routing wrappers. */
+    if (g_in_real_cuda > 0) {
+        return __real_dlsym(handle, symbol);
+    }
+
+    /* Check if this is a cuBLAS/cublasLt symbol we intercept */
+    if (symbol) {
+        for (int i = 0; g_intercepted_cublas_symbols[i] != NULL; i++) {
+            if (strcmp(symbol, g_intercepted_cublas_symbols[i]) == 0) {
+                /* Return OUR version so local/remote routing works */
+                void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
+                if (ours) return ours;
+                break;  /* symbol matched but we couldn't find ours — fall through */
+            }
+        }
+    }
+
+    /* All other symbols: return the real result */
+    return __real_dlsym(handle, symbol);
 }
 
 /*
@@ -379,7 +500,7 @@ static void init_real_cuda(void) {
     g_real_cudart_handle = RTLD_NEXT;
 
     /* Populate dispatch table — Driver API from dlopen'd handle, Runtime API from RTLD_NEXT */
-    #define LOAD_SYM(handle, name) g_real.name = dlsym(handle, #name)
+    #define LOAD_SYM(handle, name) g_real.name = __real_dlsym(handle, #name)
     #define LOAD_CUDA(name) LOAD_SYM(g_real_cuda_handle, name)
     #define LOAD_CUDART(name) LOAD_SYM(RTLD_NEXT, name)
 
@@ -425,7 +546,7 @@ static void init_real_cuda(void) {
     LOAD_CUDART(cudaMemcpy);
     LOAD_CUDART(cudaDeviceSynchronize);
     LOAD_CUDART(cudaStreamSynchronize);
-    if (g_real_cudart_handle) g_real.cudaLaunchKernel_ptr = dlsym(g_real_cudart_handle, "cudaLaunchKernel");
+    if (g_real_cudart_handle) g_real.cudaLaunchKernel_ptr = __real_dlsym(g_real_cudart_handle, "cudaLaunchKernel");
     LOAD_CUDART(__cudaRegisterFatBinary);
     LOAD_CUDART(__cudaRegisterFatBinaryEnd);
     LOAD_CUDART(__cudaUnregisterFatBinary);
@@ -2483,7 +2604,7 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     void *h = ensure_real_cublas();
     if (!h) return NULL;
     typedef cublasStatus_t (*create_fn)(cublasHandle_t *);
-    create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
+    create_fn real_create = (create_fn)__real_dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
     /* The DEEPBIND cuBLAS uses the real CUDA driver via its own dependency scope.
      * Our intercepted cudaSetDevice(0) sets the local GPU context via the real driver.
@@ -2555,7 +2676,7 @@ cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, CUstream stream) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, CUstream);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSetStream_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSetStream_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2597,7 +2718,7 @@ cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasMath_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSetMathMode"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSetMathMode"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2637,7 +2758,7 @@ cublasStatus_t cublasGetVersion_v2(cublasHandle_t handle, int *version) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGetVersion_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasGetVersion_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2677,7 +2798,7 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void *, int, const void *, int, const float *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemm_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSgemm_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2734,7 +2855,7 @@ cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const double *, const void *, int, const void *, int, const double *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDgemm_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDgemm_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2791,7 +2912,7 @@ cublasStatus_t cublasHgemm(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void *, int, const void *, int, const void *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasHgemm"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasHgemm"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2847,7 +2968,7 @@ cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void *, int, int, const void *, int, int, const float *, void *, int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemmEx"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSgemmEx"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -2915,7 +3036,7 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void *, int, int, const void *, int, int, const void *, void *, int, int, int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmEx"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasGemmEx"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_dlopen_redirect_active = 1;
@@ -2982,7 +3103,7 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, int, int, const float *, const void *, int, const void *, int, const float *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemv_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSgemv_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3034,7 +3155,7 @@ cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, int, int, const double *, const void *, int, const void *, int, const double *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDgemv_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDgemv_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3085,7 +3206,7 @@ cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const float *, const void *, int, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSaxpy_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSaxpy_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3125,7 +3246,7 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const double *, const void *, int, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDaxpy_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDaxpy_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3167,7 +3288,7 @@ cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, float *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSnrm2_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSnrm2_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3200,7 +3321,7 @@ cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, double *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDnrm2_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDnrm2_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3237,7 +3358,7 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, const void *, int, float *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSdot_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSdot_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3275,7 +3396,7 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, const void *, int, double *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDdot_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDdot_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3315,7 +3436,7 @@ cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const float *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSscal_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSscal_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3349,7 +3470,7 @@ cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const double *, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDscal_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDscal_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3386,7 +3507,7 @@ cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasScopy_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasScopy_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3422,7 +3543,7 @@ cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, int, const void *, int, void *, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasDcopy_v2"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasDcopy_v2"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3471,7 +3592,7 @@ cublasStatus_t cublasSgemmBatched(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void * const *, int, const void * const *, int, const float *, void * const *, int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemmBatched"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSgemmBatched"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3549,7 +3670,7 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const float *, const void *, int, long long int, const void *, int, long long int, const float *, void *, int, long long int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasSgemmStridedBatched"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSgemmStridedBatched"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -3614,7 +3735,7 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void *, int, int, long long int, const void *, int, int, long long int, const void *, void *, int, int, long long int, int, int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmStridedBatchedEx"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasGemmStridedBatchedEx"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -5300,7 +5421,7 @@ static void replay_deferred_registrations(void) {
     g_deferred_replay_done = 1;
 
     if (!g_partial_offload || !g_real.__cudaRegisterFatBinary) {
-        fprintf(stderr, "[chidori] deferred replay: no partial offload or no real __cudaRegisterFatBinary, skipping\n");
+        LOG_DEBUG("deferred replay: no partial offload or no real __cudaRegisterFatBinary, skipping");
         return;
     }
 
@@ -6597,7 +6718,7 @@ CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real_cuda_handle) {
         typedef CUresult (*fn_t)(CUdeviceptr, unsigned char, size_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuMemsetD8_v2");
+        if (!real_fn) real_fn = (fn_t)__real_dlsym(g_real_cuda_handle, "cuMemsetD8_v2");
         if (real_fn) { g_in_real_cuda++; CUresult r = real_fn(dstDevice, uc, N); g_in_real_cuda--; return r; }
     }
     struct __attribute__((packed)) {
@@ -6616,7 +6737,7 @@ CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
     if (g_partial_offload && is_local_device(g_current_device) && g_real_cuda_handle) {
         typedef CUresult (*fn_t)(CUdeviceptr, unsigned int, size_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuMemsetD32_v2");
+        if (!real_fn) real_fn = (fn_t)__real_dlsym(g_real_cuda_handle, "cuMemsetD32_v2");
         if (real_fn) { g_in_real_cuda++; CUresult r = real_fn(dstDevice, ui, N); g_in_real_cuda--; return r; }
     }
     struct __attribute__((packed)) {
@@ -6688,7 +6809,7 @@ cublasStatus_t cublasGetProperty(int type, int *value) {
     void *h = ensure_real_cublas();
     if (h) {
         typedef cublasStatus_t (*fn_t)(int, int *);
-        fn_t real_fn = (fn_t)dlsym(h, "cublasGetProperty");
+        fn_t real_fn = (fn_t)__real_dlsym(h, "cublasGetProperty");
         if (real_fn) return real_fn(type, value);
     }
     (void)type;
@@ -6743,7 +6864,7 @@ cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int, const void *, const void * const *, int, int, const void * const *, int, int, const void *, void * const *, int, int, int, int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmBatchedEx"); }
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasGemmBatchedEx"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -6809,7 +6930,7 @@ static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
     void *h = ensure_real_cublaslt();
     if (!h) return NULL;
     typedef cublasStatus_t (*create_fn)(cublasLtHandle_t *);
-    create_fn real_create = (create_fn)dlsym(h, "cublasLtCreate");
+    create_fn real_create = (create_fn)__real_dlsym(h, "cublasLtCreate");
     if (!real_create) return NULL;
     ensure_real_cuda_init();
     /* Use real cudart's cudaSetDevice for full device initialization */
@@ -6835,7 +6956,7 @@ cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtCreate");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtCreate");
             if (real_fn) return real_fn(lightHandle);
         }
     }
@@ -6857,7 +6978,7 @@ cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtDestroy");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtDestroy");
             if (real_fn) return real_fn(lightHandle);
         }
     }
@@ -6924,7 +7045,7 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, const void *, const void *, void *, const void *, void *, const void *, const void *, void *, void *, void *, const void *, void *, size_t, void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmul");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmul");
             if (real_fn) return real_fn(lightHandle, computeDesc, alpha, A, Adesc, B, Bdesc, beta, C, Cdesc, D, Ddesc, algo, workspace, workspaceSizeInBytes, stream);
         }
     }
@@ -6932,7 +7053,7 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, const void *, const void *, void *, const void *, void *, const void *, const void *, void *, void *, void *, const void *, void *, size_t, void *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmul"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmul"); }
         cublasLtHandle_t local_h = ensure_local_cublaslt_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -7017,7 +7138,7 @@ cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int 
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void **, int, int);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescCreate");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescCreate");
             if (real_fn) return real_fn(matmulDesc, computeType, scaleType);
         }
     }
@@ -7025,7 +7146,7 @@ cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int 
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void **, int, int);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescCreate"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescCreate"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matmulDesc, computeType, scaleType);
@@ -7048,7 +7169,7 @@ cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescDestroy");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescDestroy");
             if (real_fn) return real_fn(matmulDesc);
         }
     }
@@ -7056,7 +7177,7 @@ cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescDestroy"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescDestroy"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matmulDesc);
@@ -7075,7 +7196,7 @@ cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescSetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescSetAttribute");
             if (real_fn) return real_fn(matmulDesc, attr, buf, sizeInBytes);
         }
     }
@@ -7083,7 +7204,7 @@ cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescSetAttribute"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescSetAttribute"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matmulDesc, attr, buf, sizeInBytes);
@@ -7108,7 +7229,7 @@ cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescGetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescGetAttribute");
             if (real_fn) return real_fn(matmulDesc, attr, buf, sizeInBytes, sizeWritten);
         }
     }
@@ -7116,7 +7237,7 @@ cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescGetAttribute"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulDescGetAttribute"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matmulDesc, attr, buf, sizeInBytes, sizeWritten);
@@ -7141,7 +7262,7 @@ cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void **, int, uint64_t, uint64_t, int64_t);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutCreate");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutCreate");
             if (real_fn) return real_fn(matLayout, type, rows, cols, ld);
         }
     }
@@ -7149,7 +7270,7 @@ cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void **, int, uint64_t, uint64_t, int64_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutCreate"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutCreate"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matLayout, type, rows, cols, ld);
@@ -7175,7 +7296,7 @@ cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutDestroy");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutDestroy");
             if (real_fn) return real_fn(matLayout);
         }
     }
@@ -7183,7 +7304,7 @@ cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutDestroy"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutDestroy"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matLayout);
@@ -7202,7 +7323,7 @@ cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutSetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutSetAttribute");
             if (real_fn) return real_fn(matLayout, attr, buf, sizeInBytes);
         }
     }
@@ -7210,7 +7331,7 @@ cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutSetAttribute"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutSetAttribute"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matLayout, attr, buf, sizeInBytes);
@@ -7235,7 +7356,7 @@ cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutGetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutGetAttribute");
             if (real_fn) return real_fn(matLayout, attr, buf, sizeInBytes, sizeWritten);
         }
     }
@@ -7243,7 +7364,7 @@ cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutGetAttribute"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatrixLayoutGetAttribute"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(matLayout, attr, buf, sizeInBytes, sizeWritten);
@@ -7269,7 +7390,7 @@ cublasStatus_t cublasLtMatmulPreferenceCreate(void **pref) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void **);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceCreate");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulPreferenceCreate");
             if (real_fn) return real_fn(pref);
         }
     }
@@ -7277,7 +7398,7 @@ cublasStatus_t cublasLtMatmulPreferenceCreate(void **pref) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void **);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceCreate"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulPreferenceCreate"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(pref);
@@ -7296,7 +7417,7 @@ cublasStatus_t cublasLtMatmulPreferenceDestroy(void *pref) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceDestroy");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulPreferenceDestroy");
             if (real_fn) return real_fn(pref);
         }
     }
@@ -7304,7 +7425,7 @@ cublasStatus_t cublasLtMatmulPreferenceDestroy(void *pref) {
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceDestroy"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulPreferenceDestroy"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(pref);
@@ -7323,7 +7444,7 @@ cublasStatus_t cublasLtMatmulPreferenceSetAttribute(void *pref, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceSetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulPreferenceSetAttribute");
             if (real_fn) return real_fn(pref, attr, buf, sizeInBytes);
         }
     }
@@ -7331,7 +7452,7 @@ cublasStatus_t cublasLtMatmulPreferenceSetAttribute(void *pref, int attr,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceSetAttribute"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulPreferenceSetAttribute"); }
         if (real_fn) {
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(pref, attr, buf, sizeInBytes);
@@ -7352,7 +7473,7 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, void *, int, void *, int *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoGetHeuristic");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoGetHeuristic");
             if (real_fn) return real_fn(lightHandle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference, requestedAlgoCount, heuristicResultsArray, returnAlgoCount);
         }
     }
@@ -7360,7 +7481,7 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, void *, int, void *, int *);
         static fn_t real_fn = NULL;
-        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoGetHeuristic"); }
+        if (!real_fn) { void *h = ensure_real_cublaslt(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoGetHeuristic"); }
         cublasLtHandle_t local_h = ensure_local_cublaslt_handle();
         if (real_fn && local_h) {
             g_in_real_cuda++;
@@ -7438,7 +7559,7 @@ cublasStatus_t cublasLtMatmulAlgoInit(cublasLtHandle_t lightHandle,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, int, int, int, int, int, int, int, void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoInit");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoInit");
             if (real_fn) return real_fn(lightHandle, computeType, scaleType, Atype, Btype, Ctype, Dtype, algoId, algo);
         }
     }
@@ -7455,7 +7576,7 @@ cublasStatus_t cublasLtMatmulAlgoConfigSetAttribute(void *algo, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoConfigSetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoConfigSetAttribute");
             if (real_fn) return real_fn(algo, attr, buf, sizeInBytes);
         }
     }
@@ -7470,7 +7591,7 @@ cublasStatus_t cublasLtMatmulAlgoConfigGetAttribute(const void *algo, int attr,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(const void *, int, void *, size_t, size_t *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoConfigGetAttribute");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoConfigGetAttribute");
             if (real_fn) return real_fn(algo, attr, buf, sizeInBytes, sizeWritten);
         }
     }
@@ -7488,7 +7609,7 @@ cublasStatus_t cublasLtMatmulAlgoCheck(cublasLtHandle_t lightHandle,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, const void *, void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoCheck");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoCheck");
             if (real_fn) return real_fn(lightHandle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, algo, result);
         }
     }
@@ -7506,7 +7627,7 @@ cublasStatus_t cublasLtMatmulAlgoGetIds(cublasLtHandle_t lightHandle,
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, int, int, int, int, int, int, int, int *, int *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoGetIds");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtMatmulAlgoGetIds");
             if (real_fn) return real_fn(lightHandle, computeType, scaleType, Atype, Btype, Ctype, Dtype, requestedAlgoCount, algoIdsArray, returnAlgoCount);
         }
     }
@@ -7522,40 +7643,40 @@ size_t cublasLtGetCudartVersion(void) {
      * Can't use dlsym(handle) because our function may be in the handle's scope. */
     typedef size_t (*fn_t)(void);
     static fn_t real_fn = NULL;
-    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetCudartVersion");
+    if (!real_fn) real_fn = (fn_t)__real_dlsym(RTLD_NEXT, "cublasLtGetCudartVersion");
     if (real_fn) return real_fn();
     return 12040; /* fallback */
 }
 cublasStatus_t cublasLtGetStatusName(cublasStatus_t status, const char **str) {
     typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
     static fn_t real_fn = NULL;
-    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetStatusName");
+    if (!real_fn) real_fn = (fn_t)__real_dlsym(RTLD_NEXT, "cublasLtGetStatusName");
     if (real_fn) return real_fn(status, str);
     (void)status; if (str) *str = "CUBLAS_STATUS_SUCCESS"; return CUBLAS_STATUS_SUCCESS;
 }
 cublasStatus_t cublasLtGetStatusString(cublasStatus_t status, const char **str) {
     typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
     static fn_t real_fn = NULL;
-    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetStatusString");
+    if (!real_fn) real_fn = (fn_t)__real_dlsym(RTLD_NEXT, "cublasLtGetStatusString");
     if (real_fn) return real_fn(status, str);
     (void)status; if (str) *str = "success"; return CUBLAS_STATUS_SUCCESS;
 }
 size_t cublasLtGetVersion(void) {
     typedef size_t (*fn_t)(void);
     static fn_t real_fn = NULL;
-    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetVersion");
+    if (!real_fn) real_fn = (fn_t)__real_dlsym(RTLD_NEXT, "cublasLtGetVersion");
     if (real_fn) return real_fn();
     return 120405; /* fallback */
 }
 cublasStatus_t cublasLtGetProperty(int type, int *value) {
     typedef cublasStatus_t (*fn_t)(int, int *);
     static fn_t real_fn = NULL;
-    if (!real_fn) real_fn = (fn_t)dlsym(RTLD_NEXT, "cublasLtGetProperty");
+    if (!real_fn) real_fn = (fn_t)__real_dlsym(RTLD_NEXT, "cublasLtGetProperty");
     if (real_fn) return real_fn(type, value);
     void *h = ensure_real_cublaslt();
     if (h) {
         typedef cublasStatus_t (*fn_t)(int, int *);
-        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetProperty");
+        fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtGetProperty");
         if (real_fn) return real_fn(type, value);
     }
     if (value) *value = (type == 0) ? 12 : (type == 1) ? 4 : 5;
@@ -7567,7 +7688,7 @@ cublasStatus_t cublasLtLoggerSetCallback(void *callback) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetCallback");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtLoggerSetCallback");
             if (real_fn) return real_fn(callback);
         }
     }
@@ -7579,7 +7700,7 @@ cublasStatus_t cublasLtLoggerSetLevel(int level) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(int);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetLevel");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtLoggerSetLevel");
             if (real_fn) return real_fn(level);
         }
     }
@@ -7591,7 +7712,7 @@ cublasStatus_t cublasLtLoggerSetMask(int mask) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(int);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetMask");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtLoggerSetMask");
             if (real_fn) return real_fn(mask);
         }
     }
@@ -7603,7 +7724,7 @@ cublasStatus_t cublasLtLoggerSetFile(void *file) {
         void *h = ensure_real_cublaslt();
         if (h) {
             typedef cublasStatus_t (*fn_t)(void *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetFile");
+            fn_t real_fn = (fn_t)__real_dlsym(h, "cublasLtLoggerSetFile");
             if (real_fn) return real_fn(file);
         }
     }
@@ -7766,7 +7887,7 @@ int nvmlDeviceGetCount(unsigned int *deviceCount) {
     static nvml_fn real_fn = NULL;
     if (!real_fn) {
         void *nvml = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_NOLOAD);
-        if (nvml) real_fn = (nvml_fn)dlsym(nvml, "nvmlDeviceGetCount");
+        if (nvml) real_fn = (nvml_fn)__real_dlsym(nvml, "nvmlDeviceGetCount");
     }
     if (real_fn) return real_fn(deviceCount);
     if (deviceCount) *deviceCount = 1;
@@ -7825,7 +7946,7 @@ static const char *g_intercepted_symbols[] = {
 static void *lookup_intercepted_symbol(const char *symbol) {
     for (int i = 0; g_intercepted_symbols[i] != NULL; i++) {
         if (strcmp(symbol, g_intercepted_symbols[i]) == 0)
-            return dlsym(RTLD_DEFAULT, symbol);
+            return __real_dlsym(RTLD_DEFAULT, symbol);
     }
     return NULL;
 }
@@ -7866,7 +7987,7 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
     if (g_real_cuda_handle) {
         typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
         static fn_t real_fn = NULL;
-        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
+        if (!real_fn) real_fn = (fn_t)__real_dlsym(g_real_cuda_handle, "cuGetProcAddress");
         if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
     }
 
@@ -7907,7 +8028,7 @@ cudaError_t cudaGetDriverEntryPoint(const char *symbol, void **funcPtr,
     if (!real_fn) {
         void *cudart = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
         if (cudart)
-            real_fn = (real_fn_t)dlsym(cudart, "cudaGetDriverEntryPoint");
+            real_fn = (real_fn_t)__real_dlsym(cudart, "cudaGetDriverEntryPoint");
     }
     if (real_fn)
         return real_fn(symbol, funcPtr, flags);
@@ -7936,7 +8057,7 @@ cudaError_t cudaGetDriverEntryPointByVersion(const char *symbol, void **funcPtr,
     if (!real_fn) {
         void *cudart = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
         if (cudart)
-            real_fn = (real_fn_t)dlsym(cudart, "cudaGetDriverEntryPointByVersion");
+            real_fn = (real_fn_t)__real_dlsym(cudart, "cudaGetDriverEntryPointByVersion");
     }
     if (real_fn)
         return real_fn(symbol, funcPtr, cudaVersion, flags, queryResult);
