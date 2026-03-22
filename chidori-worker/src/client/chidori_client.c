@@ -6113,6 +6113,13 @@ const char *cublasGetStatusString(cublasStatus_t status) {
 }
 
 cublasStatus_t cublasGetProperty(int type, int *value) {
+    /* ALWAYS forward — cuBLAS may call during load-time version checks */
+    void *h = ensure_real_cublas();
+    if (h) {
+        typedef cublasStatus_t (*fn_t)(int, int *);
+        fn_t real_fn = (fn_t)dlsym(h, "cublasGetProperty");
+        if (real_fn) return real_fn(type, value);
+    }
     (void)type;
     if (value) *value = 0;
     return CUBLAS_STATUS_SUCCESS;
@@ -6934,73 +6941,53 @@ cublasStatus_t cublasLtMatmulAlgoGetIds(cublasLtHandle_t lightHandle,
 }
 
 size_t cublasLtGetCudartVersion(void) {
-    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
-    if (g_in_real_cuda > 0) {
-        void *h = ensure_real_cublaslt();
-        fprintf(stderr, "[chidori-diag] cublasLtGetCudartVersion: g_in_real_cuda=%d, cublaslt_handle=%p\n",
-                g_in_real_cuda, h);
-        if (h) {
-            typedef size_t (*fn_t)(void);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetCudartVersion");
-            /* Check if dlsym returned our own function (would be circular!) */
-            extern size_t cublasLtGetCudartVersion(void);
-            fprintf(stderr, "[chidori-diag] cublasLtGetCudartVersion: real_fn=%p, ours=%p, same=%d\n",
-                    (void*)(uintptr_t)real_fn, (void*)(uintptr_t)&cublasLtGetCudartVersion,
-                    real_fn == &cublasLtGetCudartVersion);
-            if (real_fn && real_fn != &cublasLtGetCudartVersion) {
-                size_t ver = real_fn();
-                fprintf(stderr, "[chidori-diag] real cublasLtGetCudartVersion returned: %zu\n", ver);
-                return ver;
-            }
-        }
+    /* ALWAYS forward to real cublasLt — cuBLAS calls this at library load time
+     * (before g_in_real_cuda is set) and caches the result. Wrong version → error 14. */
+    void *h = ensure_real_cublaslt();
+    if (h) {
+        typedef size_t (*fn_t)(void);
+        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetCudartVersion");
+        if (real_fn) return real_fn();
     }
-    return 12040;
+    return 12040; /* fallback */
 }
 cublasStatus_t cublasLtGetStatusName(cublasStatus_t status, const char **str) {
-    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
-    if (g_in_real_cuda > 0) {
-        void *h = ensure_real_cublaslt();
-        if (h) {
-            typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusName");
-            if (real_fn) return real_fn(status, str);
-        }
+    /* ALWAYS forward — cuBLAS may call at load time */
+    void *h = ensure_real_cublaslt();
+    if (h) {
+        typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
+        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusName");
+        if (real_fn) return real_fn(status, str);
     }
     (void)status; if (str) *str = "CUBLAS_STATUS_SUCCESS"; return CUBLAS_STATUS_SUCCESS;
 }
 cublasStatus_t cublasLtGetStatusString(cublasStatus_t status, const char **str) {
-    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
-    if (g_in_real_cuda > 0) {
-        void *h = ensure_real_cublaslt();
-        if (h) {
-            typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusString");
-            if (real_fn) return real_fn(status, str);
-        }
+    /* ALWAYS forward — cuBLAS may call at load time */
+    void *h = ensure_real_cublaslt();
+    if (h) {
+        typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
+        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusString");
+        if (real_fn) return real_fn(status, str);
     }
     (void)status; if (str) *str = "success"; return CUBLAS_STATUS_SUCCESS;
 }
 size_t cublasLtGetVersion(void) {
-    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
-    if (g_in_real_cuda > 0) {
-        void *h = ensure_real_cublaslt();
-        if (h) {
-            typedef size_t (*fn_t)(void);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetVersion");
-            if (real_fn) return real_fn();
-        }
+    /* ALWAYS forward — cuBLAS may call at load time */
+    void *h = ensure_real_cublaslt();
+    if (h) {
+        typedef size_t (*fn_t)(void);
+        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetVersion");
+        if (real_fn) return real_fn();
     }
-    return 120405;
+    return 120405; /* fallback */
 }
 cublasStatus_t cublasLtGetProperty(int type, int *value) {
-    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
-    if (g_in_real_cuda > 0) {
-        void *h = ensure_real_cublaslt();
-        if (h) {
-            typedef cublasStatus_t (*fn_t)(int, int *);
-            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetProperty");
-            if (real_fn) return real_fn(type, value);
-        }
+    /* ALWAYS forward — cuBLAS may call at load time */
+    void *h = ensure_real_cublaslt();
+    if (h) {
+        typedef cublasStatus_t (*fn_t)(int, int *);
+        fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetProperty");
+        if (real_fn) return real_fn(type, value);
     }
     if (value) *value = (type == 0) ? 12 : (type == 1) ? 4 : 5;
     return CUBLAS_STATUS_SUCCESS;
