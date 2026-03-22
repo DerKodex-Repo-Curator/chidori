@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <sys/mman.h>
 #ifndef RTLD_DEEPBIND
 #define RTLD_DEEPBIND 0  /* Not available on this platform */
 #endif
@@ -5853,9 +5854,24 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                 }
             }
             if (is_host_ptr) {
+                /* Verify the address is actually readable before treating it as a pointer.
+                 * Use msync() — returns 0 if the page is mapped, -1 with ENOMEM if not. */
+                void *page = (void *)((uintptr_t)val & ~4095ULL);
+                if (msync(page, 4096, MS_ASYNC) != 0) {
+                    /* Not a real pointer — likely a float/int value that looks like an address */
+                    continue;
+                }
                 /* Copy 256 bytes from host pointer to remote device memory.
                  * OffsetCalculator and similar metadata structs are typically < 128 bytes. */
                 size_t copy_size = 256;
+                /* Check if we might cross a page boundary into unmapped memory */
+                size_t page_remaining = 4096 - ((uintptr_t)val & 4095);
+                if (copy_size > page_remaining) {
+                    /* Check if next page is also mapped */
+                    void *next_page = (void *)((uintptr_t)page + 4096);
+                    if (msync(next_page, 4096, MS_ASYNC) != 0)
+                        copy_size = page_remaining;
+                }
                 void *dev_ptr = NULL;
                 /* cudaMalloc on the current (remote) device */
                 cudaError_t merr = cudaMalloc(&dev_ptr, copy_size);
