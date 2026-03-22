@@ -7262,6 +7262,8 @@ static const char *g_intercepted_symbols[] = {
     "cuEventDestroy", "cuEventDestroy_v2", "cuEventElapsedTime",
     "cuFuncGetAttribute",
     "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease", "cuDevicePrimaryCtxRelease_v2",
+    "cuDevicePrimaryCtxGetState", "cuDevicePrimaryCtxSetFlags", "cuDevicePrimaryCtxSetFlags_v2",
+    "cuDevicePrimaryCtxReset", "cuDevicePrimaryCtxReset_v2",
     "cuDeviceGetPCIBusId",
     "cuGetErrorString", "cuGetErrorName",
     "cuPointerGetAttribute",
