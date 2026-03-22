@@ -2187,35 +2187,13 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     typedef cublasStatus_t (*create_fn)(cublasHandle_t *);
     create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
-    /* DEEPBIND cuBLAS resolves libcuda.so.1 from the real NVIDIA driver.
-     * Set up the CUDA context via the real driver API directly (no cudart).
-     * cuBLAS ALSO depends on cudart, so it uses the same cudart as PyTorch.
-     * We need cudart to know about device 0 too — use real cudaSetDevice. */
-    if (g_real.cuInit) {
-        CUresult ci = g_real.cuInit(0);
-        fprintf(stderr, "[chidori-diag] real cuInit = %d\n", ci);
-    }
-    if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
-        CUresult cr = g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, 0);
-        fprintf(stderr, "[chidori-diag] real cuDevicePrimaryCtxRetain = %d, ctx=%p\n", cr, (void*)g_local_ctx);
-    }
-    if (g_local_ctx && g_real.cuCtxSetCurrent) {
-        CUresult cs = g_real.cuCtxSetCurrent(g_local_ctx);
-        fprintf(stderr, "[chidori-diag] real cuCtxSetCurrent = %d\n", cs);
-    }
-    /* Also init cudart for device 0 (cuBLAS might need it) */
-    g_in_real_cuda++;
-    if (g_real.cudaSetDevice) {
-        int err = g_real.cudaSetDevice(0);
-        fprintf(stderr, "[chidori-diag] real cudaSetDevice(0) = %d\n", err);
-    }
-    g_in_real_cuda--;
-    /* Verify context */
-    if (g_real.cuCtxGetCurrent) {
-        CUcontext cur = NULL;
-        g_real.cuCtxGetCurrent(&cur);
-        fprintf(stderr, "[chidori-diag] context after setup: %p\n", (void*)cur);
-    }
+    /* The DEEPBIND cuBLAS uses the real CUDA driver via its own dependency scope.
+     * Our intercepted cudaSetDevice(0) sets the local GPU context via the real driver.
+     * Call it to ensure the context is current (matching the ctypes test that worked). */
+    extern int cudaSetDevice(int);
+    extern int cudaDeviceSynchronize(void);
+    cudaSetDevice(0);
+    cudaDeviceSynchronize();
     cublasStatus_t r = real_create(&g_local_cublas_handle);
     fprintf(stderr, "[chidori-diag] DEEPBIND cublasCreate = %d, handle=%p\n", r, (void*)g_local_cublas_handle);
     if (r != CUBLAS_STATUS_SUCCESS) {
