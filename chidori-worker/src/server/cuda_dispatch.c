@@ -2677,12 +2677,36 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             }
         }
 
+        fprintf(stderr, "[cublas_lt] matmul: A=%p B=%p C=%p D=%p stream=%p ws=%zu\n",
+                (void *)(uintptr_t)A_ptr, (void *)(uintptr_t)B_ptr,
+                (void *)(uintptr_t)C_ptr, (void *)(uintptr_t)D_ptr,
+                (void *)stream, workspaceSize);
+
+        /* Synchronize before matmul to detect any prior errors */
+        {
+            cudaError_t pre_err = cudaDeviceSynchronize();
+            if (pre_err != cudaSuccess) {
+                fprintf(stderr, "[cublas_lt] matmul: pre-sync error=%d\n", (int)pre_err);
+                cudaGetLastError();
+            }
+        }
+
         cublasStatus_t st = cublasLtMatmul(ltHandle, opDesc,
             alpha_bytes, (void *)(uintptr_t)A_ptr, descs[0],
             (void *)(uintptr_t)B_ptr, descs[1],
             beta_bytes, (void *)(uintptr_t)C_ptr, descs[2],
             (void *)(uintptr_t)D_ptr, descs[3],
             algo, workspace, workspaceSize, (cudaStream_t)stream);
+
+        /* Synchronize after to catch async errors immediately */
+        {
+            cudaError_t post_err = cudaDeviceSynchronize();
+            if (post_err != cudaSuccess) {
+                fprintf(stderr, "[cublas_lt] matmul: POST-SYNC error=%d (%s)\n",
+                        (int)post_err, cudaGetErrorString(post_err));
+                cudaGetLastError();
+            }
+        }
 
         if (workspace) cudaFree(workspace);
 
