@@ -226,13 +226,13 @@ void *dlsym(void *handle, const char *symbol) {
          * MINIMAL set: only functions that take device ordinals or affect
          * device context. Avoid intercepting cuMemAlloc etc. here to
          * prevent hanging during cuBLAS lazy init. */
-        /* MINIMAL: only primary context functions that take device ordinals.
-         * cuDeviceGetCount/Get/GetAttribute are NOT intercepted here to
-         * avoid init hangs — cuBLAS needs real values from those. */
+        /* cuGetProcAddress is the KEY symbol: ALL other driver functions
+         * are resolved through it by cudart. If we don't intercept it here,
+         * cudart gets the real cuGetProcAddress (via dlsym on real driver
+         * handle from always-redirect dlopen), which returns real driver
+         * functions that can't handle virtual device ordinals. */
         static const char *g_virtual_device_symbols[] = {
-            "cuDevicePrimaryCtxRetain", "cuDevicePrimaryCtxRelease",
-            "cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxGetState",
-            "cuDevicePrimaryCtxSetFlags_v2", "cuDevicePrimaryCtxReset_v2",
+            "cuGetProcAddress", "cuGetProcAddress_v2",
             NULL
         };
         for (int i = 0; g_virtual_device_symbols[i] != NULL; i++) {
