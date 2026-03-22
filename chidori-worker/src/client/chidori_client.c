@@ -404,16 +404,20 @@ static inline void *ensure_real_cublas(void) {
     g_cublas_load_attempted = 1;
 
     /* cuBLAS resolves CUDA symbols via dlopen("libcuda.so.1") + dlsym() at runtime.
-     * With LD_LIBRARY_PATH=build, this finds our libcuda.so.1 symlink, giving cuBLAS
-     * our intercepted functions. Our is_local_device() routing handles this correctly.
+     * We enable the dlopen redirect DURING cuBLAS loading so cuBLAS's internal
+     * dlopen("libcuda.so.1") returns the real driver. This ensures cuBLAS caches
+     * real driver function pointers, not our interceptors — needed for GemmEx fp16
+     * which does lazy kernel loading through cached pointers.
      *
-     * Use PyTorch's already-loaded cuBLAS (RTLD_NOLOAD) — same version as PyTorch's
-     * CUDA runtime, avoids system CUDA 13.x vs PyTorch CUDA 12.8 mismatch. */
+     * Use PyTorch's already-loaded cuBLAS (RTLD_NOLOAD) first. If cuBLAS was
+     * already loaded before our redirect was active, force a re-resolution by
+     * loading from system path with redirect active. */
+    g_dlopen_redirect_active = 1;
     g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_NOLOAD);
     if (!g_real_cublas_handle)
         g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_NOLOAD);
 
-    /* Fallback: try system cuBLAS paths */
+    /* Fallback: try system cuBLAS paths (with redirect active) */
     if (!g_real_cublas_handle) {
         static const char *cublas_paths[] = {
             "/opt/cuda/lib64/libcublas.so",
@@ -426,6 +430,7 @@ static inline void *ensure_real_cublas(void) {
             g_real_cublas_handle = dlopen(cublas_paths[i], RTLD_LAZY);
         }
     }
+    g_dlopen_redirect_active = 0;
     if (g_real_cublas_handle)
         LOG_DEBUG("Loaded real cuBLAS: %p", g_real_cublas_handle);
     else
