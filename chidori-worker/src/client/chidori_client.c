@@ -6826,6 +6826,20 @@ cublasStatus_t cublasGetProperty(int type, int *value) {
 }
 
 cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t handle, void *workspace, size_t workspaceSizeInBytes) {
+    /* LOCAL DEVICE ROUTING — workspace is needed for FP16 GEMM */
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        typedef cublasStatus_t (*fn_t)(cublasHandle_t, void *, size_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)__real_dlsym(h, "cublasSetWorkspace_v2"); }
+        cublasHandle_t local_h = ensure_local_cublas_handle();
+        if (real_fn && local_h) {
+            g_in_real_cuda++;
+            cublasStatus_t r = real_fn(local_h, workspace, workspaceSizeInBytes);
+            g_in_real_cuda--;
+            return r;
+        }
+    }
+    /* Remote: workspace is server-side, just acknowledge */
     (void)handle; (void)workspace; (void)workspaceSizeInBytes;
     return CUBLAS_STATUS_SUCCESS;
 }
