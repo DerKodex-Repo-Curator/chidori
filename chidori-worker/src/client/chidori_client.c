@@ -7594,6 +7594,8 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
     void *preference, int requestedAlgoCount, void *heuristicResultsArray,
     int *returnAlgoCount) {
+    /* DIAG: check if this function is called during FP16 dispatch */
+    write(STDERR_FILENO, "[DIAG] cublasLtMatmulAlgoGetHeuristic CALLED\n", 45);
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
