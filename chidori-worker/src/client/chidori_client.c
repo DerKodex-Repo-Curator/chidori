@@ -2161,7 +2161,22 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
     ensure_real_cuda_init();
+    /* cuBLAS needs an active CUDA context. Ensure the local device context
+     * is created and set current before calling cublasCreate_v2.
+     * This may run before cudaSetDevice(0) if PyTorch creates cuBLAS early. */
     g_in_real_cuda++;
+    if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
+        CUdevice dev = 0; /* first local device */
+        CUresult cr = g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, dev);
+        if (cr != CUDA_SUCCESS) {
+            fprintf(stderr, "[chidori] ensure_local_cublas_handle: cuDevicePrimaryCtxRetain failed: %d\n", cr);
+            g_in_real_cuda--;
+            return NULL;
+        }
+    }
+    if (g_local_ctx && g_real.cuCtxSetCurrent) {
+        g_real.cuCtxSetCurrent(g_local_ctx);
+    }
     cublasStatus_t r = real_create(&g_local_cublas_handle);
     g_in_real_cuda--;
     if (r != CUBLAS_STATUS_SUCCESS) {
@@ -6212,7 +6227,14 @@ static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
     create_fn real_create = (create_fn)dlsym(h, "cublasLtCreate");
     if (!real_create) return NULL;
     ensure_real_cuda_init();
+    /* Ensure local CUDA context is active before creating cublasLt handle */
     g_in_real_cuda++;
+    if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
+        g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, 0);
+    }
+    if (g_local_ctx && g_real.cuCtxSetCurrent) {
+        g_real.cuCtxSetCurrent(g_local_ctx);
+    }
     cublasStatus_t r = real_create(&g_local_cublaslt_handle);
     g_in_real_cuda--;
     if (r != 0) {
