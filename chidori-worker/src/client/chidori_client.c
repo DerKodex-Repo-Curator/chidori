@@ -1669,7 +1669,7 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    memset(prop, 0, 2048); /* sizeof(cudaDeviceProp) — oversized for safety */
+    memset(prop, 0, 1008); /* sizeof(cudaDeviceProp) — CUDA 12.x ~896, 13.x ~1008 */
 
     char *p = (char *)prop;
     int val;
@@ -1728,6 +1728,8 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     SET_INT(452, 37);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth */
     SET_INT(456, 38);     /* l2CacheSize = cudaDevAttrL2CacheSize */
     SET_INT(460, 39);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
+    { int check = 0; memcpy(&check, p + 460, 4);
+      fprintf(stderr, "[chidori] cudaGetDeviceProperties: maxThreadsPerMP at offset 460 = %d (attr 39)\n", check); }
     SET_INT(464, 40);     /* asyncEngineCount = cudaDevAttrAsyncEngineCount */
     SET_INT(472, 56);     /* managedMemory = cudaDevAttrManagedMemory */
     SET_INT(476, 57);     /* isMultiGpuBoard = cudaDevAttrIsMultiGpuBoard */
