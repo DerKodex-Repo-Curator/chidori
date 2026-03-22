@@ -1549,12 +1549,22 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t by
 
 CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
     if (g_in_real_cuda > 0 && g_real.cuMemGetInfo_v2) return g_real.cuMemGetInfo_v2(free, total);
+    static int cached = 0;
+    static size_t cached_free, cached_total;
+    if (cached) {
+        if (free) *free = cached_free;
+        if (total) *total = cached_total;
+        return CUDA_SUCCESS;
+    }
     struct { uint64_t free; uint64_t total; } info;
     size_t len = sizeof(info);
     CUresult r = chidori_rpc(CHIDORI_CU_MEM_GET_INFO, NULL, 0, &info, &len);
     if (r == CUDA_SUCCESS) {
-        *free = (size_t)info.free;
-        *total = (size_t)info.total;
+        cached_free = (size_t)info.free;
+        cached_total = (size_t)info.total;
+        cached = 1;
+        if (free) *free = cached_free;
+        if (total) *total = cached_total;
     }
     return r;
 }
@@ -2661,12 +2671,23 @@ cudaError_t cudaDriverGetVersion(int *version) {
 }
 
 cudaError_t cudaMemGetInfo(size_t *free_mem, size_t *total_mem) {
+    static int cached = 0;
+    static size_t cached_free, cached_total;
+    if (cached) {
+        if (free_mem) *free_mem = cached_free;
+        if (total_mem) *total_mem = cached_total;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
     struct { uint64_t free; uint64_t total; } info;
     size_t len = sizeof(info);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MEM_GET_INFO, NULL, 0, &info, &len);
     if (r == cudaSuccess) {
-        *free_mem = (size_t)info.free;
-        *total_mem = (size_t)info.total;
+        cached_free = (size_t)info.free;
+        cached_total = (size_t)info.total;
+        cached = 1;
+        if (free_mem) *free_mem = cached_free;
+        if (total_mem) *total_mem = cached_total;
     }
     g_last_error = r;
     return r;
@@ -6648,8 +6669,8 @@ CUresult cuCtxPopCurrent_v2(CUcontext *pctx) {
 }
 
 CUresult cuCtxGetDevice(CUdevice *device) {
-    size_t len = sizeof(int32_t);
-    return chidori_rpc(CHIDORI_CU_CTX_GET_DEVICE, NULL, 0, device, &len);
+    if (device) *device = (CUdevice)g_current_device;
+    return CUDA_SUCCESS;
 }
 
 CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags, int *active) {
@@ -7202,6 +7223,10 @@ static lt_matmul_desc_t g_lt_descs[LT_DESC_POOL];
 static int g_lt_desc_count = 0;
 static lt_matrix_layout_t g_lt_layouts[LT_DESC_POOL * 4];
 static int g_lt_layout_count = 0;
+static int g_lt_desc_free[LT_DESC_POOL];
+static int g_lt_desc_free_top = -1;
+static int g_lt_layout_free[LT_DESC_POOL * 4];
+static int g_lt_layout_free_top = -1;
 
 cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     void *computeDesc, const void *alpha,
@@ -7323,8 +7348,15 @@ cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int 
             return r;
         }
     }
-    if (g_lt_desc_count >= LT_DESC_POOL) g_lt_desc_count = 0; /* wrap — pool is circular */
-    lt_matmul_desc_t *d = &g_lt_descs[g_lt_desc_count++];
+    lt_matmul_desc_t *d;
+    if (g_lt_desc_free_top >= 0) {
+        d = &g_lt_descs[g_lt_desc_free[g_lt_desc_free_top--]];
+    } else if (g_lt_desc_count < LT_DESC_POOL) {
+        d = &g_lt_descs[g_lt_desc_count++];
+    } else {
+        if (matmulDesc) *matmulDesc = NULL;
+        return CUBLAS_STATUS_ALLOC_FAILED;
+    }
     memset(d, 0, sizeof(*d));
     d->computeType = computeType;
     d->scaleType = scaleType;
@@ -7354,7 +7386,11 @@ cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
             return r;
         }
     }
-    (void)matmulDesc;
+    if (matmulDesc) {
+        int idx = (lt_matmul_desc_t *)matmulDesc - g_lt_descs;
+        if (idx >= 0 && idx < LT_DESC_POOL && g_lt_desc_free_top < LT_DESC_POOL - 1)
+            g_lt_desc_free[++g_lt_desc_free_top] = idx;
+    }
     return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -7447,8 +7483,15 @@ cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
             return r;
         }
     }
-    if (g_lt_layout_count >= LT_DESC_POOL * 4) g_lt_layout_count = 0; /* wrap — pool is circular */
-    lt_matrix_layout_t *l = &g_lt_layouts[g_lt_layout_count++];
+    lt_matrix_layout_t *l;
+    if (g_lt_layout_free_top >= 0) {
+        l = &g_lt_layouts[g_lt_layout_free[g_lt_layout_free_top--]];
+    } else if (g_lt_layout_count < LT_DESC_POOL * 4) {
+        l = &g_lt_layouts[g_lt_layout_count++];
+    } else {
+        if (matLayout) *matLayout = NULL;
+        return CUBLAS_STATUS_ALLOC_FAILED;
+    }
     memset(l, 0, sizeof(*l));
     l->dtype = type;
     l->rows = rows;
@@ -7481,7 +7524,11 @@ cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
             return r;
         }
     }
-    (void)matLayout;
+    if (matLayout) {
+        int idx = (lt_matrix_layout_t *)matLayout - g_lt_layouts;
+        if (idx >= 0 && idx < LT_DESC_POOL * 4 && g_lt_layout_free_top < LT_DESC_POOL * 4 - 1)
+            g_lt_layout_free[++g_lt_layout_free_top] = idx;
+    }
     return CUBLAS_STATUS_SUCCESS;
 }
 
