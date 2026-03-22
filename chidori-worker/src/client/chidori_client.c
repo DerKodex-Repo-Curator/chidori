@@ -1723,11 +1723,11 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     SET_INT(432, 36);     /* ECCEnabled = cudaDevAttrEccEnabled */
     SET_INT(436, 33);     /* pciBusID = cudaDevAttrPciBusId */
     SET_INT(440, 34);     /* pciDeviceID = cudaDevAttrPciDeviceId */
-    SET_INT(448, 37);     /* memoryClockRate = cudaDevAttrMemoryClockRate */
-    SET_INT(452, 38);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth */
-    SET_INT(456, 39);     /* l2CacheSize = cudaDevAttrL2CacheSize */
-    SET_INT(460, 40);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
-    SET_INT(464, 41);     /* asyncEngineCount = cudaDevAttrAsyncEngineCount */
+    SET_INT(448, 36);     /* memoryClockRate = cudaDevAttrMemoryClockRate */
+    SET_INT(452, 37);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth */
+    SET_INT(456, 38);     /* l2CacheSize = cudaDevAttrL2CacheSize */
+    SET_INT(460, 39);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
+    SET_INT(464, 40);     /* asyncEngineCount = cudaDevAttrAsyncEngineCount */
     SET_INT(472, 56);     /* managedMemory = cudaDevAttrManagedMemory */
     SET_INT(476, 57);     /* isMultiGpuBoard = cudaDevAttrIsMultiGpuBoard */
 
