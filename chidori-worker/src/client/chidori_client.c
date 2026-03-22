@@ -1684,15 +1684,22 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
         memcpy(p + 288, &total, 8);
     }
 
+    /* DIAGNOSTIC MODE: write offset markers instead of real values */
+    static int g_offset_diag = -1;
+    if (g_offset_diag == -1) {
+        const char *d = getenv("CHIDORI_OFFSET_DIAG");
+        g_offset_diag = (d && d[0] == '1') ? 1 : 0;
+    }
+
     /* Helper macro: query a Runtime API device attribute and write to the struct */
     #define SET_INT(offset, cuda_attr) do { \
-        val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); \
-        memcpy(p + (offset), &val, 4); \
+        if (g_offset_diag) { int _ov = (offset); memcpy(p + (offset), &_ov, 4); } \
+        else { val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); memcpy(p + (offset), &val, 4); } \
     } while(0)
 
     #define SET_SIZE_T(offset, cuda_attr) do { \
-        val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); \
-        size_t sv = (size_t)val; memcpy(p + (offset), &sv, 8); \
+        if (g_offset_diag) { size_t _ov = (size_t)(offset); memcpy(p + (offset), &_ov, 8); } \
+        else { val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); size_t sv = (size_t)val; memcpy(p + (offset), &sv, 8); } \
     } while(0)
 
     /* cudaDevAttr enum values (stable across CUDA versions) */
