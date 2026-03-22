@@ -2659,7 +2659,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             cublasLtMatmulPreferenceCreate(&pref);
             /* Allow up to 32 MB workspace */
             size_t maxWs = 32 * 1024 * 1024;
-            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREFERENCE_MAX_WORKSPACE_BYTES,
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                   &maxWs, sizeof(maxWs));
             cublasLtMatmulHeuristicResult_t heur;
             int heurCount = 0;
