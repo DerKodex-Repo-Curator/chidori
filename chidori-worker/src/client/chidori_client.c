@@ -5819,7 +5819,7 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
             memcpy(&val, param_buf + off, 8);
             /* Check if this looks like a host user-space address (0x55... or similar)
              * but NOT a GPU address (GPU addresses on CUDA UVA are typically 0x7x...) */
-            if (val >= 0x10000000000ULL && val < 0x60000000000ULL) {
+            if (val >= 0x10000000000ULL && val < 0x600000000000ULL) {
                 /* This is almost certainly a host heap address (PIE binary range) */
                 fprintf(stderr, "[chidori-launch] HOST_PTR: param[%d]=0x%llx dev=%d func=%s\n",
                         off, (unsigned long long)val,
