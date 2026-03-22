@@ -50,6 +50,7 @@
  */
 static void *g_real_cuda_handle_for_dlopen = NULL; /* set by init_real_cuda */
 static __thread int g_dlopen_redirect_active = 0;  /* 1 = redirect libcuda dlopen to real driver */
+static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
 
 void *dlopen(const char *filename, int flags) {
     static void *(*real_dlopen)(const char *, int) = NULL;
@@ -57,10 +58,13 @@ void *dlopen(const char *filename, int flags) {
         real_dlopen = dlsym(RTLD_NEXT, "dlopen");
     }
 
-    /* Only redirect when explicitly enabled (during cuBLAS init).
-     * PyTorch's own dlopen("libcuda.so.1") must NOT be redirected —
-     * it needs our intercepted functions for device routing. */
-    if (g_dlopen_redirect_active && g_real_cuda_handle_for_dlopen && filename &&
+    /* Redirect libcuda.so.1 dlopen to real driver when:
+     * 1. Explicitly enabled (g_dlopen_redirect_active, during cuBLAS create), OR
+     * 2. Inside a real CUDA call (g_in_real_cuda > 0, during cuBLAS GemmEx etc.)
+     * This ensures cuBLAS gets real driver functions for ALL operations,
+     * not just initialization. Needed for fp16 GemmEx which lazily loads kernels. */
+    if ((g_dlopen_redirect_active || g_in_real_cuda > 0) &&
+        g_real_cuda_handle_for_dlopen && filename &&
         (strcmp(filename, "libcuda.so.1") == 0 ||
          strcmp(filename, "libcuda.so") == 0)) {
         return g_real_cuda_handle_for_dlopen;
@@ -183,7 +187,7 @@ static int alloc_track_device(uintptr_t ptr) {
 }
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
-static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
+/* g_in_real_cuda defined above (before dlopen interceptor) */
 static CUcontext g_local_ctx = NULL;      /* Real CUDA primary context for local device */
 
 /* Real CUDA function pointers (populated by init_real_cuda) */
