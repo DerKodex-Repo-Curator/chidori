@@ -1202,15 +1202,26 @@ CUresult cuDeviceGetCount(int *count) {
     if (g_in_real_cuda > 0 && g_real.cuDeviceGetCount)
         return g_real.cuDeviceGetCount(count); /* reentrance: return REAL device count */
     if (!count) return CUDA_ERROR_INVALID_VALUE;
+    /* DRIVER API: always return the REAL local device count.
+     *
+     * NVIDIA libraries (cuBLAS, cublasLt, cuDNN) cache this value during
+     * their init and expect it to match the real driver's device count.
+     * Returning an inflated virtual count (local + remote) causes
+     * CUBLAS_STATUS_NOT_INITIALIZED for FP16 GemmEx.
+     *
+     * PyTorch discovers devices through cudaGetDeviceCount (runtime API)
+     * and nvmlDeviceGetCount (NVML), both of which still return the
+     * virtual count. PyTorch NEVER calls cuDeviceGetCount directly. */
+    if (g_partial_offload) {
+        *count = g_local_device_count;
+        return CUDA_SUCCESS;
+    }
+    /* Remote-only mode: query server for device count */
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
     if (remote_count <= 0) remote_count = 1;
-    if (g_partial_offload) {
-        *count = g_local_device_count + remote_count;
-    } else {
-        *count = remote_count;
-    }
+    *count = remote_count;
     return r;
 }
 
