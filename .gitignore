@@ -4,4 +4,6 @@ chidori-worker/src/generated/
 *.so
 *.exe
 chidori-worker/tests/request.sh
-.env.claude/worktrees/
+.env
+.claude/worktrees/
+validate.sh

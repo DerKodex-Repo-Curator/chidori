@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <limits.h>
 #ifndef RTLD_DEEPBIND
 #define RTLD_DEEPBIND 0  /* Not available on this platform */
 #endif
@@ -94,6 +95,7 @@ typedef unsigned long long CUdeviceptr;
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_VALUE 1
 #define CUDA_ERROR_NOT_FOUND 500
+#define CUDA_ERROR_NOT_SUPPORTED 801
 
 /*
  * ============================================================================
@@ -109,6 +111,7 @@ typedef unsigned long long CUdeviceptr;
 /* Real CUDA function dispatch table — loaded lazily via dlsym */
 static void *g_real_cuda_handle = NULL;   /* dlopen handle for real libcuda.so */
 static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so */
+static void *g_real_cublas_handle = NULL; /* dlopen handle for real libcublas.so */
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
@@ -116,6 +119,7 @@ static int g_current_device = 0;         /* current active device (global) */
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
+static CUcontext g_local_ctx = NULL;      /* Real CUDA primary context for local device */
 
 /* Real CUDA function pointers (populated by init_real_cuda) */
 static struct {
@@ -155,6 +159,8 @@ static struct {
     CUresult (*cuEventRecord)(CUevent, CUstream);
     CUresult (*cuEventSynchronize)(CUevent);
     CUresult (*cuEventElapsedTime)(float *, CUevent, CUevent);
+    /* Internal driver API — used by cudart for initialization handshake */
+    CUresult (*cuGetExportTable)(const void **, const void *);
     /* Runtime API */
     int (*cudaSetDevice)(int);
     int (*cudaGetDevice)(int *);
@@ -198,37 +204,50 @@ static void init_real_cuda(void) {
 
     /* Load real CUDA driver via explicit dlopen.
      * We CANNOT use RTLD_NEXT because we ARE libcuda.so.1 via LD_PRELOAD,
-     * and there's no "next" libcuda in the chain. RTLD_NEXT fails fatally.
-     * Instead, dlopen the real driver by path with RTLD_LAZY|RTLD_NOLOAD first
-     * (in case it's already loaded), then try explicit paths. */
-    /* Open real NVIDIA driver by absolute path. Do NOT use RTLD_NOLOAD or
-     * bare "libcuda.so.1" — those return OUR library (SONAME collision).
-     * The absolute path opens the actual file even if SONAME matches. */
+     * so RTLD_NEXT resolves back to ourselves. Instead, we dlopen the real
+     * system libcuda.so using its versioned path. We use RTLD_LOCAL to avoid
+     * replacing PLT entries in PyTorch's libtorch_cuda.so.
+     * For cudart, RTLD_NEXT works since we don't replace libcudart. */
     {
-        const char *cuda_paths[] = {
-            "/usr/lib/libcuda.so.1",
-            "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
-            "/usr/lib64/libcuda.so.1",
+        /* Try to find and dlopen the real CUDA driver by versioned path */
+        static const char *cuda_paths[] = {
+            "/usr/lib/libcuda.so.1",          /* Standard Linux */
+            "/usr/lib64/libcuda.so.1",         /* Some distros */
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.1", /* Debian/Ubuntu multiarch */
             NULL
         };
+        g_real_cuda_handle = NULL;
         for (int i = 0; cuda_paths[i]; i++) {
-            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY);
+            /* Resolve symlinks to get the versioned .so (e.g., libcuda.so.590.48.01)
+             * This avoids dlopen loading our own libcuda.so.1 symlink. */
+            char resolved[PATH_MAX];
+            if (realpath(cuda_paths[i], resolved) && strcmp(resolved, cuda_paths[i]) != 0) {
+                g_real_cuda_handle = dlopen(resolved, RTLD_LAZY | RTLD_LOCAL);
+                if (g_real_cuda_handle) {
+                    fprintf(stderr, "[chidori] Loaded real CUDA driver from %s (resolved: %s)\n", cuda_paths[i], resolved);
+                    break;
+                }
+            }
+            /* Also try the direct path */
+            g_real_cuda_handle = dlopen(cuda_paths[i], RTLD_LAZY | RTLD_LOCAL);
             if (g_real_cuda_handle) {
                 fprintf(stderr, "[chidori] Loaded real CUDA driver from %s\n", cuda_paths[i]);
                 break;
             }
         }
+        if (!g_real_cuda_handle) {
+            fprintf(stderr, "[chidori] WARNING: Could not load real CUDA driver — local GPU passthrough disabled\n");
+            g_partial_offload = 0;
+            return;
+        }
     }
-    /* For cudart: the real one is already loaded by PyTorch */
-    g_real_cudart_handle = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_NOLOAD);
+    /* For cudart: use RTLD_NEXT since we don't replace libcudart */
+    g_real_cudart_handle = RTLD_NEXT;
 
-    if (!g_real_cuda_handle)
-        fprintf(stderr, "[chidori] WARNING: Could not load real libcuda.so for partial offload\n");
-
-    /* Populate dispatch table from real libraries */
-    #define LOAD_SYM(handle, name) g_real.name = (handle) ? dlsym(handle, #name) : NULL
+    /* Populate dispatch table — Driver API from dlopen'd handle, Runtime API from RTLD_NEXT */
+    #define LOAD_SYM(handle, name) g_real.name = dlsym(handle, #name)
     #define LOAD_CUDA(name) LOAD_SYM(g_real_cuda_handle, name)
-    #define LOAD_CUDART(name) LOAD_SYM(g_real_cudart_handle, name)
+    #define LOAD_CUDART(name) LOAD_SYM(RTLD_NEXT, name)
 
     LOAD_CUDA(cuInit);
     LOAD_CUDA(cuDriverGetVersion);
@@ -263,6 +282,7 @@ static void init_real_cuda(void) {
     LOAD_CUDA(cuEventRecord);
     LOAD_CUDA(cuEventSynchronize);
     LOAD_CUDA(cuEventElapsedTime);
+    LOAD_CUDA(cuGetExportTable);
     LOAD_CUDART(cudaSetDevice);
     LOAD_CUDART(cudaGetDevice);
     LOAD_CUDART(cudaGetDeviceCount);
@@ -291,14 +311,42 @@ static void init_real_cuda(void) {
         if (g_local_device_mask & (1u << i))
             g_local_device_count++;
     }
-    /* Default device 0: if it's local, set routing accordingly */
-    if (g_local_device_mask & 1)
-
     LOG_DEBUG("Partial offload: local_devices=%s (%d local GPUs)", env, g_local_device_count);
+    LOG_DEBUG("init_real_cuda: CHIDORI_LOCAL_DEVICES=%s", env);
 }
 
 static inline int is_local_device(int device) {
     return g_partial_offload && ((g_local_device_mask >> device) & 1);
+}
+
+/*
+ * Lazy-load real cuBLAS — called at first cuBLAS function entry on a local device.
+ * We can't load cuBLAS in init_real_cuda() because PyTorch hasn't loaded it yet
+ * at that point. By the time a cuBLAS function is called, PyTorch's libtorch_cuda.so
+ * has already dlopen'd libcublas.so, so RTLD_NOLOAD will find it.
+ */
+static int g_cublas_load_attempted = 0;
+static inline void *ensure_real_cublas(void) {
+    if (g_real_cublas_handle) return g_real_cublas_handle;
+    if (g_cublas_load_attempted) return NULL;
+    g_cublas_load_attempted = 1;
+
+    g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_NOLOAD);
+    if (!g_real_cublas_handle)
+        g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_NOLOAD);
+    /* Fallback: force-load if not yet loaded (shouldn't happen in practice) */
+    if (!g_real_cublas_handle) {
+        g_in_real_cuda++;
+        g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY);
+        if (!g_real_cublas_handle)
+            g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY);
+        g_in_real_cuda--;
+    }
+    if (g_real_cublas_handle)
+        LOG_DEBUG("Loaded real cuBLAS: %p", g_real_cublas_handle);
+    else
+        LOG_DEBUG("WARNING: Could not load real cuBLAS — local device cuBLAS calls will fall through to RPC");
+    return g_real_cublas_handle;
 }
 
 /* Client state */
@@ -899,26 +947,10 @@ static struct { int dev; int attrib; int value; int valid; } g_attr_cache[ATTR_C
 static int g_attr_cache_count = 0;
 
 /* g_real_cuda_inited declared near g_partial_offload, used by cuInit and ensure_real_cuda_init */
-static CUcontext g_real_ctx = NULL;
 static void ensure_real_cuda_init(void) {
     if (!g_real_cuda_inited && g_real.cuInit) {
-        g_in_real_cuda++;
         g_real.cuInit(0);
-        /* Create and activate a context on the local GPU */
-        if (g_real.cuDevicePrimaryCtxRetain && g_real.cuCtxSetCurrent) {
-            CUdevice dev = 0;
-            if (g_real.cuDeviceGet) g_real.cuDeviceGet(&dev, 0);
-            g_real.cuDevicePrimaryCtxRetain(&g_real_ctx, dev);
-            g_real.cuCtxSetCurrent(g_real_ctx);
-        }
-        g_in_real_cuda--;
         g_real_cuda_inited = 1;
-    }
-    /* Ensure real context is active for local operations */
-    if (g_real_ctx && g_real.cuCtxSetCurrent) {
-        g_in_real_cuda++;
-        g_real.cuCtxSetCurrent(g_real_ctx);
-        g_in_real_cuda--;
     }
 }
 
@@ -975,12 +1007,13 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
 }
 
 CUresult cuCtxSetCurrent(CUcontext ctx) {
-    if (g_in_real_cuda > 0 && g_real.cuCtxSetCurrent) return g_real.cuCtxSetCurrent(ctx);
-    /* Partial offload: local device context management goes to real driver */
+    if (g_in_real_cuda && g_real.cuCtxSetCurrent) return g_real.cuCtxSetCurrent(ctx); /* reentrance: forward to real driver */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxSetCurrent) {
         g_in_real_cuda++;
         CUresult r = g_real.cuCtxSetCurrent(ctx);
         g_in_real_cuda--;
+        g_cached_ctx = ctx;
+        g_cached_ctx_valid = 1;
         return r;
     }
     uint64_t handle = (uint64_t)(uintptr_t)ctx;
@@ -990,11 +1023,15 @@ CUresult cuCtxSetCurrent(CUcontext ctx) {
 }
 
 CUresult cuCtxGetCurrent(CUcontext *pctx) {
-    if (g_in_real_cuda > 0 && g_real.cuCtxGetCurrent) return g_real.cuCtxGetCurrent(pctx);
+    if (g_in_real_cuda && g_real.cuCtxGetCurrent) return g_real.cuCtxGetCurrent(pctx); /* reentrance: forward to real driver */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxGetCurrent) {
         g_in_real_cuda++;
         CUresult r = g_real.cuCtxGetCurrent(pctx);
         g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) {
+            g_cached_ctx = *pctx;
+            g_cached_ctx_valid = 1;
+        }
         return r;
     }
     if (g_cached_ctx_valid) {
@@ -1011,7 +1048,7 @@ CUresult cuCtxGetCurrent(CUcontext *pctx) {
 }
 
 CUresult cuCtxSynchronize(void) {
-    if (g_in_real_cuda > 0 && g_real.cuCtxSynchronize) return g_real.cuCtxSynchronize();
+    if (g_in_real_cuda && g_real.cuCtxSynchronize) return g_real.cuCtxSynchronize(); /* reentrance: forward to real driver */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxSynchronize) {
         g_in_real_cuda++;
         CUresult r = g_real.cuCtxSynchronize();
@@ -1022,16 +1059,19 @@ CUresult cuCtxSynchronize(void) {
 }
 
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
-    if (g_in_real_cuda > 0 && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
-    /* Partial offload: local device context goes to real driver */
+    if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
     if (g_partial_offload && is_local_device(dev) && g_real.cuDevicePrimaryCtxRetain) {
         ensure_real_cuda_init();
         g_in_real_cuda++;
         CUresult r = g_real.cuDevicePrimaryCtxRetain(pctx, dev);
         g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) {
+            g_local_ctx = *pctx;
+            g_cached_ctx = *pctx;
+            g_cached_ctx_valid = 1;
+        }
         return r;
     }
-    /* Remap device for remote */
     int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
     size_t len = sizeof(uint64_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RETAIN, &remote_dev, sizeof(remote_dev), pctx, &len);
@@ -1043,8 +1083,15 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
 }
 
 CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
-    if (g_in_real_cuda > 0 && g_real.cuDevicePrimaryCtxRelease_v2) return g_real.cuDevicePrimaryCtxRelease_v2(dev);
-    return chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RELEASE, &dev, sizeof(dev), NULL, NULL);
+    if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRelease_v2) return g_real.cuDevicePrimaryCtxRelease_v2(dev);
+    if (g_partial_offload && is_local_device(dev) && g_real.cuDevicePrimaryCtxRelease_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuDevicePrimaryCtxRelease_v2(dev);
+        g_in_real_cuda--;
+        return r;
+    }
+    int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
+    return chidori_rpc(CHIDORI_CU_DEVICE_PRIMARY_CTX_RELEASE, &remote_dev, sizeof(remote_dev), NULL, NULL);
 }
 
 /* Memory */
@@ -1318,19 +1365,32 @@ CUresult cuLaunchKernel(CUfunction f,
 
 /* Stream */
 CUresult cuStreamCreate(CUstream *phStream, unsigned int flags) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuStreamCreate) {
+        LOG_DEBUG("cuStreamCreate -> LOCAL (dev %d)", g_current_device);
+        g_in_real_cuda++;
+        CUresult r = g_real.cuStreamCreate(phStream, flags);
+        g_in_real_cuda--;
+        return r;
+    }
     size_t len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_STREAM_CREATE, &flags, sizeof(flags), phStream, &len);
 }
 
 CUresult cuStreamDestroy_v2(CUstream hStream) {
-    if (g_in_real_cuda > 0) return CUDA_SUCCESS; /* reentrance guard */
+    if (g_in_real_cuda) return CUDA_SUCCESS; /* reentrance guard */
     uint64_t handle = (uint64_t)(uintptr_t)hStream;
     return chidori_rpc_async(CHIDORI_CU_STREAM_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuStreamSynchronize(CUstream hStream) {
-    if (g_in_real_cuda > 0 && g_real.cuStreamSynchronize) return g_real.cuStreamSynchronize(hStream); /* reentrance guard */
+    if (g_in_real_cuda && g_real.cuStreamSynchronize) return g_real.cuStreamSynchronize(hStream); /* reentrance guard */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuStreamSynchronize) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuStreamSynchronize(hStream);
+        g_in_real_cuda--;
+        return r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)hStream;
     return chidori_rpc(CHIDORI_CU_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
 }
@@ -1430,25 +1490,55 @@ cudaError_t cudaGetDevice(int *device) {
 }
 
 cudaError_t cudaSetDevice(int device) {
-    /* Short-circuit: skip RPC if already on this device (hot path) */
-    if (device == g_current_device)
-        return cudaSuccess;
+    /* Short-circuit: skip RPC if already on this device (hot path).
+     * Exception: for local devices, we must still initialize the context
+     * on the first call (g_local_ctx == NULL). */
+    if (device == g_current_device) {
+        if (!g_partial_offload || !is_local_device(device) || g_local_ctx)
+            return cudaSuccess;
+        /* Fall through to initialize local context */
+    }
+
+    int was_local = g_partial_offload && is_local_device(g_current_device);
 
     if (g_partial_offload && is_local_device(device)) {
-        /* Route to local GPU via real CUDA driver */
-        LOG_DEBUG("cudaSetDevice(%d) → LOCAL", device);
+        /* Route to local GPU via real CUDA driver API directly.
+         * We cannot use g_real.cudaSetDevice (cudart) because cudart calls
+         * driver API functions internally, hitting our interceptors and
+         * seeing us as a stub library (error 36). Instead, set up the
+         * context directly via the real driver's cuDevicePrimaryCtxRetain
+         * + cuCtxSetCurrent which we loaded via dlopen. */
+        LOG_DEBUG("cudaSetDevice(%d) -> LOCAL", device);
         ensure_real_cuda_init();
-        cudaError_t r = cudaSuccess;
-        if (g_real.cudaSetDevice) {
+        CUresult cr = CUDA_SUCCESS;
+        if (g_real.cuDevicePrimaryCtxRetain && !g_local_ctx) {
             g_in_real_cuda++;
-            r = (cudaError_t)g_real.cudaSetDevice(device);
+            cr = g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, device);
             g_in_real_cuda--;
+            if (cr != CUDA_SUCCESS) {
+                LOG_DEBUG("cudaSetDevice(%d) -> cuDevicePrimaryCtxRetain failed: %d", device, cr);
+                g_last_error = (cudaError_t)cr;
+                return (cudaError_t)cr;
+            }
         }
-        if (r == cudaSuccess) {
-            g_current_device = device;
+        if (g_local_ctx && g_real.cuCtxSetCurrent) {
+            g_in_real_cuda++;
+            cr = g_real.cuCtxSetCurrent(g_local_ctx);
+            g_in_real_cuda--;
+            LOG_DEBUG("cudaSetDevice(%d) -> activated local GPU context %p (r=%d)", device, g_local_ctx, cr);
         }
-        g_last_error = r;
-        return r;
+        g_current_device = device;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+
+    /* Switching from local to remote — deactivate real context to avoid
+     * the real driver intercepting subsequent Driver API calls */
+    if (was_local && g_real.cuCtxSetCurrent) {
+        g_in_real_cuda++;
+        g_real.cuCtxSetCurrent(NULL);
+        g_in_real_cuda--;
+        LOG_DEBUG("cudaSetDevice(%d) -> deactivated local GPU context", device);
     }
 
     /* Route to remote GPU via Chidori RPC */
@@ -1607,8 +1697,19 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
     /* Use Driver API (cuMemAlloc) for local device to avoid Runtime API reentrance */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemAlloc_v2) {
-        LOG_DEBUG("cudaMalloc(%zu) → LOCAL via cuMemAlloc (dev %d)", size, g_current_device);
+        LOG_DEBUG("cudaMalloc(%zu) -> LOCAL via cuMemAlloc (dev %d)", size, g_current_device);
         ensure_real_cuda_init();
+        /* Ensure local context is active (may not be if cudaSetDevice wasn't called yet) */
+        if (!g_local_ctx && g_real.cuDevicePrimaryCtxRetain) {
+            g_in_real_cuda++;
+            g_real.cuDevicePrimaryCtxRetain(&g_local_ctx, g_current_device);
+            g_in_real_cuda--;
+        }
+        if (g_local_ctx && g_real.cuCtxSetCurrent) {
+            g_in_real_cuda++;
+            g_real.cuCtxSetCurrent(g_local_ctx);
+            g_in_real_cuda--;
+        }
         g_in_real_cuda++;
         CUdeviceptr dptr = 0;
         CUresult r = g_real.cuMemAlloc_v2(&dptr, size);
@@ -1854,12 +1955,14 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 
 cudaError_t cudaDeviceSynchronize(void) {
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaDeviceSynchronize) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxSynchronize) {
+        /* Use real driver's cuCtxSynchronize instead of cudart's cudaDeviceSynchronize
+         * to avoid cudart's internal driver API calls hitting our interceptors */
         g_in_real_cuda++;
-        cudaError_t r = (cudaError_t)g_real.cudaDeviceSynchronize();
+        CUresult cr = g_real.cuCtxSynchronize();
         g_in_real_cuda--;
-        g_last_error = r;
-        return r;
+        g_last_error = (cudaError_t)cr;
+        return (cudaError_t)cr;
     }
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_SYNCHRONIZE, NULL, 0, NULL, NULL);
     g_last_error = r;
@@ -1867,6 +1970,18 @@ cudaError_t cudaDeviceSynchronize(void) {
 }
 
 cudaError_t cudaStreamCreate(void **pStream) {
+    if (g_partial_offload && is_local_device(g_current_device)) {
+        /* For local device, create stream via real CUDA driver */
+        LOG_DEBUG("cudaStreamCreate -> LOCAL (dev %d)", g_current_device);
+        ensure_real_cuda_init();
+        g_in_real_cuda++;
+        CUresult r = g_real.cuStreamCreate
+            ? g_real.cuStreamCreate((CUstream *)pStream, 0)
+            : CUDA_SUCCESS;
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
     uint64_t handle = 0;
     size_t len = sizeof(uint64_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_STREAM_CREATE, NULL, 0, &handle, &len);
@@ -1884,12 +1999,14 @@ cudaError_t cudaStreamDestroy(void *stream) {
 }
 
 cudaError_t cudaStreamSynchronize(void *stream) {
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cudaStreamSynchronize) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuStreamSynchronize) {
+        /* Use real driver's cuStreamSynchronize instead of cudart's version
+         * to avoid cudart's internal driver API calls hitting our interceptors */
         g_in_real_cuda++;
-        cudaError_t r = (cudaError_t)g_real.cudaStreamSynchronize(stream);
+        CUresult cr = g_real.cuStreamSynchronize((CUstream)stream);
         g_in_real_cuda--;
-        g_last_error = r;
-        return r;
+        g_last_error = (cudaError_t)cr;
+        return (cudaError_t)cr;
     }
     uint64_t handle = (uint64_t)(uintptr_t)stream;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
@@ -2035,6 +2152,9 @@ static size_t chidori_cublas_scalar_size(int dtype) {
 
 static uint64_t g_last_cublas_handle = 0; /* Track last cuBLAS handle for cublasLt translation */
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
+    /* NOTE: cuBLAS local routing deferred — cublasCreate internally calls
+     * many CUDA functions that interact with our LD_PRELOAD interceptors.
+     * For now, all cuBLAS operations go through RPC (remote server). */
     uint64_t h = 0;
     size_t len = sizeof(uint64_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_CREATE, NULL, 0, &h, &len);
@@ -5353,6 +5473,20 @@ CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
     return CUDA_SUCCESS;
 }
 
+/*
+ * cuGetExportTable -- Internal CUDA driver function used by cudart for
+ * initialization handshake. Without this, the real cudart reports
+ * cudaErrorCallRequiresNewerDriver (36) because it can't negotiate
+ * internal function tables with the driver.
+ *
+ * Forward directly to the real driver (dlopen'd handle).
+ */
+CUresult cuGetExportTable(const void **ppExportTable, const void *pExportTableId) {
+    if (g_real.cuGetExportTable)
+        return g_real.cuGetExportTable(ppExportTable, pExportTableId);
+    return CUDA_ERROR_NOT_INITIALIZED;
+}
+
 CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int *version) {
     (void)ctx;
     if (version) *version = 3020;
@@ -6238,6 +6372,7 @@ static const char *g_intercepted_symbols[] = {
     "cuDeviceGetPCIBusId",
     "cuGetErrorString", "cuGetErrorName",
     "cuPointerGetAttribute",
+    "cuGetExportTable",
     NULL
 };
 

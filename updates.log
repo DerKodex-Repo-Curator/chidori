@@ -5,15 +5,15 @@
 ### MILESTONE ACHIEVED: Basic Partial GPU Offloading Works!
 ```
 Devices: 2
-cuda:0: [1.0, 2.0, 3.0]  ← LOCAL GPU (real CUDA driver)
-cuda:1: [4.0, 5.0, 6.0]  ← REMOTE SERVER (Chidori TCP)
+cuda:0: [1.0, 2.0, 3.0]  <- LOCAL GPU (real CUDA driver)
+cuda:1: [4.0, 5.0, 6.0]  <- REMOTE SERVER (Chidori TCP)
 BOTH DEVICES PASS
 ```
 
 ### What Works
 - torch.cuda.device_count() == 2
-- torch.tensor().cuda(0) → local GPU allocation
-- torch.tensor().cuda(1) → remote server allocation
+- torch.tensor().cuda(0) -> local GPU allocation
+- torch.tensor().cuda(1) -> remote server allocation
 - x.cpu() DtoH readback from both devices
 - cudaMalloc, cudaFree, cudaMemcpy, cudaMemcpyAsync all route correctly
 - Context management (cuCtxSetCurrent, cuDevicePrimaryCtxRetain) routes correctly
@@ -28,8 +28,8 @@ BOTH DEVICES PASS
 
 ### What to Do Next
 1. Add partial offload routing to cuBLAS functions:
-   - cublasCreate → use real driver for local device
-   - cublasSgemm → use real driver for local device
+   - cublasCreate -> use real driver for local device
+   - cublasSgemm -> use real driver for local device
    - All cuBLAS operations need is_local_device() guard
 2. Add partial offload routing to kernel launch (cudaLaunchKernel, cuLaunchKernel)
 3. Add routing to cuStreamCreate, cuStreamSynchronize for local device
@@ -38,10 +38,69 @@ BOTH DEVICES PASS
 ### Key Fixes Made Today
 1. NVML shim (libnvidia-ml.so.1) intercepts nvmlDeviceGetCount
 2. Real driver loaded via dlopen("/usr/lib/libcuda.so.1") with SONAME fix
-3. g_in_real_cuda → recursion counter (++/--)
+3. g_in_real_cuda -> recursion counter (++/--)
 4. cuGetProcAddress returns OUR functions (not real driver's)
 5. cuInit reentrance guard
 6. cudaMemcpyAsync partial offload routing
 7. Context management routing for local device
 8. g_current_device moved to globals section
 9. cuDevicePrimaryCtxRetain routing for local device
+
+## Session: 2026-03-21 - Merge of 3 Parallel Research Agents
+
+### Merge Summary
+Applied fixes from 3 worktree agents into main chidori_client.c:
+
+#### Agent 3 (Streams/Context/Device) -- FULLY APPLIED
+Key insight: Use Driver API directly for local device ops to avoid error 36.
+
+1. **cudaSetDevice** -- Replaced cudart's cudaSetDevice with Driver API
+   (cuDevicePrimaryCtxRetain + cuCtxSetCurrent). Added context deactivation
+   when switching local->remote. Added fallthrough for first-time context init.
+
+2. **cudaDeviceSynchronize** -- Changed from cudaDeviceSynchronize (Runtime)
+   to cuCtxSynchronize (Driver API) to avoid cudart internal driver calls.
+
+3. **cudaStreamCreate** -- Added local device routing using cuStreamCreate.
+
+4. **cudaStreamSynchronize** -- Changed from cudaStreamSynchronize (Runtime)
+   to cuStreamSynchronize (Driver API).
+
+5. **cuStreamCreate/cuStreamSynchronize** -- Added is_local_device routing.
+
+6. **cuCtxSetCurrent/cuCtxGetCurrent/cuCtxSynchronize** -- Fixed reentrance guards
+   to forward to real driver instead of returning CUDA_SUCCESS with no-op.
+
+7. **cuDevicePrimaryCtxRetain/Release** -- Added g_local_ctx tracking + remote
+   device remapping.
+
+8. **init_real_cuda** -- Improved dlopen: realpath() + RTLD_LOCAL. Fixed dangling if.
+
+9. **cudaMalloc** -- Added context activation before cuMemAlloc_v2.
+
+#### Agent 2 (Kernel Launch) -- PARTIALLY APPLIED
+1. **cuGetExportTable** -- Added interception forwarding to real driver.
+   NOT applied: version script, struct offset changes (too risky).
+
+#### Agent 1 (cuBLAS) -- INFRASTRUCTURE ONLY
+1. **g_real_cublas_handle + ensure_real_cublas()** -- Lazy-load infrastructure added.
+   NOT applied: cuBLAS function local routing (causes LD_PRELOAD re-entry).
+
+### Test Results (Lenovo loopback, CHIDORI_LOCAL_DEVICES=0)
+```
+Devices: 2
+cuda:0: [1.0, 2.0, 3.0]         -- local device tensor copy OK
+cuda:1: [4.0, 5.0, 6.0]         -- remote device tensor copy OK
+cuda:0 sync OK                   -- local cuCtxSynchronize OK
+cuda:1 sync OK                   -- remote sync via RPC OK
+cuda:1 matmul err=0.000042       -- remote cuBLAS via RPC OK
+cuda:0 stream created OK         -- local cuStreamCreate OK
+cuda:0 stream sync OK            -- local cuStreamSynchronize OK
+ALL TESTS PASSED
+```
+
+### Known Limitation
+cuBLAS local routing deferred. cuBLAS calls internal CUDA functions that
+re-enter our LD_PRELOAD interceptors. The g_in_real_cuda guard forwards
+most calls, but cuBLAS's initialization handshake fails. Needs either
+RTLD_LOCAL isolation or separate interception-free code path.
