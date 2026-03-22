@@ -892,8 +892,8 @@ CUresult cuDriverGetVersion(int *version) {
 CUresult cuDeviceGetCount(int *count) {
     /* Ensure partial offload is initialized before returning count */
     init_real_cuda();
-    if (g_in_real_cuda > 0 && !g_partial_offload && g_real.cuDeviceGetCount)
-        return g_real.cuDeviceGetCount(count);
+    if (g_in_real_cuda > 0 && g_real.cuDeviceGetCount)
+        return g_real.cuDeviceGetCount(count); /* reentrance: return REAL device count */
     int remote_count = 0;
     size_t len = sizeof(int32_t);
     CUresult r = chidori_rpc(CHIDORI_CU_DEVICE_GET_COUNT, NULL, 0, &remote_count, &len);
