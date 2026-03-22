@@ -62,6 +62,20 @@ Also fixed: cudaDeviceCanAccessPeer (was sending RPC with invalid device nums),
 CUDA event routing (events created on wrong device), cudaStreamWaitEvent (context
 deactivation + remote event handles), cudaEventRecordWithFlags (missing interception).
 
+### MILESTONE: Full Test Suite — Training + Async on Both Devices
+```
+PASS: tensor transfers (CPU<->GPU, GPU<->GPU)
+PASS: cuBLAS matmul (cuda:0 err=0.000042, cuda:1 err=0.000042)
+PASS: kernel launch (randn both devices)
+PASS: element-wise ops (add, mul)
+PASS: training on cuda:0 (losses=[2.36, 2.35, 2.33, 2.31, 2.29])
+PASS: training on cuda:1 (losses=[2.55, 2.53, 2.51, 2.50, 2.48])
+PASS: async mode (no CUDA_LAUNCH_BLOCKING)
+=== ALL PARTIAL OFFLOAD TESTS PASSED ===
+```
+Training confirmed: forward + backward + optimizer step on BOTH devices.
+Losses decrease properly = learning is happening. Async mode works.
+
 ### Kernel Launch FPE Root Cause
 - `maxThreadsPerMultiProcessor` was 0 → FPE (division by zero in RNG config)
 - Our `cudaGetDeviceProperties` wrote attr 39 at WRONG offset (460)
