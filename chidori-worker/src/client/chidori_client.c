@@ -1507,21 +1507,40 @@ CUresult cuStreamSynchronize(CUstream hStream) {
     return chidori_rpc(CHIDORI_CU_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
 }
 
-/* Event */
+/* Event — route to local driver when on local device */
 CUresult cuEventCreate(CUevent *phEvent, unsigned int flags) {
-    if (g_in_real_cuda > 0 && g_real.cuEventCreate) return g_real.cuEventCreate(phEvent, flags); /* reentrance: forward to real driver */
+    if (g_in_real_cuda > 0 && g_real.cuEventCreate) return g_real.cuEventCreate(phEvent, flags);
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventCreate) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventCreate(phEvent, flags);
+        g_in_real_cuda--;
+        return r;
+    }
     size_t len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_EVENT_CREATE, &flags, sizeof(flags), phEvent, &len);
 }
 
 CUresult cuEventDestroy_v2(CUevent hEvent) {
-    if (g_in_real_cuda > 0 && g_real.cuEventDestroy_v2) return g_real.cuEventDestroy_v2(hEvent); /* reentrance: forward to real driver */
+    if (g_in_real_cuda > 0 && g_real.cuEventDestroy_v2) return g_real.cuEventDestroy_v2(hEvent);
+    /* Try local first, then remote — event could be from either */
+    if (g_partial_offload && g_real.cuEventDestroy_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventDestroy_v2(hEvent);
+        g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) return r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc_async(CHIDORI_CU_EVENT_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
-    if (g_in_real_cuda > 0 && g_real.cuEventRecord) return g_real.cuEventRecord(hEvent, hStream); /* reentrance: forward to real driver */
+    if (g_in_real_cuda > 0 && g_real.cuEventRecord) return g_real.cuEventRecord(hEvent, hStream);
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventRecord) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventRecord(hEvent, hStream);
+        g_in_real_cuda--;
+        return r;
+    }
     struct { uint64_t event; uint64_t stream; } req;
     req.event = (uint64_t)(uintptr_t)hEvent;
     req.stream = (uint64_t)(uintptr_t)hStream;
@@ -1529,7 +1548,15 @@ CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
 }
 
 CUresult cuEventSynchronize(CUevent hEvent) {
-    if (g_in_real_cuda > 0 && g_real.cuEventSynchronize) return g_real.cuEventSynchronize(hEvent); /* reentrance: forward to real driver */
+    if (g_in_real_cuda > 0 && g_real.cuEventSynchronize) return g_real.cuEventSynchronize(hEvent);
+    /* Events can be from either device. Try local first (succeeds for local events),
+     * fall back to RPC (for remote events). This handles cross-device event sync. */
+    if (g_partial_offload && g_real.cuEventSynchronize) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventSynchronize(hEvent);
+        g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) return r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc(CHIDORI_CU_EVENT_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
 }
