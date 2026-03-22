@@ -7704,7 +7704,32 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
         memcpy(p, &stride, 8); p += 8;
     }
 
-    /* RPC to server */
+    /* Heuristic cache: same matrix dims → same algorithm.
+     * Eliminates a 50ms sync RPC round-trip per matmul.
+     * PyTorch calls with the same shapes every training step. */
+    #define HEUR_CACHE_SIZE 64
+    static struct {
+        uint8_t key[188];
+        uint8_t result[100]; /* algoCount(4) + heuristicResult(96) */
+        size_t result_len;
+        int valid;
+    } g_heur_cache[HEUR_CACHE_SIZE];
+    static int g_heur_cache_count = 0;
+
+    /* Check cache */
+    for (int i = 0; i < g_heur_cache_count; i++) {
+        if (g_heur_cache[i].valid && memcmp(g_heur_cache[i].key, payload, 188) == 0) {
+            /* Cache hit — skip RPC */
+            int32_t algoCount = 0;
+            memcpy(&algoCount, g_heur_cache[i].result, 4);
+            if (returnAlgoCount) *returnAlgoCount = algoCount;
+            if (algoCount > 0 && heuristicResultsArray && g_heur_cache[i].result_len > 4)
+                memcpy(heuristicResultsArray, g_heur_cache[i].result + 4, g_heur_cache[i].result_len - 4);
+            return CUBLAS_STATUS_SUCCESS;
+        }
+    }
+
+    /* Cache miss — RPC to server */
     uint8_t resp[4 + 96]; /* algoCount(4) + cublasLtMatmulHeuristicResult_t (96) */
     size_t out_len = sizeof(resp);
     cublasStatus_t st = (cublasStatus_t)chidori_rpc(
@@ -7715,6 +7740,15 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     if (returnAlgoCount) *returnAlgoCount = algoCount;
     if (algoCount > 0 && heuristicResultsArray && out_len > 4)
         memcpy(heuristicResultsArray, resp + 4, out_len - 4);
+
+    /* Store in cache */
+    if (st == CUBLAS_STATUS_SUCCESS && g_heur_cache_count < HEUR_CACHE_SIZE) {
+        int idx = g_heur_cache_count++;
+        memcpy(g_heur_cache[idx].key, payload, 188);
+        memcpy(g_heur_cache[idx].result, resp, out_len < 100 ? out_len : 100);
+        g_heur_cache[idx].result_len = out_len;
+        g_heur_cache[idx].valid = 1;
+    }
 
     return st;
 }
