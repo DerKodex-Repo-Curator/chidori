@@ -7020,7 +7020,10 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, uint6
         typedef CUresult (*fn_t)(const char *, void **, int, uint64_t);
         static fn_t real_fn = NULL;
         if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuGetProcAddress");
-        if (real_fn) return real_fn(symbol, pfn, cudaVersion, flags);
+        if (real_fn) {
+            fprintf(stderr, "[chidori-diag] cuGetProcAddress('%s') → REAL (g_in_real_cuda=%d)\n", symbol, g_in_real_cuda);
+            return real_fn(symbol, pfn, cudaVersion, flags);
+        }
     }
 
     /* Return OUR intercepted functions for ALL modes (including partial offload).
