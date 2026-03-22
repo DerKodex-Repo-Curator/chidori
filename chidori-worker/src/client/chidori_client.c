@@ -3128,9 +3128,10 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    /* DIAGNOSTIC: file marker + abort to prove function is called */
+    /* DIAGNOSTIC: abort to prove function is called */
     { int _fd = open("/tmp/chidori_gemmex_called", O_CREAT|O_WRONLY, 0644); if (_fd >= 0) close(_fd); }
     write(STDERR_FILENO, "!!! cublasGemmEx CALLED !!!\n", 28);
+    abort(); /* CRASH: if we see SIGABRT, our function was called */
     /* Keep the detailed trace too */
     {
         char _buf[200];
