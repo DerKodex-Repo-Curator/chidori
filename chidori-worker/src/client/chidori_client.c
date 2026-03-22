@@ -3077,8 +3077,14 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    fprintf(stderr, "[chidori] cublasGemmEx ENTERED m=%d n=%d k=%d Atype=%d compute=%d dev=%d\n",
+    /* Use raw write() to bypass any fprintf buffering issues */
+    {
+        char _buf[200];
+        int _len = snprintf(_buf, sizeof(_buf),
+            "[chidori] cublasGemmEx ENTERED m=%d n=%d k=%d Atype=%d compute=%d dev=%d\n",
             m, n, k, Atype, computeType, g_current_device);
+        if (_len > 0) write(STDERR_FILENO, _buf, _len);
+    }
 
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
