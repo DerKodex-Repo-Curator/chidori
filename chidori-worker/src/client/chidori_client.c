@@ -310,7 +310,12 @@ static void init_real_cuda(void) {
             return;
         }
     }
-    /* Enable dlopen interception: cuBLAS's dlopen("libcuda.so.1") returns real driver */
+    /* Enable dlopen interception: cuBLAS's dlopen("libcuda.so.1") returns real driver.
+     * Also permanently enable the redirect — ALL dlopen("libcuda.so.1") calls after
+     * init will get the real driver. This is safe because our LD_PRELOAD'd symbols
+     * still intercept PLT calls, and cuGetProcAddress returns our functions for routing.
+     * Libraries that use dlsym on the real driver handle get real driver functions,
+     * which is correct for local device operations. */
     g_real_cuda_handle_for_dlopen = g_real_cuda_handle;
 
     /* For cudart: use RTLD_NEXT since we don't replace libcudart */
@@ -2834,9 +2839,12 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
         if (!real_fn) { void *h = ensure_real_cublas(); if (h) real_fn = (fn_t)dlsym(h, "cublasGemmEx"); }
         cublasHandle_t local_h = ensure_local_cublas_handle();
         if (real_fn && local_h) {
+            g_dlopen_redirect_active = 1;
             g_in_real_cuda++;
             cublasStatus_t r = real_fn(local_h, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc, computeType, algo);
             g_in_real_cuda--;
+            g_dlopen_redirect_active = 0;
+            if (r != 0) fprintf(stderr, "[chidori] cublasGemmEx LOCAL failed: %d (Atype=%d Ctype=%d compute=%d)\n", r, Atype, Ctype, computeType);
             return r;
         }
     }
