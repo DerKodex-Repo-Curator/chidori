@@ -359,6 +359,38 @@ static struct {
 } g_pending_funcs[MAX_PENDING_FUNCS];
 static int g_pending_func_count = 0;
 
+/* Event-to-device tracker: records which device each CUDA event was created on.
+ * During cross-device backward, PyTorch creates events on one device and
+ * destroys/records/synchronizes them from a different device context.
+ * Without tracking, remote event handles get passed to the local CUDA driver → SIGSEGV. */
+#define MAX_EVENT_TRACK 4096
+static struct { uintptr_t handle; int device; } g_event_track[MAX_EVENT_TRACK];
+static int g_event_track_count = 0;
+
+static void event_track_add(uintptr_t handle, int device) {
+    if (g_event_track_count < MAX_EVENT_TRACK) {
+        g_event_track[g_event_track_count].handle = handle;
+        g_event_track[g_event_track_count].device = device;
+        g_event_track_count++;
+    }
+}
+
+static int event_track_device(uintptr_t handle) {
+    for (int i = g_event_track_count - 1; i >= 0; i--) {
+        if (g_event_track[i].handle == handle) return g_event_track[i].device;
+    }
+    return -1; /* unknown — assume current device */
+}
+
+static void event_track_remove(uintptr_t handle) {
+    for (int i = g_event_track_count - 1; i >= 0; i--) {
+        if (g_event_track[i].handle == handle) {
+            g_event_track[i] = g_event_track[--g_event_track_count];
+            return;
+        }
+    }
+}
+
 /* Pointer-to-device tracker for cuPointerGetAttribute cross-device queries */
 #define MAX_ALLOC_TRACK 16384
 static struct { uintptr_t ptr; size_t size; int device; } g_alloc_track[MAX_ALLOC_TRACK];
@@ -1801,28 +1833,45 @@ CUresult cuEventCreate(CUevent *phEvent, unsigned int flags) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventCreate(phEvent, flags);
         g_in_real_cuda--;
+        if (r == CUDA_SUCCESS && phEvent) event_track_add((uintptr_t)*phEvent, g_current_device);
         return r;
     }
     size_t len = sizeof(uint64_t);
-    return chidori_rpc(CHIDORI_CU_EVENT_CREATE, &flags, sizeof(flags), phEvent, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_EVENT_CREATE, &flags, sizeof(flags), phEvent, &len);
+    if (r == CUDA_SUCCESS && phEvent) event_track_add((uintptr_t)*phEvent, g_current_device);
+    return r;
 }
 
 CUresult cuEventDestroy_v2(CUevent hEvent) {
     if (g_in_real_cuda > 0 && g_real.cuEventDestroy_v2) return g_real.cuEventDestroy_v2(hEvent);
-    /* Try local first, then remote — event could be from either */
-    if (g_partial_offload && g_real.cuEventDestroy_v2) {
+    /* Route by the device the event was CREATED on, not g_current_device.
+     * During cross-device backward, PyTorch destroys events from a different
+     * device context than they were created in. Passing a remote wire handle
+     * to the real local driver causes SIGSEGV. */
+    int ev_dev = event_track_device((uintptr_t)hEvent);
+    if (g_partial_offload && ev_dev >= 0 && is_local_device(ev_dev) && g_real.cuEventDestroy_v2) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventDestroy_v2(hEvent);
         g_in_real_cuda--;
-        if (r == CUDA_SUCCESS) return r;
+        event_track_remove((uintptr_t)hEvent);
+        return r;
     }
+    event_track_remove((uintptr_t)hEvent);
     uint64_t handle = (uint64_t)(uintptr_t)hEvent;
     return chidori_rpc_async(CHIDORI_CU_EVENT_DESTROY, &handle, sizeof(handle));
 }
 
 CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
     if (g_in_real_cuda > 0 && g_real.cuEventRecord) return g_real.cuEventRecord(hEvent, hStream);
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventRecord) {
+    /* Route by the event's device, not g_current_device */
+    int ev_dev = event_track_device((uintptr_t)hEvent);
+    if (g_partial_offload && ev_dev >= 0 && is_local_device(ev_dev) && g_real.cuEventRecord) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventRecord(hEvent, hStream);
+        g_in_real_cuda--;
+        return r;
+    }
+    if (g_partial_offload && is_local_device(g_current_device) && ev_dev < 0 && g_real.cuEventRecord) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventRecord(hEvent, hStream);
         g_in_real_cuda--;
@@ -2501,20 +2550,32 @@ cudaError_t cudaEventCreate(void **pEvent) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventCreate((CUevent *)pEvent, 0x02 /* CU_EVENT_DISABLE_TIMING */);
         g_in_real_cuda--;
+        if (r == CUDA_SUCCESS && pEvent && *pEvent) event_track_add((uintptr_t)*pEvent, g_current_device);
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
     uint64_t handle = 0;
     size_t len = sizeof(uint64_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_EVENT_CREATE, NULL, 0, &handle, &len);
-    if (r == cudaSuccess)
+    if (r == cudaSuccess) {
         *pEvent = (void *)(uintptr_t)handle;
+        event_track_add(handle, g_current_device);
+    }
     g_last_error = r;
     return r;
 }
 
 cudaError_t cudaEventRecord(void *event, void *stream) {
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventRecord) {
+    /* Route by event's device, not g_current_device */
+    int ev_dev = event_track_device((uintptr_t)event);
+    if (g_partial_offload && ev_dev >= 0 && is_local_device(ev_dev) && g_real.cuEventRecord) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventRecord((CUevent)event, (CUstream)stream);
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
+    if (g_partial_offload && is_local_device(g_current_device) && ev_dev < 0 && g_real.cuEventRecord) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventRecord((CUevent)event, (CUstream)stream);
         g_in_real_cuda--;
@@ -2536,7 +2597,16 @@ cudaError_t cudaEventRecordWithFlags(void *event, void *stream, unsigned int fla
 }
 
 cudaError_t cudaEventSynchronize(void *event) {
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventSynchronize) {
+    /* Route by event's device, not g_current_device */
+    int ev_dev = event_track_device((uintptr_t)event);
+    if (g_partial_offload && ev_dev >= 0 && is_local_device(ev_dev) && g_real.cuEventSynchronize) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuEventSynchronize((CUevent)event);
+        g_in_real_cuda--;
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
+    }
+    if (g_partial_offload && is_local_device(g_current_device) && ev_dev < 0 && g_real.cuEventSynchronize) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventSynchronize((CUevent)event);
         g_in_real_cuda--;
@@ -2550,13 +2620,17 @@ cudaError_t cudaEventSynchronize(void *event) {
 }
 
 cudaError_t cudaEventDestroy(void *event) {
-    /* For simplicity, try local first then RPC — event might have been created on either */
-    if (g_partial_offload && g_real.cuEventDestroy_v2) {
+    /* Route by the device the event was CREATED on.
+     * During cross-device backward, remote event handles must NOT be
+     * passed to the local CUDA driver — that causes SIGSEGV. */
+    int ev_dev = event_track_device((uintptr_t)event);
+    if (g_partial_offload && ev_dev >= 0 && is_local_device(ev_dev) && g_real.cuEventDestroy_v2) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventDestroy_v2((CUevent)event);
         g_in_real_cuda--;
-        if (r == CUDA_SUCCESS) { g_last_error = cudaSuccess; return cudaSuccess; }
-        /* If local destroy failed, try RPC (event might be remote) */
+        event_track_remove((uintptr_t)event);
+        g_last_error = (cudaError_t)r;
+        return (cudaError_t)r;
     }
     uint64_t handle = (uint64_t)(uintptr_t)event;
     cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_EVENT_DESTROY, &handle, sizeof(handle));
@@ -5435,10 +5509,11 @@ cudaError_t cudaEventCreateWithFlags(void **pEvent, unsigned int flags) {
         g_in_real_cuda++;
         CUresult r = g_real.cuEventCreate((CUevent *)pEvent, flags);
         g_in_real_cuda--;
+        if (r == CUDA_SUCCESS && pEvent && *pEvent) event_track_add((uintptr_t)*pEvent, g_current_device);
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
-    return cudaEventCreate(pEvent);
+    return cudaEventCreate(pEvent); /* cudaEventCreate already tracks */
 }
 
 cudaError_t cudaEventElapsedTime(float *ms, void *start, void *end) {
