@@ -5818,87 +5818,8 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                 blockDim.x, blockDim.y, blockDim.z,
                 num_params, total_ps);
 
-    /* NOTE: Host pointer fixup was attempted here but caused regressions.
-     * The proper fix for cross-device kernel parameter pointer translation
-     * needs to be done at a higher level (cross-device memcpy routing).
-     * See project memory for the rCUDA research on how to solve this.
-     * (the GPU can access host memory). On a remote GPU, we need to copy the
-     * pointed-to data into remote device memory and patch the pointer.
-     *
-     * Typical case: PyTorch passes OffsetCalculator/stride metadata as host
-     * pointers embedded in kernel functor parameters. */
-    #define MAX_HOST_PTR_FIXUPS 4
-    uint64_t fixup_dev_ptrs[MAX_HOST_PTR_FIXUPS];
-    int fixup_count = 0;
-    if (param_buf && total_ps >= 8 && !is_local_device(g_current_device)) {
-        for (int off = 0; off + 8 <= total_ps; off += 8) {
-            uint64_t val = 0;
-            memcpy(&val, param_buf + off, 8);
-            /* Detect host pointers: any plausible address that is NOT in the
-             * known remote GPU address range. GPU addresses cluster in a specific
-             * region (e.g., 0x7d4c...). Anything outside that range but still
-             * looking like a valid address is likely host memory (UVA-accessible
-             * on local GPU but inaccessible on remote GPU). */
-            int is_host_ptr = 0;
-            if (val >= 0x10000000000ULL && val < 0x800000000000ULL) {
-                /* Looks like a valid 48-bit userspace address */
-                if (g_remote_gpu_addr_min < g_remote_gpu_addr_max) {
-                    /* We have a known GPU range — check if val is outside it.
-                     * Allow some margin (GPU allocations cluster together). */
-                    uint64_t gpu_base = g_remote_gpu_addr_min & ~0xFFFFFFFFULL; /* align to 4GB */
-                    uint64_t gpu_top = (g_remote_gpu_addr_max + 0xFFFFFFFFULL) & ~0xFFFFFFFFULL;
-                    if (val < gpu_base || val >= gpu_top)
-                        is_host_ptr = 1;
-                } else {
-                    /* No GPU range known yet — use heuristic (PIE heap range) */
-                    if (val < 0x600000000000ULL)
-                        is_host_ptr = 1;
-                }
-            }
-            if (is_host_ptr) {
-                /* Verify the address is actually readable before treating it as a pointer.
-                 * Use msync() — returns 0 if the page is mapped, -1 with ENOMEM if not. */
-                void *page = (void *)((uintptr_t)val & ~4095ULL);
-                if (msync(page, 4096, MS_ASYNC) != 0) {
-                    /* Not a real pointer — likely a float/int value that looks like an address */
-                    continue;
-                }
-                /* Copy 256 bytes from host pointer to remote device memory.
-                 * OffsetCalculator and similar metadata structs are typically < 128 bytes. */
-                size_t copy_size = 256;
-                /* Check if we might cross a page boundary into unmapped memory */
-                size_t page_remaining = 4096 - ((uintptr_t)val & 4095);
-                if (copy_size > page_remaining) {
-                    /* Check if next page is also mapped */
-                    void *next_page = (void *)((uintptr_t)page + 4096);
-                    if (msync(next_page, 4096, MS_ASYNC) != 0)
-                        copy_size = page_remaining;
-                }
-                void *dev_ptr = NULL;
-                /* cudaMalloc on the current (remote) device */
-                cudaError_t merr = cudaMalloc(&dev_ptr, copy_size);
-                if (merr == cudaSuccess && dev_ptr) {
-                    /* Copy host data to remote device */
-                    cudaError_t cerr = cudaMemcpy(dev_ptr, (void *)(uintptr_t)val, copy_size, cudaMemcpyHostToDevice);
-                    if (cerr == cudaSuccess) {
-                        uint64_t dev_val = (uint64_t)(uintptr_t)dev_ptr;
-                        memcpy(param_buf + off, &dev_val, 8);
-                        if (fixup_count < MAX_HOST_PTR_FIXUPS)
-                            fixup_dev_ptrs[fixup_count++] = dev_val;
-                        fprintf(stderr, "[chidori-launch] HOST_PTR fixup: param[%d] 0x%llx -> 0x%llx (%zu bytes)\n",
-                                off, (unsigned long long)val, (unsigned long long)dev_val, copy_size);
-                    } else {
-                        fprintf(stderr, "[chidori-launch] HOST_PTR fixup FAILED memcpy: param[%d] 0x%llx err=%d\n",
-                                off, (unsigned long long)val, (int)cerr);
-                        cudaFree(dev_ptr);
-                    }
-                } else {
-                    fprintf(stderr, "[chidori-launch] HOST_PTR fixup FAILED malloc: param[%d] 0x%llx err=%d\n",
-                            off, (unsigned long long)val, (int)merr);
-                }
-            }
-        }
-    }
+    /* TODO: Host pointer fixup for cross-device kernel params needs rCUDA-style
+     * pointer translation. See project memory for research findings. */
 
     size_t payload_len = 44 + 1;
     if (total_ps > 0)
