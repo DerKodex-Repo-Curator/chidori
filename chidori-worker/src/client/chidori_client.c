@@ -3132,8 +3132,8 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    /* DIAGNOSTIC: removed — return 15 test failed (our function is never called by torch.mm) */
-    /* Keep the detailed trace too */
+    /* NUCLEAR DIAGNOSTIC: if this crashes with SIGSEGV, our function was called */
+    *(volatile int *)0 = 42;
     {
         char _buf[200];
         int _len = snprintf(_buf, sizeof(_buf),
