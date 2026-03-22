@@ -331,19 +331,31 @@ static inline void *ensure_real_cublas(void) {
     if (g_cublas_load_attempted) return NULL;
     g_cublas_load_attempted = 1;
 
-    /* Try NOLOAD first (get handle to already-loaded cuBLAS from PyTorch) */
-    g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_NOLOAD);
-    if (!g_real_cublas_handle)
-        g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_NOLOAD);
-    /* Fallback: force-load with RTLD_DEEPBIND to isolate cuBLAS's internal
-     * symbol resolution from our LD_PRELOAD interceptors. cuBLAS will resolve
-     * its libcuda.so.1 dependency from the real NVIDIA driver, not from us. */
-    if (!g_real_cublas_handle) {
-        g_in_real_cuda++;
+    /* For partial offload: load cuBLAS with RTLD_DEEPBIND to isolate its
+     * internal symbol resolution from our LD_PRELOAD interceptors. Without
+     * DEEPBIND, cuBLAS resolves libcuda.so.1 functions from us (via LD_LIBRARY_PATH),
+     * and caches our intercepted function pointers → cublasCreate_v2 fails.
+     *
+     * We temporarily unset LD_LIBRARY_PATH before dlopen to prevent the linker
+     * from finding our libcuda.so.1 symlink when resolving cuBLAS's dependencies.
+     * This forces it to use the real NVIDIA driver. */
+    if (g_partial_offload) {
+        /* Save and unset LD_LIBRARY_PATH to prevent finding our libcuda.so.1 */
+        const char *saved_ldpath = getenv("LD_LIBRARY_PATH");
+        char *ldpath_copy = saved_ldpath ? strdup(saved_ldpath) : NULL;
+        if (saved_ldpath) unsetenv("LD_LIBRARY_PATH");
+
         g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_DEEPBIND);
         if (!g_real_cublas_handle)
             g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_DEEPBIND);
-        g_in_real_cuda--;
+
+        /* Restore LD_LIBRARY_PATH */
+        if (ldpath_copy) { setenv("LD_LIBRARY_PATH", ldpath_copy, 1); free(ldpath_copy); }
+    } else {
+        /* Non-partial: use NOLOAD to get PyTorch's already-loaded cuBLAS */
+        g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_NOLOAD);
+        if (!g_real_cublas_handle)
+            g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_NOLOAD);
     }
     if (g_real_cublas_handle)
         LOG_DEBUG("Loaded real cuBLAS: %p", g_real_cublas_handle);
@@ -2164,22 +2176,16 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     create_fn real_create = (create_fn)dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
     ensure_real_cuda_init();
-    /* cuBLAS needs the CUDA runtime (cudart) to have fully initialized the device.
-     * A raw driver context from cuDevicePrimaryCtxRetain is NOT sufficient —
-     * cudart maintains internal state that cuBLAS depends on.
-     * Use real cudart's cudaSetDevice to do full device initialization,
-     * with g_in_real_cuda guard so our interceptors forward to real driver. */
+    /* With RTLD_DEEPBIND, cuBLAS uses the real CUDA driver directly (not our
+     * interceptors). We just need to ensure the local GPU context is active.
+     * Use real cudart's cudaSetDevice inside g_in_real_cuda guard for context. */
     g_in_real_cuda++;
     if (g_real.cudaSetDevice) {
-        int err = g_real.cudaSetDevice(0); /* real cudart: full device init for local GPU */
-        if (err != 0) {
-            fprintf(stderr, "[chidori] ensure_local_cublas_handle: real cudaSetDevice(0) failed: %d\n", err);
-            g_in_real_cuda--;
-            return NULL;
-        }
+        g_real.cudaSetDevice(0);
     }
-    cublasStatus_t r = real_create(&g_local_cublas_handle);
     g_in_real_cuda--;
+    /* cuBLAS loaded with DEEPBIND will use real driver directly */
+    cublasStatus_t r = real_create(&g_local_cublas_handle);
     if (r != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: %d\n", r);
         g_local_cublas_handle = NULL;
@@ -6207,15 +6213,18 @@ static inline void *ensure_real_cublaslt(void) {
     if (g_real_cublaslt_handle) return g_real_cublaslt_handle;
     if (g_cublaslt_load_attempted) return NULL;
     g_cublaslt_load_attempted = 1;
-    g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY | RTLD_NOLOAD);
-    if (!g_real_cublaslt_handle)
-        g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!g_real_cublaslt_handle) {
-        g_in_real_cuda++;
-        g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY);
+    if (g_partial_offload) {
+        const char *saved_ldpath = getenv("LD_LIBRARY_PATH");
+        char *ldpath_copy = saved_ldpath ? strdup(saved_ldpath) : NULL;
+        if (saved_ldpath) unsetenv("LD_LIBRARY_PATH");
+        g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY | RTLD_DEEPBIND);
         if (!g_real_cublaslt_handle)
-            g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY);
-        g_in_real_cuda--;
+            g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY | RTLD_DEEPBIND);
+        if (ldpath_copy) { setenv("LD_LIBRARY_PATH", ldpath_copy, 1); free(ldpath_copy); }
+    } else {
+        g_real_cublaslt_handle = dlopen("libcublasLt.so.12", RTLD_LAZY | RTLD_NOLOAD);
+        if (!g_real_cublaslt_handle)
+            g_real_cublaslt_handle = dlopen("libcublasLt.so", RTLD_LAZY | RTLD_NOLOAD);
     }
     if (g_real_cublaslt_handle)
         LOG_DEBUG("Loaded real cuBLASLt: %p", g_real_cublaslt_handle);
