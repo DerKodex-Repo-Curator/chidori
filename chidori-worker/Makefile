@@ -8,7 +8,7 @@
 #   make clean     - Remove build artifacts
 
 CC ?= gcc
-CFLAGS = -Wall -Wextra -O2 -fPIC -I include
+CFLAGS = -D_GNU_SOURCE -Wall -Wextra -O2 -fPIC -I include
 
 CUDA_PATH ?= /usr/local/cuda
 CUDA_CFLAGS = -I$(CUDA_PATH)/include
