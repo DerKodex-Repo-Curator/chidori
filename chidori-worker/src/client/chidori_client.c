@@ -1669,10 +1669,27 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    memset(prop, 0, 1008); /* sizeof(cudaDeviceProp) — CUDA 12.x ~896, 13.x ~1008 */
+    memset(prop, 0, 1008);
 
     char *p = (char *)prop;
     int val;
+
+    /* Offset diagnostic mode */
+    static int g_offset_diag_early = -1;
+    if (g_offset_diag_early == -1) {
+        const char *d = getenv("CHIDORI_OFFSET_DIAG");
+        g_offset_diag_early = (d && d[0] == '1') ? 1 : 0;
+    }
+    if (g_offset_diag_early) {
+        /* Fill EVERY 4-byte slot with its offset — then the macros overwrite specific slots */
+        for (int _i = 256; _i < 1008; _i += 4) {
+            int _ov = _i; memcpy(p + _i, &_ov, 4);
+        }
+        /* Return immediately — don't overwrite with real values */
+        cuDeviceGetName(p, 256, device);
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
 
     /* name: use cuDeviceGetName (routes to local or remote) */
     cuDeviceGetName(p, 256, device);
