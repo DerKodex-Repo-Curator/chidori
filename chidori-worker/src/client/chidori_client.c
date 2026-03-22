@@ -151,6 +151,36 @@ static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set *
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
 static int g_current_device = 0;         /* current active device (global) */
+
+/* Pointer-to-device tracker for cuPointerGetAttribute cross-device queries */
+#define MAX_ALLOC_TRACK 16384
+static struct { uintptr_t ptr; size_t size; int device; } g_alloc_track[MAX_ALLOC_TRACK];
+static int g_alloc_track_count = 0;
+static pthread_mutex_t g_alloc_track_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void alloc_track_add(uintptr_t ptr, size_t size, int device) {
+    pthread_mutex_lock(&g_alloc_track_lock);
+    if (g_alloc_track_count < MAX_ALLOC_TRACK) {
+        g_alloc_track[g_alloc_track_count].ptr = ptr;
+        g_alloc_track[g_alloc_track_count].size = size;
+        g_alloc_track[g_alloc_track_count].device = device;
+        g_alloc_track_count++;
+    }
+    pthread_mutex_unlock(&g_alloc_track_lock);
+}
+
+static int alloc_track_device(uintptr_t ptr) {
+    pthread_mutex_lock(&g_alloc_track_lock);
+    for (int i = g_alloc_track_count - 1; i >= 0; i--) {
+        if (ptr >= g_alloc_track[i].ptr &&
+            ptr < g_alloc_track[i].ptr + g_alloc_track[i].size) {
+            pthread_mutex_unlock(&g_alloc_track_lock);
+            return g_alloc_track[i].device;
+        }
+    }
+    pthread_mutex_unlock(&g_alloc_track_lock);
+    return -1; /* unknown */
+}
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
 static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real CUDA call, forward to real driver */
@@ -1821,6 +1851,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
         CUresult r = g_real.cuMemAlloc_v2(&dptr, size);
         g_in_real_cuda--;
         if (devPtr) *devPtr = (void *)(uintptr_t)dptr;
+        if (r == CUDA_SUCCESS && dptr) alloc_track_add(dptr, size, g_current_device);
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
@@ -1828,8 +1859,10 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
     uint64_t ptr64 = 0;
     size_t len = sizeof(uint64_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MALLOC, &size64, sizeof(size64), &ptr64, &len);
-    if (r == cudaSuccess)
+    if (r == cudaSuccess) {
         *devPtr = (void *)(uintptr_t)ptr64;
+        alloc_track_add(ptr64, size, g_current_device);
+    }
     g_last_error = r;
     return r;
 }
@@ -5775,11 +5808,30 @@ CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes,
 /* ---- Pointer Attributes (Driver API) ---- */
 
 CUresult cuPointerGetAttribute(void *data, int attribute, CUdeviceptr ptr) {
-    (void)ptr;
-    if (data) memset(data, 0, 8);
-    if (attribute == 2 /* CU_POINTER_ATTRIBUTE_MEMORY_TYPE */) {
-        int type = 2; /* CU_MEMORYTYPE_DEVICE */
-        memcpy(data, &type, sizeof(int));
+    if (!data) return CUDA_ERROR_INVALID_VALUE;
+    memset(data, 0, 8);
+
+    int dev = alloc_track_device((uintptr_t)ptr);
+    if (dev < 0) dev = g_current_device; /* fallback: assume current device */
+
+    switch (attribute) {
+    case 1: /* CU_POINTER_ATTRIBUTE_CONTEXT */
+        /* Return local context for local device, NULL for remote */
+        if (is_local_device(dev)) {
+            memcpy(data, &g_local_ctx, sizeof(void*));
+        }
+        break;
+    case 2: /* CU_POINTER_ATTRIBUTE_MEMORY_TYPE */
+        { int type = 2; /* CU_MEMORYTYPE_DEVICE */ memcpy(data, &type, sizeof(int)); }
+        break;
+    case 3: /* CU_POINTER_ATTRIBUTE_DEVICE_POINTER */
+        { CUdeviceptr dp = ptr; memcpy(data, &dp, sizeof(CUdeviceptr)); }
+        break;
+    case 8: /* CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL */
+        memcpy(data, &dev, sizeof(int));
+        break;
+    default:
+        break;
     }
     return CUDA_SUCCESS;
 }
