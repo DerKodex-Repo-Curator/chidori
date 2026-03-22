@@ -1396,6 +1396,18 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
     /* Reentrance guard: if inside a real CUDA call, forward to real driver */
     if (g_in_real_cuda > 0 && g_real.cuMemAlloc_v2)
         return g_real.cuMemAlloc_v2(dptr, bytesize);
+    /* Local device: allocate on real local GPU.
+     * Critical for cuBLAS FP16 — when real cuBLAS is called directly
+     * (bypassing our wrapper), it allocates workspace via this function
+     * with g_in_real_cuda=0. Without this routing, workspace goes to
+     * the remote server and cuBLAS gets ALLOC_FAILED. */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemAlloc_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuMemAlloc_v2(dptr, bytesize);
+        g_in_real_cuda--;
+        if (r == CUDA_SUCCESS) alloc_track_add((uintptr_t)*dptr, bytesize, g_current_device);
+        return r;
+    }
     uint64_t size = (uint64_t)bytesize;
     size_t len = sizeof(uint64_t);
     return chidori_rpc(CHIDORI_CU_MEM_ALLOC, &size, sizeof(size), dptr, &len);
@@ -1404,12 +1416,26 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
 CUresult cuMemFree_v2(CUdeviceptr dptr) {
     if (g_in_real_cuda > 0 && g_real.cuMemFree_v2)
         return g_real.cuMemFree_v2(dptr);
+    /* Local device: free on real local GPU */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemFree_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuMemFree_v2(dptr);
+        g_in_real_cuda--;
+        return r;
+    }
     uint64_t ptr = (uint64_t)dptr;
     return chidori_rpc_async(CHIDORI_CU_MEM_FREE, &ptr, sizeof(ptr));
 }
 
 CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byteCount) {
     if (g_in_real_cuda > 0 && g_real.cuMemcpyHtoD_v2) return g_real.cuMemcpyHtoD_v2(dstDevice, srcHost, byteCount); /* reentrance guard */
+    /* Local device: copy to real local GPU */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemcpyHtoD_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuMemcpyHtoD_v2(dstDevice, srcHost, byteCount);
+        g_in_real_cuda--;
+        return r;
+    }
     /* Payload: dst_ptr(8) + size(8) + data(byteCount) */
     size_t payload_len = 16 + byteCount;
     void *payload = malloc(payload_len);
@@ -1427,6 +1453,13 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byte
 
 CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t byteCount) {
     if (g_in_real_cuda > 0 && g_real.cuMemcpyDtoH_v2) return g_real.cuMemcpyDtoH_v2(dstHost, srcDevice, byteCount); /* reentrance guard */
+    /* Local device: copy from real local GPU */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemcpyDtoH_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuMemcpyDtoH_v2(dstHost, srcDevice, byteCount);
+        g_in_real_cuda--;
+        return r;
+    }
     /* Payload: src_ptr(8) + size(8) */
     struct { uint64_t src; uint64_t size; } req;
     req.src = (uint64_t)srcDevice;
@@ -1438,6 +1471,13 @@ CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t byteCount)
 
 CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t byteCount) {
     if (g_in_real_cuda > 0 && g_real.cuMemcpyDtoD_v2) return g_real.cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount); /* reentrance: forward to real driver */
+    /* Local device: copy within real local GPU */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemcpyDtoD_v2) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
+        g_in_real_cuda--;
+        return r;
+    }
     struct { uint64_t dst; uint64_t src; uint64_t size; } req;
     req.dst = (uint64_t)dstDevice;
     req.src = (uint64_t)srcDevice;
