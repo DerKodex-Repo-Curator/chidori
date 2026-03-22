@@ -6937,10 +6937,21 @@ size_t cublasLtGetCudartVersion(void) {
     /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
     if (g_in_real_cuda > 0) {
         void *h = ensure_real_cublaslt();
+        fprintf(stderr, "[chidori-diag] cublasLtGetCudartVersion: g_in_real_cuda=%d, cublaslt_handle=%p\n",
+                g_in_real_cuda, h);
         if (h) {
             typedef size_t (*fn_t)(void);
             fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetCudartVersion");
-            if (real_fn) return real_fn();
+            /* Check if dlsym returned our own function (would be circular!) */
+            extern size_t cublasLtGetCudartVersion(void);
+            fprintf(stderr, "[chidori-diag] cublasLtGetCudartVersion: real_fn=%p, ours=%p, same=%d\n",
+                    (void*)(uintptr_t)real_fn, (void*)(uintptr_t)&cublasLtGetCudartVersion,
+                    real_fn == &cublasLtGetCudartVersion);
+            if (real_fn && real_fn != &cublasLtGetCudartVersion) {
+                size_t ver = real_fn();
+                fprintf(stderr, "[chidori-diag] real cublasLtGetCudartVersion returned: %zu\n", ver);
+                return ver;
+            }
         }
     }
     return 12040;
