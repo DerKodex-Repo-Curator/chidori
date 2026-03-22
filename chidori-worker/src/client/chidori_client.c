@@ -2813,6 +2813,10 @@ cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, CUstream *stream) {
 }
 
 cublasStatus_t cublasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
+    /* DIAG: return unique error to see if this function is called before FP16 */
+    if (g_partial_offload && is_local_device(g_current_device) && mode != 0) {
+        write(STDERR_FILENO, "[DIAG] cublasSetMathMode CALLED for local FP16!\n", 48);
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasHandle_t, cublasMath_t);
@@ -3128,8 +3132,7 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    /* DIAGNOSTIC: return unique error code 15 (CUBLAS_STATUS_NOT_SUPPORTED) */
-    return (cublasStatus_t)15;
+    /* DIAGNOSTIC: removed — return 15 test failed (our function is never called by torch.mm) */
     /* Keep the detailed trace too */
     {
         char _buf[200];
