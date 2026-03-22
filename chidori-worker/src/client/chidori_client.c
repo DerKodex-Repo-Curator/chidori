@@ -331,15 +331,18 @@ static inline void *ensure_real_cublas(void) {
     if (g_cublas_load_attempted) return NULL;
     g_cublas_load_attempted = 1;
 
+    /* Try NOLOAD first (get handle to already-loaded cuBLAS from PyTorch) */
     g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_NOLOAD);
     if (!g_real_cublas_handle)
         g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_NOLOAD);
-    /* Fallback: force-load if not yet loaded (shouldn't happen in practice) */
+    /* Fallback: force-load with RTLD_DEEPBIND to isolate cuBLAS's internal
+     * symbol resolution from our LD_PRELOAD interceptors. cuBLAS will resolve
+     * its libcuda.so.1 dependency from the real NVIDIA driver, not from us. */
     if (!g_real_cublas_handle) {
         g_in_real_cuda++;
-        g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY);
+        g_real_cublas_handle = dlopen("libcublas.so.12", RTLD_LAZY | RTLD_DEEPBIND);
         if (!g_real_cublas_handle)
-            g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY);
+            g_real_cublas_handle = dlopen("libcublas.so", RTLD_LAZY | RTLD_DEEPBIND);
         g_in_real_cuda--;
     }
     if (g_real_cublas_handle)
@@ -6243,6 +6246,15 @@ static cublasLtHandle_t ensure_local_cublaslt_handle(void) {
 
 static int g_lt_handle_storage;
 cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtCreate");
+            if (real_fn) return real_fn(lightHandle);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         cublasLtHandle_t local_h = ensure_local_cublaslt_handle();
@@ -6256,6 +6268,15 @@ cublasStatus_t cublasLtCreate(cublasLtHandle_t *lightHandle) {
 }
 
 cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtDestroy");
+            if (real_fn) return real_fn(lightHandle);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         /* Don't actually destroy — we reuse the local handle */
@@ -6314,6 +6335,15 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     const void *beta, const void *C, void *Cdesc,
     void *D, void *Ddesc, const void *algo,
     void *workspace, size_t workspaceSizeInBytes, void *stream) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, const void *, const void *, void *, const void *, void *, const void *, const void *, void *, void *, void *, const void *, void *, size_t, void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmul");
+            if (real_fn) return real_fn(lightHandle, computeDesc, alpha, A, Adesc, B, Bdesc, beta, C, Cdesc, D, Ddesc, algo, workspace, workspaceSizeInBytes, stream);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, const void *, const void *, void *, const void *, void *, const void *, const void *, void *, void *, void *, const void *, void *, size_t, void *);
@@ -6398,6 +6428,15 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
 }
 
 cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int scaleType) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void **, int, int);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescCreate");
+            if (real_fn) return real_fn(matmulDesc, computeType, scaleType);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void **, int, int);
@@ -6420,6 +6459,15 @@ cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int 
 }
 
 cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescDestroy");
+            if (real_fn) return real_fn(matmulDesc);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *);
@@ -6438,6 +6486,15 @@ cublasStatus_t cublasLtMatmulDescDestroy(void *matmulDesc) {
 
 cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
                                                 const void *buf, size_t sizeInBytes) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescSetAttribute");
+            if (real_fn) return real_fn(matmulDesc, attr, buf, sizeInBytes);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
@@ -6462,6 +6519,15 @@ cublasStatus_t cublasLtMatmulDescSetAttribute(void *matmulDesc, int attr,
 cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
                                                 void *buf, size_t sizeInBytes,
                                                 size_t *sizeWritten) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulDescGetAttribute");
+            if (real_fn) return real_fn(matmulDesc, attr, buf, sizeInBytes, sizeWritten);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
@@ -6486,6 +6552,15 @@ cublasStatus_t cublasLtMatmulDescGetAttribute(void *matmulDesc, int attr,
 
 cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
                                             uint64_t rows, uint64_t cols, int64_t ld) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void **, int, uint64_t, uint64_t, int64_t);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutCreate");
+            if (real_fn) return real_fn(matLayout, type, rows, cols, ld);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void **, int, uint64_t, uint64_t, int64_t);
@@ -6511,6 +6586,15 @@ cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
 }
 
 cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutDestroy");
+            if (real_fn) return real_fn(matLayout);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *);
@@ -6529,6 +6613,15 @@ cublasStatus_t cublasLtMatrixLayoutDestroy(void *matLayout) {
 
 cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
                                                   const void *buf, size_t sizeInBytes) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutSetAttribute");
+            if (real_fn) return real_fn(matLayout, attr, buf, sizeInBytes);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
@@ -6553,6 +6646,15 @@ cublasStatus_t cublasLtMatrixLayoutSetAttribute(void *matLayout, int attr,
 cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
                                                   void *buf, size_t sizeInBytes,
                                                   size_t *sizeWritten) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatrixLayoutGetAttribute");
+            if (real_fn) return real_fn(matLayout, attr, buf, sizeInBytes, sizeWritten);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, void *, size_t, size_t *);
@@ -6578,6 +6680,15 @@ cublasStatus_t cublasLtMatrixLayoutGetAttribute(void *matLayout, int attr,
 }
 
 cublasStatus_t cublasLtMatmulPreferenceCreate(void **pref) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void **);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceCreate");
+            if (real_fn) return real_fn(pref);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void **);
@@ -6596,6 +6707,15 @@ cublasStatus_t cublasLtMatmulPreferenceCreate(void **pref) {
 }
 
 cublasStatus_t cublasLtMatmulPreferenceDestroy(void *pref) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceDestroy");
+            if (real_fn) return real_fn(pref);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *);
@@ -6614,6 +6734,15 @@ cublasStatus_t cublasLtMatmulPreferenceDestroy(void *pref) {
 
 cublasStatus_t cublasLtMatmulPreferenceSetAttribute(void *pref, int attr,
                                                       const void *buf, size_t sizeInBytes) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulPreferenceSetAttribute");
+            if (real_fn) return real_fn(pref, attr, buf, sizeInBytes);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
@@ -6634,6 +6763,15 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
     void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
     void *preference, int requestedAlgoCount, void *heuristicResultsArray,
     int *returnAlgoCount) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, void *, int, void *, int *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoGetHeuristic");
+            if (real_fn) return real_fn(lightHandle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference, requestedAlgoCount, heuristicResultsArray, returnAlgoCount);
+        }
+    }
     /* LOCAL DEVICE ROUTING */
     if (g_partial_offload && is_local_device(g_current_device)) {
         typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, void *, int, void *, int *);
@@ -6711,6 +6849,15 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
 cublasStatus_t cublasLtMatmulAlgoInit(cublasLtHandle_t lightHandle,
     int computeType, int scaleType, int Atype, int Btype, int Ctype, int Dtype,
     int algoId, void *algo) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, int, int, int, int, int, int, int, void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoInit");
+            if (real_fn) return real_fn(lightHandle, computeType, scaleType, Atype, Btype, Ctype, Dtype, algoId, algo);
+        }
+    }
     (void)lightHandle; (void)computeType; (void)scaleType;
     (void)Atype; (void)Btype; (void)Ctype; (void)Dtype; (void)algoId;
     if (algo) memset(algo, 0, 64);
@@ -6719,12 +6866,30 @@ cublasStatus_t cublasLtMatmulAlgoInit(cublasLtHandle_t lightHandle,
 
 cublasStatus_t cublasLtMatmulAlgoConfigSetAttribute(void *algo, int attr,
     const void *buf, size_t sizeInBytes) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *, int, const void *, size_t);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoConfigSetAttribute");
+            if (real_fn) return real_fn(algo, attr, buf, sizeInBytes);
+        }
+    }
     (void)algo; (void)attr; (void)buf; (void)sizeInBytes;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 cublasStatus_t cublasLtMatmulAlgoConfigGetAttribute(const void *algo, int attr,
     void *buf, size_t sizeInBytes, size_t *sizeWritten) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(const void *, int, void *, size_t, size_t *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoConfigGetAttribute");
+            if (real_fn) return real_fn(algo, attr, buf, sizeInBytes, sizeWritten);
+        }
+    }
     (void)algo; (void)attr;
     if (buf) memset(buf, 0, sizeInBytes);
     if (sizeWritten) *sizeWritten = sizeInBytes;
@@ -6734,6 +6899,15 @@ cublasStatus_t cublasLtMatmulAlgoConfigGetAttribute(const void *algo, int attr,
 cublasStatus_t cublasLtMatmulAlgoCheck(cublasLtHandle_t lightHandle,
     void *operationDesc, void *Adesc, void *Bdesc, void *Cdesc, void *Ddesc,
     const void *algo, void *result) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, void *, void *, void *, void *, void *, const void *, void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoCheck");
+            if (real_fn) return real_fn(lightHandle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, algo, result);
+        }
+    }
     (void)lightHandle; (void)operationDesc; (void)Adesc; (void)Bdesc;
     (void)Cdesc; (void)Ddesc; (void)algo;
     if (result) memset(result, 0, 280);
@@ -6743,6 +6917,15 @@ cublasStatus_t cublasLtMatmulAlgoCheck(cublasLtHandle_t lightHandle,
 cublasStatus_t cublasLtMatmulAlgoGetIds(cublasLtHandle_t lightHandle,
     int computeType, int scaleType, int Atype, int Btype, int Ctype, int Dtype,
     int requestedAlgoCount, int *algoIdsArray, int *returnAlgoCount) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasLtHandle_t, int, int, int, int, int, int, int, int *, int *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtMatmulAlgoGetIds");
+            if (real_fn) return real_fn(lightHandle, computeType, scaleType, Atype, Btype, Ctype, Dtype, requestedAlgoCount, algoIdsArray, returnAlgoCount);
+        }
+    }
     (void)lightHandle; (void)computeType; (void)scaleType;
     (void)Atype; (void)Btype; (void)Ctype; (void)Dtype;
     (void)requestedAlgoCount; (void)algoIdsArray;
@@ -6750,22 +6933,115 @@ cublasStatus_t cublasLtMatmulAlgoGetIds(cublasLtHandle_t lightHandle,
     return CUBLAS_STATUS_SUCCESS;
 }
 
-size_t cublasLtGetCudartVersion(void) { return 12040; }
+size_t cublasLtGetCudartVersion(void) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef size_t (*fn_t)(void);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetCudartVersion");
+            if (real_fn) return real_fn();
+        }
+    }
+    return 12040;
+}
 cublasStatus_t cublasLtGetStatusName(cublasStatus_t status, const char **str) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusName");
+            if (real_fn) return real_fn(status, str);
+        }
+    }
     (void)status; if (str) *str = "CUBLAS_STATUS_SUCCESS"; return CUBLAS_STATUS_SUCCESS;
 }
 cublasStatus_t cublasLtGetStatusString(cublasStatus_t status, const char **str) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(cublasStatus_t, const char **);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetStatusString");
+            if (real_fn) return real_fn(status, str);
+        }
+    }
     (void)status; if (str) *str = "success"; return CUBLAS_STATUS_SUCCESS;
 }
-size_t cublasLtGetVersion(void) { return 120405; }
+size_t cublasLtGetVersion(void) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef size_t (*fn_t)(void);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetVersion");
+            if (real_fn) return real_fn();
+        }
+    }
+    return 120405;
+}
 cublasStatus_t cublasLtGetProperty(int type, int *value) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(int, int *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtGetProperty");
+            if (real_fn) return real_fn(type, value);
+        }
+    }
     if (value) *value = (type == 0) ? 12 : (type == 1) ? 4 : 5;
     return CUBLAS_STATUS_SUCCESS;
 }
-cublasStatus_t cublasLtLoggerSetCallback(void *callback) { (void)callback; return CUBLAS_STATUS_SUCCESS; }
-cublasStatus_t cublasLtLoggerSetLevel(int level) { (void)level; return CUBLAS_STATUS_SUCCESS; }
-cublasStatus_t cublasLtLoggerSetMask(int mask) { (void)mask; return CUBLAS_STATUS_SUCCESS; }
-cublasStatus_t cublasLtLoggerSetFile(void *file) { (void)file; return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasLtLoggerSetCallback(void *callback) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetCallback");
+            if (real_fn) return real_fn(callback);
+        }
+    }
+    (void)callback; return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasLtLoggerSetLevel(int level) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(int);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetLevel");
+            if (real_fn) return real_fn(level);
+        }
+    }
+    (void)level; return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasLtLoggerSetMask(int mask) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(int);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetMask");
+            if (real_fn) return real_fn(mask);
+        }
+    }
+    (void)mask; return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t cublasLtLoggerSetFile(void *file) {
+    /* REENTRANCE GUARD: forward to real cublasLt when inside cuBLAS init */
+    if (g_in_real_cuda > 0) {
+        void *h = ensure_real_cublaslt();
+        if (h) {
+            typedef cublasStatus_t (*fn_t)(void *);
+            fn_t real_fn = (fn_t)dlsym(h, "cublasLtLoggerSetFile");
+            if (real_fn) return real_fn(file);
+        }
+    }
+    (void)file; return CUBLAS_STATUS_SUCCESS;
+}
 
 /*
  * ============================================================================
