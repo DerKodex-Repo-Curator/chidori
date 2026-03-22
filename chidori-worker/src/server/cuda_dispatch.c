@@ -1860,12 +1860,18 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                                          shared, stream,
                                          NULL, extra);
 
-                    if (s_verbose) {
-                        fprintf(stderr, "[cuda_dispatch] LAUNCH result=%d\n", res);
-                        /* Check for async errors */
+                    {
+                        /* Always sync after kernel launch to catch illegal address errors immediately */
                         CUresult sync_res = cuCtxSynchronize();
-                        if (sync_res != CUDA_SUCCESS)
-                            fprintf(stderr, "[cuda_dispatch] POST-LAUNCH SYNC ERROR=%d\n", sync_res);
+                        if (sync_res != CUDA_SUCCESS) {
+                            fprintf(stderr, "[cuda_dispatch] LAUNCH SYNC ERROR=%d after grid=(%u,%u,%u) block=(%u,%u,%u)\n",
+                                    sync_res, gridX, gridY, gridZ, blockX, blockY, blockZ);
+                            /* Dump param buffer for diagnosis */
+                            fprintf(stderr, "[cuda_dispatch] PARAMS: ");
+                            for (uint32_t bi = 0; bi < buf_size && bi < 64; bi++)
+                                fprintf(stderr, "%02x", ((uint8_t*)param_buffer)[bi]);
+                            fprintf(stderr, "\n");
+                        }
                     }
 
                     return chidori_send_response(fd, req->seq_num, res, NULL, 0);

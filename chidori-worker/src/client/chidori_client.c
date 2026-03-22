@@ -5818,8 +5818,10 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                 blockDim.x, blockDim.y, blockDim.z,
                 num_params, total_ps);
 
-    /* Host pointer fixup: scan param buffer for host pointers that won't be
-     * accessible on a remote GPU. On a local GPU, these work via CUDA UVA
+    /* NOTE: Host pointer fixup was attempted here but caused regressions.
+     * The proper fix for cross-device kernel parameter pointer translation
+     * needs to be done at a higher level (cross-device memcpy routing).
+     * See project memory for the rCUDA research on how to solve this.
      * (the GPU can access host memory). On a remote GPU, we need to copy the
      * pointed-to data into remote device memory and patch the pointer.
      *
