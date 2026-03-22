@@ -28,9 +28,6 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <limits.h>
-/* dlvsym is a GNU extension declared in <dlfcn.h> with _GNU_SOURCE,
- * but some compilers (clang) may not see the declaration. */
-extern void *dlvsym(void *handle, const char *symbol, const char *version);
 #ifndef RTLD_DEEPBIND
 #define RTLD_DEEPBIND 0  /* Not available on this platform */
 #endif
@@ -66,16 +63,34 @@ static __thread int g_in_real_cuda = 0;   /* reentrance guard: >0 = inside real 
  * ============================================================================
  */
 static void *(*g_real_dlsym_fn)(void *, const char *) = NULL;
+static void *(*g_real_dlvsym_fn)(void *, const char *, const char *) = NULL;
+
+/* Get the real glibc dlvsym via _dl_sym or linker tricks.
+ * Called once at startup BEFORE our dlvsym override is active. */
+extern void *_dl_sym(void *, const char *, void *) __attribute__((weak));
 
 static void init_real_dlsym(void) {
     if (g_real_dlsym_fn) return;
-    /* dlvsym is a GNU extension that resolves a specific symbol version.
-     * This gets the glibc dlsym, bypassing our override. */
-    g_real_dlsym_fn = (void *(*)(void *, const char *))dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    /* First, get glibc's real dlvsym so we can resolve versioned dlsym.
+     * We can't call dlvsym() directly because our override intercepts it.
+     * Use _dl_sym (glibc internal, weak) as bootstrap. */
+    if (_dl_sym) {
+        g_real_dlvsym_fn = (void *(*)(void *, const char *, const char *))
+            _dl_sym(RTLD_NEXT, "dlvsym", (void *)init_real_dlsym);
+    }
+    if (g_real_dlvsym_fn) {
+        g_real_dlsym_fn = (void *(*)(void *, const char *))
+            g_real_dlvsym_fn(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    }
     if (!g_real_dlsym_fn) {
-        /* Fallback: try unversioned. This may recurse if we're already in dlsym,
-         * but if dlvsym failed we have no choice. */
-        fprintf(stderr, "[chidori] WARNING: dlvsym failed, falling back to _dl_sym\n");
+        /* Last resort: try _dl_sym for dlsym directly */
+        if (_dl_sym) {
+            g_real_dlsym_fn = (void *(*)(void *, const char *))
+                _dl_sym(RTLD_NEXT, "dlsym", (void *)init_real_dlsym);
+        }
+    }
+    if (!g_real_dlsym_fn) {
+        fprintf(stderr, "[chidori] FATAL: could not bootstrap real dlsym\n");
     }
 }
 
@@ -184,7 +199,11 @@ void *dlsym(void *handle, const char *symbol) {
             if (strcmp(symbol, g_intercepted_cublas_symbols[i]) == 0) {
                 /* Return OUR version so local/remote routing works */
                 void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
-                if (ours) return ours;
+                if (ours) {
+                    fprintf(stderr, "[chidori-dlsym] %s → OUR %p (handle=%p)\n", symbol, ours, handle);
+                    return ours;
+                }
+                fprintf(stderr, "[chidori-dlsym] %s MATCH but RTLD_DEFAULT returned NULL!\n", symbol);
                 break;  /* symbol matched but we couldn't find ours — fall through */
             }
         }
@@ -192,6 +211,28 @@ void *dlsym(void *handle, const char *symbol) {
 
     /* All other symbols: return the real result */
     return __real_dlsym(handle, symbol);
+}
+
+/* Also intercept dlvsym — PyTorch may use versioned symbol resolution */
+void *dlvsym(void *handle, const char *symbol, const char *version) {
+    /* Use the real dlvsym stored during bootstrap */
+    if (!g_real_dlvsym_fn) init_real_dlsym();
+
+    /* Same interception logic as dlsym for cuBLAS symbols */
+    if (g_in_real_cuda == 0 && symbol) {
+        for (int i = 0; g_intercepted_cublas_symbols[i] != NULL; i++) {
+            if (strcmp(symbol, g_intercepted_cublas_symbols[i]) == 0) {
+                void *ours = __real_dlsym(RTLD_DEFAULT, symbol);
+                if (ours) {
+                    fprintf(stderr, "[chidori-dlvsym] %s@%s → OUR %p\n", symbol, version ? version : "?", ours);
+                    return ours;
+                }
+                break;
+            }
+        }
+    }
+
+    return g_real_dlvsym_fn ? g_real_dlvsym_fn(handle, symbol, version) : NULL;
 }
 
 /*
