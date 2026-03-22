@@ -3077,7 +3077,9 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
     const void *beta,
     void *C, int Ctype, int ldc,
     int computeType, int algo) {
-    /* Use raw write() to bypass any fprintf buffering issues */
+    /* DIAGNOSTIC: unconditional crash to prove function is called */
+    write(STDERR_FILENO, "!!! cublasGemmEx CALLED !!!\n", 28);
+    /* Keep the detailed trace too */
     {
         char _buf[200];
         int _len = snprintf(_buf, sizeof(_buf),
