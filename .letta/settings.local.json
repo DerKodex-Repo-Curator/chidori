@@ -7,11 +7,11 @@
   "sessionsByServer": {
     "localhost:8283": {
       "agentId": "agent-8210fd34-bc8e-4245-8b99-7de9cd026207",
-      "conversationId": "conv-a9888044-c439-432a-9816-88afde814899"
+      "conversationId": "conv-812a1e13-00a1-41c7-a08c-f2ba2ce48bfe"
     }
   },
   "lastSession": {
     "agentId": "agent-8210fd34-bc8e-4245-8b99-7de9cd026207",
-    "conversationId": "conv-a9888044-c439-432a-9816-88afde814899"
+    "conversationId": "conv-812a1e13-00a1-41c7-a08c-f2ba2ce48bfe"
   }
 }
