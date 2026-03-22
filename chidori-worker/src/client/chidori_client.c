@@ -7248,7 +7248,7 @@ cublasStatus_t cublasLtMatmulDescCreate(void **matmulDesc, int computeType, int 
             return r;
         }
     }
-    if (g_lt_desc_count >= LT_DESC_POOL) { if (matmulDesc) *matmulDesc = NULL; return CUBLAS_STATUS_ALLOC_FAILED; }
+    if (g_lt_desc_count >= LT_DESC_POOL) g_lt_desc_count = 0; /* wrap — pool is circular */
     lt_matmul_desc_t *d = &g_lt_descs[g_lt_desc_count++];
     memset(d, 0, sizeof(*d));
     d->computeType = computeType;
@@ -7372,7 +7372,7 @@ cublasStatus_t cublasLtMatrixLayoutCreate(void **matLayout, int type,
             return r;
         }
     }
-    if (g_lt_layout_count >= LT_DESC_POOL * 4) { if (matLayout) *matLayout = NULL; return CUBLAS_STATUS_ALLOC_FAILED; }
+    if (g_lt_layout_count >= LT_DESC_POOL * 4) g_lt_layout_count = 0; /* wrap — pool is circular */
     lt_matrix_layout_t *l = &g_lt_layouts[g_lt_layout_count++];
     memset(l, 0, sizeof(*l));
     l->dtype = type;
