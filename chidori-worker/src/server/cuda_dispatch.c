@@ -856,6 +856,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         CUstream stream = stream_handle ? (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle) : NULL;
         if (!stream && stream_handle) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         CUevent event = (CUevent)(uintptr_t)hmap_get(&g_events, event_handle);
+        if (!event) event = (CUevent)(uintptr_t)hmap_get(&g_rt_events, event_handle);
         res = event ? cuStreamWaitEvent(stream, event, flags) : CUDA_ERROR_INVALID_HANDLE;
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -886,7 +887,13 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             res = cuEventDestroy(event);
             hmap_remove(&g_events, handle);
         } else {
-            res = CUDA_SUCCESS;
+            event = (CUevent)(uintptr_t)hmap_get(&g_rt_events, handle);
+            if (event) {
+                res = cuEventDestroy(event);
+                hmap_remove(&g_rt_events, handle);
+            } else {
+                res = CUDA_SUCCESS;
+            }
         }
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -898,6 +905,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&stream_handle, (char *)payload + 8, 8);
         }
         CUevent event = (CUevent)(uintptr_t)hmap_get(&g_events, event_handle);
+        if (!event) event = (CUevent)(uintptr_t)hmap_get(&g_rt_events, event_handle);
         CUstream stream = stream_handle ? (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle) : NULL;
         if (!stream && stream_handle) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         res = event ? cuEventRecord(event, stream) : CUDA_ERROR_INVALID_HANDLE;
@@ -909,6 +917,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
         CUevent event = (CUevent)(uintptr_t)hmap_get(&g_events, handle);
+        if (!event) event = (CUevent)(uintptr_t)hmap_get(&g_rt_events, handle);
         res = event ? cuEventSynchronize(event) : CUDA_ERROR_INVALID_HANDLE;
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -918,6 +927,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
         CUevent event = (CUevent)(uintptr_t)hmap_get(&g_events, handle);
+        if (!event) event = (CUevent)(uintptr_t)hmap_get(&g_rt_events, handle);
         res = event ? cuEventQuery(event) : CUDA_ERROR_INVALID_HANDLE;
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -929,7 +939,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&end_handle, (char *)payload + 8, 8);
         }
         CUevent start = (CUevent)(uintptr_t)hmap_get(&g_events, start_handle);
+        if (!start) start = (CUevent)(uintptr_t)hmap_get(&g_rt_events, start_handle);
         CUevent end = (CUevent)(uintptr_t)hmap_get(&g_events, end_handle);
+        if (!end) end = (CUevent)(uintptr_t)hmap_get(&g_rt_events, end_handle);
         float ms = 0.0f;
         if (start && end) {
             res = cuEventElapsedTime(&ms, start, end);
@@ -1195,6 +1207,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&stream_handle, (char *)payload + 8, 8);
         }
         cudaEvent_t event = (cudaEvent_t)(uintptr_t)hmap_get(&g_rt_events, event_handle);
+        if (!event) event = (cudaEvent_t)(uintptr_t)hmap_get(&g_events, event_handle);
         cudaStream_t stream = NULL;
         if (stream_handle != 0) {
             stream = (cudaStream_t)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
@@ -1209,6 +1222,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
         cudaEvent_t event = (cudaEvent_t)(uintptr_t)hmap_get(&g_rt_events, handle);
+        if (!event) event = (cudaEvent_t)(uintptr_t)hmap_get(&g_events, handle);
         cudaError_t err = event ? cudaEventSynchronize(event) : cudaErrorInvalidResourceHandle;
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
     }
@@ -1222,6 +1236,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (event) {
             err = cudaEventDestroy(event);
             hmap_remove(&g_rt_events, handle);
+        } else {
+            event = (cudaEvent_t)(uintptr_t)hmap_get(&g_events, handle);
+            if (event) {
+                err = cudaEventDestroy(event);
+                hmap_remove(&g_events, handle);
+            }
         }
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
     }
@@ -1233,7 +1253,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&end_handle, (char *)payload + 8, 8);
         }
         cudaEvent_t start_ev = (cudaEvent_t)(uintptr_t)hmap_get(&g_rt_events, start_handle);
+        if (!start_ev) start_ev = (cudaEvent_t)(uintptr_t)hmap_get(&g_events, start_handle);
         cudaEvent_t end_ev = (cudaEvent_t)(uintptr_t)hmap_get(&g_rt_events, end_handle);
+        if (!end_ev) end_ev = (cudaEvent_t)(uintptr_t)hmap_get(&g_events, end_handle);
         float ms = 0.0f;
         cudaError_t err;
         if (start_ev && end_ev) {
