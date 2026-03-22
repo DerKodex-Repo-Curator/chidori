@@ -1190,6 +1190,13 @@ CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
 /* Module */
 CUresult cuModuleLoadData(CUmodule *module, const void *image) {
     if (g_in_real_cuda > 0 && g_real.cuModuleLoadData) return g_real.cuModuleLoadData(module, image);
+    /* Local device: forward to real driver (cuBLAS loads GEMM kernels via this) */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuModuleLoadData) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuModuleLoadData(module, image);
+        g_in_real_cuda--;
+        return r;
+    }
     /* Determine image size: check for PTX (text) vs CUBIN (binary) */
     size_t image_len;
     const unsigned char *data = (const unsigned char *)image;
@@ -1214,12 +1221,24 @@ CUresult cuModuleLoadData(CUmodule *module, const void *image) {
 
 CUresult cuModuleUnload(CUmodule mod) {
     if (g_in_real_cuda > 0 && g_real.cuModuleUnload) return g_real.cuModuleUnload(mod);
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuModuleUnload) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuModuleUnload(mod);
+        g_in_real_cuda--;
+        return r;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)mod;
     return chidori_rpc(CHIDORI_CU_MODULE_UNLOAD, &handle, sizeof(handle), NULL, NULL);
 }
 
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name) {
     if (g_in_real_cuda > 0 && g_real.cuModuleGetFunction) return g_real.cuModuleGetFunction(hfunc, hmod, name);
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuModuleGetFunction) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuModuleGetFunction(hfunc, hmod, name);
+        g_in_real_cuda--;
+        return r;
+    }
     /* Payload: module_handle(8) + function_name (null-terminated) */
     uint64_t mod_handle = (uint64_t)(uintptr_t)hmod;
     size_t name_len = strlen(name) + 1;
@@ -1249,6 +1268,12 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
 
 CUresult cuFuncGetAttribute(int *pi, int attrib, CUfunction hfunc) {
     if (g_in_real_cuda > 0 && g_real.cuFuncGetAttribute) return g_real.cuFuncGetAttribute(pi, attrib, hfunc);
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuFuncGetAttribute) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuFuncGetAttribute(pi, attrib, hfunc);
+        g_in_real_cuda--;
+        return r;
+    }
     struct __attribute__((packed)) { int32_t attrib; uint64_t func; } req;
     req.attrib = attrib;
     req.func = (uint64_t)(uintptr_t)hfunc;
@@ -1262,6 +1287,13 @@ CUresult cuLaunchKernel(CUfunction f,
                         unsigned int sharedMemBytes, CUstream hStream,
                         void **kernelParams, void **extra) {
     if (g_in_real_cuda > 0 && g_real.cuLaunchKernel) return g_real.cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+    /* Local device: forward to real driver (cuBLAS launches GEMM kernels via this) */
+    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuLaunchKernel) {
+        g_in_real_cuda++;
+        CUresult r = g_real.cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+        g_in_real_cuda--;
+        return r;
+    }
     /*
      * Kernel launch serialization — wire format:
      *   func_handle(8) + gridX(4) + gridY(4) + gridZ(4)
@@ -6051,6 +6083,12 @@ CUresult cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
 }
 
 CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real_cuda_handle) {
+        typedef CUresult (*fn_t)(CUdeviceptr, unsigned char, size_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuMemsetD8_v2");
+        if (real_fn) { g_in_real_cuda++; CUresult r = real_fn(dstDevice, uc, N); g_in_real_cuda--; return r; }
+    }
     struct __attribute__((packed)) {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
@@ -6064,6 +6102,12 @@ CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUst
 }
 
 CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
+    if (g_partial_offload && is_local_device(g_current_device) && g_real_cuda_handle) {
+        typedef CUresult (*fn_t)(CUdeviceptr, unsigned int, size_t);
+        static fn_t real_fn = NULL;
+        if (!real_fn) real_fn = (fn_t)dlsym(g_real_cuda_handle, "cuMemsetD32_v2");
+        if (real_fn) { g_in_real_cuda++; CUresult r = real_fn(dstDevice, ui, N); g_in_real_cuda--; return r; }
+    }
     struct __attribute__((packed)) {
         uint64_t ptr; int32_t value; uint64_t count;
     } req;
