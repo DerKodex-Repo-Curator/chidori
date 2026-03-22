@@ -1748,15 +1748,12 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     SET_INT(432, 36);     /* ECCEnabled = cudaDevAttrEccEnabled */
     SET_INT(436, 33);     /* pciBusID = cudaDevAttrPciBusId */
     SET_INT(440, 34);     /* pciDeviceID = cudaDevAttrPciDeviceId */
-    SET_INT(448, 36);     /* memoryClockRate = cudaDevAttrMemoryClockRate */
-    SET_INT(452, 37);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth */
-    SET_INT(456, 38);     /* l2CacheSize = cudaDevAttrL2CacheSize */
-    SET_INT(460, 39);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
-    { int check = 0; memcpy(&check, p + 460, 4);
-      fprintf(stderr, "[chidori] cudaGetDeviceProperties: maxThreadsPerMP at offset 460 = %d (attr 39)\n", check); }
-    SET_INT(464, 40);     /* asyncEngineCount = cudaDevAttrAsyncEngineCount */
-    SET_INT(472, 56);     /* managedMemory = cudaDevAttrManagedMemory */
-    SET_INT(476, 57);     /* isMultiGpuBoard = cudaDevAttrIsMultiGpuBoard */
+    /* Offsets below diverge between CUDA versions due to added fields.
+     * These offsets are empirically determined from PyTorch 2.10+cu128
+     * (CUDA 12.8) using CHIDORI_OFFSET_DIAG=1 pattern-fill technique. */
+    SET_INT(612, 37);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth (offset 612 in CUDA 12.8) */
+    SET_INT(624, 39);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
+    SET_INT(648, 82);     /* regsPerMultiprocessor = cudaDevAttrMaxRegistersPerMultiprocessor */
 
     #undef SET_INT
     #undef SET_SIZE_T
