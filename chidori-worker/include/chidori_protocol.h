@@ -296,6 +296,20 @@ typedef enum {
     CHIDORI_CUDNN_GET_CONVOLUTION_BACKWARD_DATA_WORKSPACE_SIZE  = 0x03A1,
     CHIDORI_CUDNN_GET_CONVOLUTION_BACKWARD_FILTER_WORKSPACE_SIZE = 0x03A2,
 
+    /* ================================================================
+     * Replay Control (0x0400 - 0x04FF)
+     *
+     * Server-side call sequence recording and replay. Records one
+     * training step, replays it on subsequent steps with only the
+     * changed data (input batch) sent over the wire. Eliminates
+     * per-call RPC overhead for repeated training steps.
+     * ================================================================ */
+    CHIDORI_REPLAY_BEGIN_RECORD          = 0x0400,  /* Start recording a call sequence */
+    CHIDORI_REPLAY_END_RECORD            = 0x0401,  /* Finalize recording, get fingerprint */
+    CHIDORI_REPLAY_EXECUTE               = 0x0402,  /* Replay with new variable data */
+    CHIDORI_REPLAY_INVALIDATE            = 0x0403,  /* Discard a recorded sequence */
+    CHIDORI_REPLAY_STATUS                = 0x0404,  /* Query replay state/stats */
+
     /* Sentinel */
     CHIDORI_FUNC_MAX                     = 0xFFFF,
 } chidori_func_id_t;
