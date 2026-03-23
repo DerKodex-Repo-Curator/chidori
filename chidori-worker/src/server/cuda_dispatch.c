@@ -1079,15 +1079,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             const void *data = (char *)payload + 28;
             cudaError_t err = cudaMemcpy((void *)(uintptr_t)dst_ptr, data,
                                           (size_t)size, cudaMemcpyHostToDevice);
-            /* Sync to detect errors */
-            {
-                cudaError_t sync_err = cudaDeviceSynchronize();
-                if (sync_err != cudaSuccess) {
-                    fprintf(stderr, "[cuda_dispatch] MEMCPY HtoD POST-SYNC ERROR=%d dst=0x%llx size=%llu\n",
-                            (int)sync_err, (unsigned long long)dst_ptr, (unsigned long long)size);
-                    cudaGetLastError();
-                }
-            }
             return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
         } else if (kind == cudaMemcpyDeviceToHost) {
             void *buf = malloc((size_t)size);
@@ -1104,21 +1095,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             cudaError_t err = cudaMemcpy((void *)(uintptr_t)dst_ptr,
                                           (void *)(uintptr_t)src_ptr,
                                           (size_t)size, cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "[cuda_dispatch] MEMCPY D2D FAILED: dst=0x%llx src=0x%llx size=%llu err=%d\n",
-                        (unsigned long long)dst_ptr, (unsigned long long)src_ptr,
-                        (unsigned long long)size, (int)err);
-            }
-            /* Sync to catch async errors from memcpy */
-            {
-                cudaError_t sync_err = cudaDeviceSynchronize();
-                if (sync_err != cudaSuccess) {
-                    fprintf(stderr, "[cuda_dispatch] MEMCPY D2D POST-SYNC ERROR=%d dst=0x%llx src=0x%llx size=%llu\n",
-                            (int)sync_err, (unsigned long long)dst_ptr, (unsigned long long)src_ptr,
-                            (unsigned long long)size);
-                    cudaGetLastError();
-                }
-            }
             return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
         } else {
             return chidori_send_response(fd, req->seq_num,
@@ -1189,19 +1165,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             memcpy(&count, (char *)payload + 12, 8);
         }
         cudaError_t err = cudaMemset((void *)(uintptr_t)ptr, value, (size_t)count);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[cuda_dispatch] MEMSET FAILED: ptr=0x%llx val=%d count=%llu err=%d\n",
-                    (unsigned long long)ptr, value, (unsigned long long)count, (int)err);
-        }
-        /* Sync to detect async errors */
-        {
-            cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                fprintf(stderr, "[cuda_dispatch] MEMSET POST-SYNC ERROR=%d ptr=0x%llx count=%llu\n",
-                        (int)sync_err, (unsigned long long)ptr, (unsigned long long)count);
-                cudaGetLastError();
-            }
-        }
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
     }
 
