@@ -430,6 +430,37 @@ static int g_local_device_count = 0;      /* number of local GPUs */
 /* g_in_real_cuda defined above (before dlopen interceptor) */
 static CUcontext g_local_ctx = NULL;      /* Real CUDA primary context for local device */
 
+/*
+ * ============================================================================
+ * Server-side Replay — record one training step on the server, then replay it
+ * without re-sending the full call stream.  Phase 2: client state machine.
+ *
+ * Enabled via CHIDORI_REPLAY=1.  After g_replay_warmup synchronization points
+ * (default 3), the client tells the server to begin recording.  At the next
+ * sync it tells the server to stop.  The server returns a fingerprint and
+ * call count.  Subsequent steps will use CHIDORI_REPLAY_EXECUTE (Phase 3).
+ * ============================================================================
+ */
+static int g_replay_mode = 0;           /* 0=off, 1=recording, 2=replaying */
+static int g_replay_step_count = 0;     /* counts training steps (sync calls) */
+static int g_replay_warmup = 3;         /* record on step N (env: CHIDORI_REPLAY_WARMUP) */
+static uint32_t g_replay_seq_id = 1;
+static uint64_t g_replay_fingerprint = 0;
+static int g_replay_enabled = -1;       /* -1=unchecked, 0=disabled, 1=enabled */
+
+static int is_replay_enabled(void) {
+    if (g_replay_enabled == -1) {
+        const char *v = getenv("CHIDORI_REPLAY");
+        g_replay_enabled = (v && v[0] == '1') ? 1 : 0;
+        if (g_replay_enabled) {
+            const char *w = getenv("CHIDORI_REPLAY_WARMUP");
+            if (w) g_replay_warmup = atoi(w);
+            fprintf(stderr, "[chidori-replay] Enabled, warmup=%d steps\n", g_replay_warmup);
+        }
+    }
+    return g_replay_enabled;
+}
+
 /* Real CUDA function pointers (populated by init_real_cuda) */
 static struct {
     /* Driver API — all functions that real cudart may call internally */
@@ -2533,6 +2564,32 @@ cudaError_t cudaDeviceSynchronize(void) {
         return (cudaError_t)cr;
     }
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_SYNCHRONIZE, NULL, 0, NULL, NULL);
+
+    /* Replay state machine: count sync points as step boundaries */
+    if (is_replay_enabled() && !g_partial_offload) {
+        g_replay_step_count++;
+        if (g_replay_step_count == g_replay_warmup && g_replay_mode == 0) {
+            /* Time to start recording */
+            g_replay_mode = 1;
+            uint32_t seq_id = g_replay_seq_id;
+            chidori_rpc(CHIDORI_REPLAY_BEGIN_RECORD, &seq_id, 4, NULL, NULL);
+            fprintf(stderr, "[chidori-replay] Recording started at step %d\n",
+                    g_replay_step_count);
+        } else if (g_replay_mode == 1 && g_replay_step_count == g_replay_warmup + 1) {
+            /* End recording */
+            uint32_t seq_id = g_replay_seq_id;
+            uint8_t resp[24];
+            size_t resp_len = 24;
+            chidori_rpc(CHIDORI_REPLAY_END_RECORD, &seq_id, 4, resp, &resp_len);
+            memcpy(&g_replay_fingerprint, resp, 8);
+            int call_count = 0;
+            memcpy(&call_count, resp + 8, 4);
+            g_replay_mode = 2; /* switch to replay mode */
+            fprintf(stderr, "[chidori-replay] Recording done: %d calls, fp=0x%016llx\n",
+                    call_count, (unsigned long long)g_replay_fingerprint);
+        }
+    }
+
     g_last_error = r;
     return r;
 }
