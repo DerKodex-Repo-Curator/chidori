@@ -2489,6 +2489,19 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 }
 
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+    /* Route based on the ADDRESS, not current device — the backward pass
+     * may zero gradient buffers on device 0 while the current device is 1.
+     * Sending a local GPU address to the remote server causes illegal access. */
+    if (g_partial_offload && g_real.cuMemsetD8_v2) {
+        int addr_dev = alloc_track_device((uintptr_t)devPtr);
+        if (addr_dev >= 0 && is_local_device(addr_dev)) {
+            g_in_real_cuda++;
+            CUresult r = g_real.cuMemsetD8_v2((CUdeviceptr)(uintptr_t)devPtr, (unsigned char)value, count);
+            g_in_real_cuda--;
+            g_last_error = (cudaError_t)r;
+            return (cudaError_t)r;
+        }
+    }
     struct __attribute__((packed)) {
         uint64_t ptr;
         int32_t  value;
