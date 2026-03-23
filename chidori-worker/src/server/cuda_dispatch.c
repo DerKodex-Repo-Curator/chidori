@@ -1729,16 +1729,22 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
             /*
              * Query EXACT parameter layout using cuFuncGetParamInfo (CUDA 12.3+).
-             * Returns offset and size for each kernel parameter.
-             * This is the ONLY correct way to serialize kernel args.
+             * Resolved at runtime via dlsym to support CUDA 12.2 and older.
              */
+            typedef CUresult (*cuFuncGetParamInfo_fn)(CUfunction, size_t, size_t *, size_t *);
+            static cuFuncGetParamInfo_fn s_cuFuncGetParamInfo = NULL;
+            static int s_param_info_checked = 0;
+            if (!s_param_info_checked) {
+                s_cuFuncGetParamInfo = (cuFuncGetParamInfo_fn)dlsym(RTLD_DEFAULT, "cuFuncGetParamInfo");
+                s_param_info_checked = 1;
+            }
             struct { uint32_t offset; uint32_t size; } param_info[64];
             int num_params = 0;
             uint32_t total_param_size = 0;
 
-            for (int i = 0; i < 64; i++) {
+            for (int i = 0; i < 64 && s_cuFuncGetParamInfo; i++) {
                 size_t off, sz;
-                CUresult pi_res = cuFuncGetParamInfo(func, (size_t)i, &off, &sz);
+                CUresult pi_res = s_cuFuncGetParamInfo(func, (size_t)i, &off, &sz);
                 if (pi_res != CUDA_SUCCESS) break;
                 param_info[num_params].offset = (uint32_t)off;
                 param_info[num_params].size = (uint32_t)sz;
