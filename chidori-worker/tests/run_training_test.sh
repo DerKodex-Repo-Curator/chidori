@@ -96,8 +96,10 @@ print(f"THROUGHPUT: {tps:.0f} tokens/s")
 if all_finite and len(losses) >= 2:
     print(f"RESULT:     PASSED")
     print(SEP)
+    print("PASS: run_training_test")
 else:
     print(f"RESULT:     FAILED")
     print(SEP)
+    print("FAIL: run_training_test")
     sys.exit(1)
 PYTHON

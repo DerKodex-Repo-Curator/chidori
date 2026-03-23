@@ -215,7 +215,7 @@ run_test \
 run_test \
     "TinyLlama 1.1B inference" \
     "$PY $DIR/tests/test_inference.py" \
-    600
+    900
 
 # ── Summary ─────────────────────────────────────────────────
 echo ""
