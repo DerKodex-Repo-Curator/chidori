@@ -2492,14 +2492,21 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
     /* Route based on the ADDRESS, not current device — the backward pass
      * may zero gradient buffers on device 0 while the current device is 1.
      * Sending a local GPU address to the remote server causes illegal access. */
-    if (g_partial_offload && g_real.cuMemsetD8_v2) {
+    if (g_partial_offload) {
         int addr_dev = alloc_track_device((uintptr_t)devPtr);
         if (addr_dev >= 0 && is_local_device(addr_dev)) {
-            g_in_real_cuda++;
-            CUresult r = g_real.cuMemsetD8_v2((CUdeviceptr)(uintptr_t)devPtr, (unsigned char)value, count);
-            g_in_real_cuda--;
-            g_last_error = (cudaError_t)r;
-            return (cudaError_t)r;
+            /* Route to local GPU via driver API */
+            typedef CUresult (*cuMemsetD8_fn)(CUdeviceptr, unsigned char, size_t);
+            static cuMemsetD8_fn real_fn = NULL;
+            if (!real_fn && g_real_cuda_handle)
+                real_fn = (cuMemsetD8_fn)__real_dlsym(g_real_cuda_handle, "cuMemsetD8_v2");
+            if (real_fn) {
+                g_in_real_cuda++;
+                CUresult r = real_fn((CUdeviceptr)(uintptr_t)devPtr, (unsigned char)value, count);
+                g_in_real_cuda--;
+                g_last_error = (cudaError_t)r;
+                return (cudaError_t)r;
+            }
         }
     }
     struct __attribute__((packed)) {
