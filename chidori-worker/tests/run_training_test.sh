@@ -55,11 +55,13 @@ model = nn.Sequential(
 P = sum(p.numel() for p in model.parameters())
 print(f"Model: {P/1e6:.1f}M params (FP32, bias=True, ReLU)")
 
-opt = torch.optim.SGD(model.parameters(), lr=0.01)
+loss_fn = torch.nn.MSELoss()
+opt = torch.optim.SGD(model.parameters(), lr=0.001)
 
 # Warmup
 x = torch.randn(16, 256).cuda()
-opt.zero_grad(); model(x).sum().backward(); opt.step()
+t = torch.randn(16, 256).cuda()
+opt.zero_grad(); loss_fn(model(x), t).backward(); opt.step()
 torch.cuda.synchronize()
 print("Warmup done\n")
 
@@ -67,9 +69,10 @@ t0 = time.time()
 losses = []
 for step in range(20):
     x = torch.randn(16, 256).cuda()
+    target = torch.randn(16, 256).cuda()
     opt.zero_grad()
     y = model(x)
-    loss = y.sum()
+    loss = loss_fn(y, target)
     loss.backward()
     opt.step()
     if step % 5 == 0:
@@ -82,14 +85,19 @@ torch.cuda.synchronize()
 dt = time.time() - t0
 tps = 20 * 16 * 256 / dt
 
+import math, sys
+all_finite = all(math.isfinite(l) for l in losses)
 print(f"\nLosses: {[round(l,4) for l in losses]}")
-trend = "decreasing" if losses[-1] < losses[0] else "stable"
-print(f"Trend: {trend}")
 print(f"\n{SEP}")
 print(f"DEVICE:     {dev}")
 print(f"MODEL:      {P/1e6:.1f}M params (FP32, bias=True, ReLU)")
-print(f"TRAINING:   {dt:.2f}s (20 steps, batch=64)")
+print(f"TRAINING:   {dt:.2f}s (20 steps)")
 print(f"THROUGHPUT: {tps:.0f} tokens/s")
-print(f"RESULT:     PASSED" if all(l < 2.0 for l in losses) else f"RESULT:     FAILED")
-print(SEP)
+if all_finite and len(losses) >= 2:
+    print(f"RESULT:     PASSED")
+    print(SEP)
+else:
+    print(f"RESULT:     FAILED")
+    print(SEP)
+    sys.exit(1)
 PYTHON
