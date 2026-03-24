@@ -430,6 +430,99 @@ static int g_local_device_count = 0;      /* number of local GPUs */
 /* g_in_real_cuda defined above (before dlopen interceptor) */
 static CUcontext g_local_ctx = NULL;      /* Real CUDA primary context for local device */
 
+/*
+ * ============================================================================
+ * Server-side Replay — record one training step on the server, then replay it
+ * without re-sending the full call stream.  Phase 2: client state machine.
+ *
+ * Enabled via CHIDORI_REPLAY=1.  After g_replay_warmup synchronization points
+ * (default 3), the client tells the server to begin recording.  At the next
+ * sync it tells the server to stop.  The server returns a fingerprint and
+ * call count.  Subsequent steps will use CHIDORI_REPLAY_EXECUTE (Phase 3).
+ * ============================================================================
+ */
+static int g_replay_mode = 0;           /* 0=off, 1=recording, 2=replaying */
+static int g_replay_step_count = 0;     /* counts training steps (sync calls) */
+static int g_replay_warmup = 3;         /* record on step N (env: CHIDORI_REPLAY_WARMUP) */
+static uint32_t g_replay_seq_id = 1;
+static uint64_t g_replay_fingerprint = 0;
+static int g_replay_enabled = -1;       /* -1=unchecked, 0=disabled, 1=enabled */
+
+/* Phase 3: H2D data collection for replay intercept */
+#define REPLAY_MAX_H2D_COLLECT 64
+static struct {
+    void *data;
+    uint32_t size;
+} g_replay_h2d_collected[REPLAY_MAX_H2D_COLLECT];
+static int g_replay_h2d_count = 0;
+static uint64_t g_replay_call_hash = 0; /* running fingerprint for validation */
+
+/* FNV-1a hash helpers (same algorithm as server) */
+static uint64_t replay_fnv1a_init(void) { return 0xcbf29ce484222325ULL; }
+static uint64_t replay_fnv1a_update(uint64_t h, const void *d, size_t l) {
+    const uint8_t *p = d;
+    for (size_t i = 0; i < l; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+
+/*
+ * Replay intercept — called at the top of chidori_rpc and chidori_rpc_async
+ * when g_replay_mode == 2.  Instead of sending each RPC individually, we
+ * collect H2D data and hash the call sequence.  At the next step boundary
+ * (cudaDeviceSynchronize), a single REPLAY_EXECUTE carries all collected
+ * data to the server.
+ *
+ * Returns 1 if the call was intercepted (caller should NOT send the RPC).
+ * Returns 0 if the call should proceed normally.
+ */
+static int replay_intercept(uint16_t func_id, const void *payload, size_t payload_len) {
+    if (g_replay_mode != 2) return 0; /* not intercepting */
+    if (func_id >= 0x0400) return 0;  /* don't intercept replay control messages */
+
+    /* Hash func_id into running fingerprint for validation */
+    g_replay_call_hash = replay_fnv1a_update(g_replay_call_hash, &func_id, 2);
+
+    /* Collect H2D data (driver API: cuMemcpyHtoD payload = dst(8)+size(8)+data) */
+    if (func_id == CHIDORI_CU_MEMCPY_H_TO_D && payload_len > 16) {
+        if (g_replay_h2d_count < REPLAY_MAX_H2D_COLLECT) {
+            uint32_t data_size = payload_len - 16;
+            g_replay_h2d_collected[g_replay_h2d_count].data = malloc(data_size);
+            memcpy(g_replay_h2d_collected[g_replay_h2d_count].data, (char*)payload + 16, data_size);
+            g_replay_h2d_collected[g_replay_h2d_count].size = data_size;
+            g_replay_h2d_count++;
+        }
+    }
+
+    /* Collect H2D data (runtime API: cudaMemcpy HtoD payload = dst(8)+src(8)+size(8)+kind(4)+data) */
+    if (func_id == CHIDORI_CUDA_MEMCPY && payload_len > 28) {
+        /* Check kind field at offset 24: cudaMemcpyHostToDevice == 1 */
+        int32_t kind = 0;
+        memcpy(&kind, (char*)payload + 24, 4);
+        if (kind == 1 && g_replay_h2d_count < REPLAY_MAX_H2D_COLLECT) {
+            uint32_t data_size = payload_len - 28;
+            g_replay_h2d_collected[g_replay_h2d_count].data = malloc(data_size);
+            memcpy(g_replay_h2d_collected[g_replay_h2d_count].data, (char*)payload + 28, data_size);
+            g_replay_h2d_collected[g_replay_h2d_count].size = data_size;
+            g_replay_h2d_count++;
+        }
+    }
+
+    return 1; /* intercepted — caller should NOT send the RPC */
+}
+
+static int is_replay_enabled(void) {
+    if (g_replay_enabled == -1) {
+        const char *v = getenv("CHIDORI_REPLAY");
+        g_replay_enabled = (v && v[0] == '1') ? 1 : 0;
+        if (g_replay_enabled) {
+            const char *w = getenv("CHIDORI_REPLAY_WARMUP");
+            if (w) g_replay_warmup = atoi(w);
+            fprintf(stderr, "[chidori-replay] Enabled, warmup=%d steps\n", g_replay_warmup);
+        }
+    }
+    return g_replay_enabled;
+}
+
 /* Real CUDA function pointers (populated by init_real_cuda) */
 static struct {
     /* Driver API — all functions that real cudart may call internally */
@@ -1042,6 +1135,12 @@ static void chidori_flush_responses(void) {
 static int g_cork_active = 0; /* TCP_CORK batching state */
 
 static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t payload_len) {
+    /* Phase 3 replay intercept — collect H2D data instead of sending RPC */
+    if (g_replay_mode == 2 && func_id < 0x0400) {
+        if (replay_intercept(func_id, payload, payload_len))
+            return CUDA_SUCCESS;
+    }
+
     check_log_levels();
     check_trace();
     if (g_trace) {
@@ -1095,6 +1194,16 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
  */
 static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payload_len,
                           void *out_payload, size_t *out_payload_len) {
+    /* Phase 3 replay intercept — sync calls are part of the recorded sequence.
+     * Skip them — they'll execute on the server during REPLAY_EXECUTE.
+     * Return success with zero output. */
+    if (g_replay_mode == 2 && func_id < 0x0400) {
+        if (replay_intercept(func_id, payload, payload_len)) {
+            if (out_payload && out_payload_len) memset(out_payload, 0, *out_payload_len);
+            return CUDA_SUCCESS;
+        }
+    }
+
     check_log_levels();
     check_trace();
     if (g_trace) {
@@ -2532,7 +2641,75 @@ cudaError_t cudaDeviceSynchronize(void) {
         g_last_error = (cudaError_t)cr;
         return (cudaError_t)cr;
     }
+
+    /* Phase 3: replay mode — send single REPLAY_EXECUTE instead of individual RPCs.
+     * All CUDA calls since the last sync were intercepted by replay_intercept() and
+     * their H2D data was collected.  Now pack it all into one message. */
+    if (g_replay_mode == 2) {
+        /* Build REPLAY_EXECUTE payload: seq_id(4) + fingerprint(8) + h2d_count(4) + [size(4)+data]... */
+        size_t total = 16; /* header: 4+8+4 */
+        for (int i = 0; i < g_replay_h2d_count; i++)
+            total += 4 + g_replay_h2d_collected[i].size;
+
+        void *exec_payload = malloc(total);
+        char *p = exec_payload;
+        memcpy(p, &g_replay_seq_id, 4); p += 4;
+        memcpy(p, &g_replay_fingerprint, 8); p += 8;
+        int32_t hc = g_replay_h2d_count;
+        memcpy(p, &hc, 4); p += 4;
+        for (int i = 0; i < g_replay_h2d_count; i++) {
+            memcpy(p, &g_replay_h2d_collected[i].size, 4); p += 4;
+            memcpy(p, g_replay_h2d_collected[i].data, g_replay_h2d_collected[i].size);
+            p += g_replay_h2d_collected[i].size;
+            free(g_replay_h2d_collected[i].data);
+            g_replay_h2d_collected[i].data = NULL;
+        }
+        g_replay_h2d_count = 0;
+        g_replay_call_hash = replay_fnv1a_init();
+
+        /* Send single REPLAY_EXECUTE — replaces ~179 individual RPCs */
+        int32_t result = 0;
+        size_t result_len = sizeof(result);
+        CUresult rr = chidori_rpc(CHIDORI_REPLAY_EXECUTE, exec_payload, total, &result, &result_len);
+        free(exec_payload);
+
+        if (rr != CUDA_SUCCESS || result != 0) {
+            fprintf(stderr, "[chidori-replay] REPLAY_EXECUTE failed (rr=%d result=%d), falling back\n", rr, result);
+            g_replay_mode = 0; /* disable replay */
+        }
+
+        g_replay_step_count++;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_SYNCHRONIZE, NULL, 0, NULL, NULL);
+
+    /* Replay state machine: count sync points as step boundaries */
+    if (is_replay_enabled() && !g_partial_offload) {
+        g_replay_step_count++;
+        if (g_replay_step_count == g_replay_warmup && g_replay_mode == 0) {
+            /* Time to start recording */
+            g_replay_mode = 1;
+            uint32_t seq_id = g_replay_seq_id;
+            chidori_rpc(CHIDORI_REPLAY_BEGIN_RECORD, &seq_id, 4, NULL, NULL);
+            fprintf(stderr, "[chidori-replay] Recording started at step %d\n",
+                    g_replay_step_count);
+        } else if (g_replay_mode == 1 && g_replay_step_count == g_replay_warmup + 1) {
+            /* End recording */
+            uint32_t seq_id = g_replay_seq_id;
+            uint8_t resp[24];
+            size_t resp_len = 24;
+            chidori_rpc(CHIDORI_REPLAY_END_RECORD, &seq_id, 4, resp, &resp_len);
+            memcpy(&g_replay_fingerprint, resp, 8);
+            int call_count = 0;
+            memcpy(&call_count, resp + 8, 4);
+            g_replay_mode = 2; /* switch to replay mode */
+            fprintf(stderr, "[chidori-replay] Recording done: %d calls, fp=0x%016llx\n",
+                    call_count, (unsigned long long)g_replay_fingerprint);
+        }
+    }
+
     g_last_error = r;
     return r;
 }
@@ -7228,8 +7405,8 @@ cublasStatus_t cublasLtDestroy(cublasLtHandle_t lightHandle) {
 #define CUBLASLT_MATRIX_LAYOUT_ROWS  2
 #define CUBLASLT_MATRIX_LAYOUT_COLS  3
 #define CUBLASLT_MATRIX_LAYOUT_LD    4
-#define CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT 6
-#define CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET 7
+#define CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT 5
+#define CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET 6
 
 typedef struct {
     int computeType;

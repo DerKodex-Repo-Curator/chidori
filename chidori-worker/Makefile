@@ -19,7 +19,7 @@ LDFLAGS_CLIENT = -lpthread -ldl -shared
 
 BUILD_DIR = build
 SRC_PROTO = src/protocol/chidori_net.c
-SRC_SERVER = src/server/chidori_worker.c src/server/cuda_dispatch.c
+SRC_SERVER = src/server/chidori_worker.c src/server/cuda_dispatch.c src/server/replay.c
 SRC_CLIENT = src/client/chidori_client.c
 
 .PHONY: all server client test test-e2e clean

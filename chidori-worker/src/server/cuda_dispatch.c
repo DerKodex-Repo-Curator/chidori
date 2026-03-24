@@ -23,6 +23,7 @@
 
 #include "chidori_protocol.h"
 #include "handle_map.h"
+#include "replay.h"
 
 /* Maximum number of GPUs we support */
 #define CHIDORI_MAX_DEVICES 16
@@ -248,11 +249,14 @@ int cuda_dispatch_init(const char *pcibus) {
     g_current_dev = default_dev;
     g_initialized = 1;
 
+    replay_init();
+
     return 0;
 }
 
 void cuda_dispatch_shutdown(void) {
     if (g_initialized) {
+        replay_shutdown();
         if (g_lt_handle) {
             cublasLtDestroy(g_lt_handle);
             g_lt_handle = NULL;
@@ -281,6 +285,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     if (s_verbose) {
         fprintf(stderr, "[cuda_dispatch] >> func=0x%04x payload=%u seq=%u\n",
                 req->func_id, req->payload_size, req->seq_num);
+    }
+
+    /* Record this call if replay recording is active.
+     * Only record normal CUDA calls (func_id < 0x0400), not replay control messages. */
+    if (replay_is_recording() && req->func_id < 0x0400) {
+        replay_record_call(req->func_id, req->flags, payload, req->payload_size);
     }
 
     CUresult res;
@@ -3797,6 +3807,79 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             hmap_remove(&g_cudnn_rnn_descs, wire);
         }
         return chidori_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ================================================================
+     * Replay System
+     * ================================================================ */
+    case CHIDORI_REPLAY_BEGIN_RECORD: {
+        uint32_t seq_id = 0;
+        if (req->payload_size >= 4) memcpy(&seq_id, payload, 4);
+        int r = replay_begin_record(seq_id);
+        return chidori_send_response(fd, req->seq_num, r == 0 ? 0 : -1, NULL, 0);
+    }
+
+    case CHIDORI_REPLAY_END_RECORD: {
+        uint32_t seq_id = 0;
+        if (req->payload_size >= 4) memcpy(&seq_id, payload, 4);
+        uint64_t fingerprint = 0;
+        int call_count = 0, h2d_count = 0;
+        uint64_t total_var = 0;
+        int r = replay_end_record(seq_id, &fingerprint, &call_count, &h2d_count, &total_var);
+        uint8_t resp[24];
+        memcpy(resp, &fingerprint, 8);
+        memcpy(resp + 8, &call_count, 4);
+        memcpy(resp + 12, &h2d_count, 4);
+        memcpy(resp + 16, &total_var, 8);
+        return chidori_send_response(fd, req->seq_num, r == 0 ? 0 : -1, resp, 24);
+    }
+
+    case CHIDORI_REPLAY_EXECUTE: {
+        /* Parse: seq_id(4) + fingerprint(8) + h2d_count(4) + [h2d_size(4) + h2d_data(h2d_size)]... */
+        if (req->payload_size < 16) {
+            return chidori_send_response(fd, req->seq_num, -1, NULL, 0);
+        }
+        uint32_t seq_id = 0;
+        uint64_t fingerprint = 0;
+        uint32_t h2d_count = 0;
+        memcpy(&seq_id, (uint8_t *)payload, 4);
+        memcpy(&fingerprint, (uint8_t *)payload + 4, 8);
+        memcpy(&h2d_count, (uint8_t *)payload + 12, 4);
+
+        /* Parse H2D variable data payloads */
+        const void *h2d_data[REPLAY_MAX_H2D_SLOTS];
+        uint32_t h2d_sizes[REPLAY_MAX_H2D_SLOTS];
+        memset(h2d_data, 0, sizeof(h2d_data));
+        memset(h2d_sizes, 0, sizeof(h2d_sizes));
+
+        uint32_t off = 16;
+        for (uint32_t i = 0; i < h2d_count && i < REPLAY_MAX_H2D_SLOTS; i++) {
+            if (off + 4 > req->payload_size) break;
+            memcpy(&h2d_sizes[i], (uint8_t *)payload + off, 4);
+            off += 4;
+            if (off + h2d_sizes[i] > req->payload_size) break;
+            h2d_data[i] = (uint8_t *)payload + off;
+            off += h2d_sizes[i];
+        }
+
+        /* Prepare D2H output buffers */
+        void *d2h_out[REPLAY_MAX_D2H_SLOTS];
+        uint64_t d2h_out_sizes[REPLAY_MAX_D2H_SLOTS];
+        memset(d2h_out, 0, sizeof(d2h_out));
+        memset(d2h_out_sizes, 0, sizeof(d2h_out_sizes));
+
+        int r = replay_execute(seq_id, fingerprint,
+                               (int)h2d_count, h2d_data, h2d_sizes,
+                               0, d2h_out, d2h_out_sizes);
+
+        return chidori_send_response(fd, req->seq_num, r, NULL, 0);
+    }
+
+    case CHIDORI_REPLAY_INVALIDATE: {
+        uint32_t seq_id = 0;
+        if (req->payload_size >= 4) memcpy(&seq_id, payload, 4);
+        replay_invalidate(seq_id);
+        return chidori_send_response(fd, req->seq_num, 0, NULL, 0);
     }
 
     /* ================================================================
