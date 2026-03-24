@@ -9,6 +9,9 @@ All matmul dimensions become fixed per token, enabling:
 Expected: faster than dynamic KV cache inference over network.
 """
 import torch
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.disable = True
 import time
 import sys
 import math
