@@ -456,309 +456,35 @@
 [chidori] fat_binary: magic=0xba55ed50 size=8953072
 [chidori] fat_binary: magic=0xba55ed50 size=10728
 [chidori] fat_binary: magic=0xba55ed50 size=76440
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori] Direct connect to gpu-worker at 127.0.0.1:43211
-[chidori] Socket fd=500
-[chidori] Connected directly to GPU worker
-[chidori-rpc] func=0x010a result=0 resp_payload=4
-[chidori] cudaDeviceGetAttribute(attr=8, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=12, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=10, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=11, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=1, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=2, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=3, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=4, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=5, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=6, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=7, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=13, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=9, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=75, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=76, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=14, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=52, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=15, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=16, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=17, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=18, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=19, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=20, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=21, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=35, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=36, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=33, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=34, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=37, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=38, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=39, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=40, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=41, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=56, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=57, dev=0) → LOCAL
-[chidori-rpc] func=0x0012 payload=8 pending=0
-[chidori-rpc] func=0x0012 result=0 resp_payload=35
-[chidori-rpc] func=0x0013 payload=4 pending=0
-[chidori-rpc] func=0x0013 result=0 resp_payload=8
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010c payload=8 pending=0
-[chidori-rpc] func=0x010c result=0 resp_payload=4
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
+[chidori] cudaGetDeviceProperties(dev=0) CALLED
+[chidori] cudaGetDeviceProperties(dev=1) CALLED
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori] cudaDeviceGetAttribute(attr=8, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=12, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=10, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=11, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=1, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=2, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=3, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=4, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=5, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=6, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=7, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=13, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=9, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=75, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=76, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=14, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=52, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=15, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=16, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=17, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=18, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=19, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=20, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=21, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=35, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=36, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=33, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=34, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=37, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=38, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=39, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=40, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=41, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=56, dev=0) → LOCAL
-[chidori] cudaDeviceGetAttribute(attr=57, dev=0) → LOCAL
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
+[chidori] cudaGetDeviceProperties(dev=0) CALLED
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x0012 payload=8 pending=0
-[chidori-rpc] func=0x0012 result=0 resp_payload=35
-[chidori-rpc] func=0x0013 payload=4 pending=0
-[chidori-rpc] func=0x0013 result=0 resp_payload=8
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
+[chidori] cudaGetDeviceProperties(dev=1) CALLED
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori-rpc] func=0x010a payload=0 pending=0
-[chidori-rpc] func=0x010a result=0 resp_payload=4
 [chidori] nvmlDeviceGetCount: local=1 + remote=1 = 2
-[chidori] cudaMalloc(2097152) -> LOCAL via cuMemAlloc (dev 0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0100 payload=8 pending=0
-[chidori-rpc] func=0x0100 result=0 resp_payload=8
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0107 payload=8 pending=0
-[chidori-rpc] func=0x0107 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0103 payload=36 pending=0
-[chidori-rpc] func=0x0103 result=0 resp_payload=12
-[chidori-rpc] func=0x0107 payload=8 pending=0
-[chidori-rpc] func=0x0107 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0106 payload=0 pending=0
-[chidori-rpc] func=0x0106 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0107 payload=8 pending=0
-[chidori-rpc] func=0x0107 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0107 payload=8 pending=0
-[chidori-rpc] func=0x0107 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0033 payload=0 pending=0
-[chidori-rpc] func=0x0033 result=0 resp_payload=8
-[chidori-rpc] func=0x0200 payload=0 pending=0
-[chidori-rpc] func=0x0200 result=0 resp_payload=8
-[chidori-rpc] func=0x0100 payload=8 pending=0
-[chidori-rpc] func=0x0100 result=0 resp_payload=8
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori-rpc] func=0x0103 payload=36 pending=0
-[chidori-rpc] func=0x0103 result=0 resp_payload=262144
-[chidori-rpc] func=0x0107 payload=8 pending=0
-[chidori-rpc] func=0x0107 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] Loaded real cuBLAS: 0x562d817c2c30
-[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: 14
-[chidori-rpc] func=0x0200 payload=0 pending=0
-[chidori-rpc] func=0x0200 result=0 resp_payload=8
-[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: 14
-[chidori] cudaMalloc(20971520) -> LOCAL via cuMemAlloc (dev 0)
-[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: 14
-[chidori] ensure_local_cublas_handle: cublasCreate_v2 failed: 14
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-[chidori] cudaSetDevice(0) -> LOCAL
-[chidori] cudaSetDevice(0) -> activated local GPU context 0x562d8846d7c0 (r=0)
-[chidori] cudaSetDevice(1) -> deactivated local GPU context
-[chidori-rpc] func=0x0109 payload=4 pending=0
-[chidori-rpc] func=0x0109 result=0 resp_payload=0
-bash: line 43: 1054200 Floating point exception   (core dumped) CHIDORI_LOCAL_DEVICES=0 CHIDORI_DIRECT_CONNECT=1 CHIDORI_CFG_OVERRIDE='{"id":"test","servers":["127.0.0.1:43211"]}' LD_PRELOAD="/home/fabricio/chidori/chidori-worker/build/libcuda.so.1" LD_LIBRARY_PATH=/home/fabricio/chidori/chidori-worker/build CHIDORI_DEBUG=1 ~/chidori/.venv/bin/python -c "
-import torch; torch._C._cuda_init()
-print(\"Devices:\", torch.cuda.device_count())
-
-# Tensor transfer
-x0 = torch.tensor([1.0, 2.0, 3.0]).cuda(0)
-print(\"cuda:0 tensor:\", x0.cpu().tolist())
-x1 = torch.tensor([4.0, 5.0, 6.0]).cuda(1)
-print(\"cuda:1 tensor:\", x1.cpu().tolist())
-
-# Sync
-torch.cuda.synchronize(0); print(\"cuda:0 sync OK\")
-torch.cuda.synchronize(1); print(\"cuda:1 sync OK\")
-
-# Matmul on remote
-a = torch.randn(256, 256)
-b = torch.randn(256, 256)
-cpu_ref = torch.mm(a, b)
-gpu1 = torch.mm(a.cuda(1), b.cuda(1)).cpu()
-err1 = (gpu1-cpu_ref).abs().max().item()
-print(\"cuda:1 matmul err=%f\" % err1)
-
-# Matmul on local
-gpu0 = torch.mm(a.cuda(0), b.cuda(0)).cpu()
-err0 = (gpu0-cpu_ref).abs().max().item()
-print(\"cuda:0 matmul err=%f\" % err0)
-
-# Randn on both
-r1 = torch.randn(4, device=\"cuda:1\")
-print(\"cuda:1 randn:\", r1.cpu().tolist())
-r0 = torch.randn(4, device=\"cuda:0\")
-print(\"cuda:0 randn:\", r0.cpu().tolist())
-
-print(\"=== ALL PARTIAL OFFLOAD TESTS PASSED ===\")
-" 2>&1
+[TRACE] cublasCreate_v2 dev=0 local=1
+[TRACE] cublasCreate_v2 → LOCAL handle=0x562edeb337a0
+[TRACE] cublasCreate_v2 dev=1 local=0
+[TRACE] cublasCreate_v2 dev=0 local=1
+[TRACE] cublasCreate_v2 → LOCAL handle=0x562edeb337a0
+Devices: 2
+FP32 cuda:0 err=0.000038
+FP32 cuda:1 err=0.000038
+FP16 mm cuda:0 err=0.015625
+FP16 mm cuda:1 err=0.015625
+BF16 mm cuda:0 err=0.062500
+BF16 mm cuda:1 err=0.062500
+FP16 Linear+backward cuda:0 OK
+Autocast 5-step training cuda:0 OK
+Randn cuda:0: [-0.9131885170936584, -0.5297993421554565]
+Randn cuda:1: [-1.5917742252349854, 0.8218645453453064]
+Sync both OK
+=== ALL PARTIAL OFFLOAD TESTS PASSED ===
+[chidori] SOCKET CLOSED at src/client/chidori_client.c:8182

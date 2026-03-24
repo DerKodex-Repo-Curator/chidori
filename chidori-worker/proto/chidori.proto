@@ -1,0 +1,962 @@
+// Chidori GPU-over-IP — gRPC Protocol Definition
+//
+// This proto defines the RPC service and message types for remoting CUDA
+// API calls over gRPC, as a potential migration path from the current
+// custom TCP wire protocol (chidori_protocol.h).
+//
+// Design decisions documented inline. See DESIGN_NOTES at end of file.
+
+syntax = "proto3";
+
+package chidori.v1;
+
+option go_package = "github.com/chidori-gpu/chidori/proto/chidori/v1;chidoriv1";
+option java_package = "com.chidori.proto.v1";
+option cc_enable_arenas = true;
+
+// ============================================================================
+// Core types — handles, errors, dimensions
+// ============================================================================
+
+// Remote GPU pointer. All device memory addresses are opaque uint64 handles
+// assigned by the server. The client never dereferences these — they are
+// tokens that the server maps to real CUdeviceptr values via handle_map.
+//
+// Using a wrapper message (vs raw uint64) gives us type safety in the proto
+// schema. Costs 2 bytes of tag overhead per field but prevents accidentally
+// passing a stream handle where a device pointer is expected.
+message DevicePtr {
+  uint64 addr = 1;
+}
+
+// Opaque handle for server-side CUDA objects (modules, streams, events,
+// cuBLAS handles, cuDNN descriptors, etc.). The client receives these from
+// creation RPCs and passes them back to subsequent calls.
+message Handle {
+  uint64 id = 1;
+}
+
+// CUDA error code. Covers both CUresult (Driver API, 0-999) and
+// cudaError_t (Runtime API, same numeric space). Also used for
+// cublasStatus_t and cudnnStatus_t since they're all small ints.
+message CudaStatus {
+  int32 code = 1;
+}
+
+// 3D grid/block dimensions for kernel launches.
+message Dim3 {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 z = 3;
+}
+
+// ============================================================================
+// Service definition
+// ============================================================================
+
+service ChidoriGpu {
+
+  // --------------------------------------------------------------------------
+  // Synchronous unary RPCs — client blocks until server responds.
+  // Used for operations that return data or handles the client needs
+  // before proceeding.
+  // --------------------------------------------------------------------------
+
+  // Initialization
+  rpc Init(InitRequest)                         returns (CudaStatus);
+  rpc DriverGetVersion(Empty)                   returns (VersionResponse);
+
+  // Device management
+  rpc DeviceGetCount(Empty)                     returns (DeviceCountResponse);
+  rpc DeviceGet(DeviceGetRequest)               returns (DeviceGetResponse);
+  rpc DeviceGetName(DeviceGetNameRequest)        returns (DeviceGetNameResponse);
+  rpc DeviceTotalMem(DeviceTotalMemRequest)      returns (DeviceTotalMemResponse);
+  rpc DeviceGetAttribute(DeviceGetAttributeRequest) returns (DeviceGetAttributeResponse);
+
+  // Context
+  rpc CtxCreate(CtxCreateRequest)               returns (CtxCreateResponse);
+  rpc CtxSynchronize(Empty)                     returns (CudaStatus);
+  rpc DevicePrimaryCtxRetain(DevicePrimaryCtxRetainRequest) returns (CtxCreateResponse);
+
+  // Memory — sync (returns data or handles)
+  rpc MemAlloc(MemAllocRequest)                 returns (MemAllocResponse);
+  rpc MemcpyDtoH(MemcpyDtoHRequest)            returns (MemcpyDtoHResponse);
+  rpc MemGetInfo(Empty)                         returns (MemGetInfoResponse);
+
+  // Module / function loading
+  rpc ModuleLoadData(ModuleLoadDataRequest)     returns (ModuleLoadDataResponse);
+  rpc ModuleGetFunction(ModuleGetFunctionRequest) returns (ModuleGetFunctionResponse);
+  rpc FuncGetAttribute(FuncGetAttributeRequest) returns (FuncGetAttributeResponse);
+
+  // Stream / event — sync (return handles)
+  rpc StreamCreate(StreamCreateRequest)         returns (StreamCreateResponse);
+  rpc EventCreate(EventCreateRequest)           returns (EventCreateResponse);
+  rpc EventElapsedTime(EventElapsedTimeRequest) returns (EventElapsedTimeResponse);
+
+  // Synchronization barriers
+  rpc DeviceSynchronize(Empty)                  returns (CudaStatus);
+  rpc StreamSynchronize(StreamSynchronizeRequest) returns (CudaStatus);
+  rpc EventSynchronize(EventSynchronizeRequest) returns (CudaStatus);
+
+  // cuBLAS — sync (handle creation)
+  rpc CublasCreate(Empty)                       returns (CublasCreateResponse);
+  rpc CublasLtCreate(Empty)                     returns (CublasCreateResponse);
+
+  // cuDNN — sync (descriptor creation)
+  rpc CudnnCreate(Empty)                        returns (CudnnCreateResponse);
+  rpc CudnnCreateTensorDescriptor(Empty)        returns (CudnnDescriptorResponse);
+  rpc CudnnCreateFilterDescriptor(Empty)        returns (CudnnDescriptorResponse);
+  rpc CudnnCreateConvolutionDescriptor(Empty)   returns (CudnnDescriptorResponse);
+  rpc CudnnCreateActivationDescriptor(Empty)    returns (CudnnDescriptorResponse);
+  rpc CudnnCreatePoolingDescriptor(Empty)       returns (CudnnDescriptorResponse);
+  rpc CudnnGetConvolutionForwardWorkspaceSize(CudnnConvWorkspaceSizeRequest)
+      returns (CudnnWorkspaceSizeResponse);
+
+  // --------------------------------------------------------------------------
+  // Client-streaming RPC — async fire-and-forget batches.
+  //
+  // This is the critical performance path. During a forward/backward pass,
+  // the client fires hundreds of async calls (memcpy, kernel launch, GEMM)
+  // without waiting for responses. With gRPC client-streaming, the client
+  // sends a stream of AsyncOp messages, and the server processes them in
+  // order. The server responds once at stream close (or on error).
+  //
+  // This replaces the current CHIDORI_FLAG_ASYNC + TCP_CORK batching.
+  // A single HTTP/2 stream carries all the async operations, and HTTP/2
+  // flow control + framing handle the batching that TCP_CORK does today.
+  // --------------------------------------------------------------------------
+  rpc ExecuteAsync(stream AsyncOp)              returns (AsyncBatchResponse);
+
+  // --------------------------------------------------------------------------
+  // Bidirectional streaming — for mixed sync/async within a session.
+  //
+  // Alternative to separate unary + client-streaming RPCs. The client sends
+  // a stream of SessionOp messages (each tagged sync or async). For async
+  // ops, the server processes silently. For sync ops, the server sends back
+  // a SessionResult with the matching sequence number.
+  //
+  // This is closer to the current protocol's behavior where sync and async
+  // calls share one TCP connection and are interleaved freely.
+  // --------------------------------------------------------------------------
+  rpc Session(stream SessionOp)                 returns (stream SessionResult);
+
+  // --------------------------------------------------------------------------
+  // Server-streaming — large DtoH transfers.
+  //
+  // For cuMemcpyDtoH of very large buffers (64MB+), the server streams
+  // back chunks instead of building one massive response. This avoids
+  // gRPC's default 4MB message size limit and keeps memory pressure low.
+  // --------------------------------------------------------------------------
+  rpc MemcpyDtoHStreaming(MemcpyDtoHRequest)    returns (stream DataChunk);
+
+  // --------------------------------------------------------------------------
+  // Client-streaming — large HtoD transfers.
+  //
+  // For cuMemcpyHtoD of very large buffers (64MB+), the client streams
+  // chunks. The server assembles them and does the device copy at the end.
+  // --------------------------------------------------------------------------
+  rpc MemcpyHtoDStreaming(stream HtoDChunk)     returns (CudaStatus);
+}
+
+// ============================================================================
+// Async operation wrapper — used in ExecuteAsync streaming RPC.
+//
+// Each message is one fire-and-forget CUDA call. The server processes
+// them in order and does not send individual responses (matching the
+// current CHIDORI_FLAG_ASYNC behavior).
+// ============================================================================
+
+message AsyncOp {
+  // Sequence number for debugging/logging. Not used for response matching
+  // since async ops don't get individual responses.
+  uint32 seq_num = 1;
+
+  oneof op {
+    MemFreeOp           mem_free            = 10;
+    MemcpyHtoDOp        memcpy_htod         = 11;
+    MemcpyDtoDOp        memcpy_dtod         = 12;
+    MemsetOp            memset_op           = 13;
+    LaunchKernelOp      launch_kernel       = 14;
+    EventRecordOp       event_record        = 15;
+    StreamWaitEventOp   stream_wait_event   = 16;
+
+    // cuBLAS async compute
+    GemmExOp            gemm_ex             = 20;
+    GemmStridedBatchedOp gemm_strided_batched = 21;
+    CublasLtMatmulOp    cublas_lt_matmul    = 22;
+
+    // cuDNN async compute
+    CudnnConvForwardOp  cudnn_conv_forward  = 30;
+    CudnnConvBwdDataOp  cudnn_conv_bwd_data = 31;
+    CudnnConvBwdFilterOp cudnn_conv_bwd_filter = 32;
+    CudnnBatchNormFwdOp cudnn_bn_fwd        = 33;
+    CudnnBatchNormBwdOp cudnn_bn_bwd        = 34;
+    CudnnActivationFwdOp cudnn_act_fwd      = 35;
+    CudnnSoftmaxFwdOp   cudnn_softmax_fwd  = 36;
+
+    // Descriptor setup (async, no return value needed)
+    CublasSetStreamOp   cublas_set_stream   = 40;
+    CublasSetMathModeOp cublas_set_math_mode = 41;
+    CudnnSetStreamOp    cudnn_set_stream    = 42;
+    CudnnSetTensor4dOp  cudnn_set_tensor_4d = 43;
+    CudnnSetFilterNdOp  cudnn_set_filter_nd = 44;
+    CudnnSetConv2dOp    cudnn_set_conv_2d   = 45;
+    CudnnSetActivationOp cudnn_set_activation = 46;
+    CudnnSetConvMathTypeOp cudnn_set_conv_math_type = 47;
+    CudnnSetConvGroupCountOp cudnn_set_conv_group_count = 48;
+
+    // Destroy operations (async, no return value)
+    DestroyHandleOp     destroy_handle      = 50;
+    StreamDestroyOp     stream_destroy      = 51;
+    EventDestroyOp      event_destroy       = 52;
+
+    // Fat binary registration (async)
+    RegisterFatBinaryOp register_fat_binary = 60;
+    RegisterFunctionOp  register_function   = 61;
+  }
+}
+
+// ============================================================================
+// Session-level bidirectional streaming messages
+// ============================================================================
+
+message SessionOp {
+  uint32 seq_num = 1;
+  bool   expect_response = 2;  // true = sync (server must reply), false = async
+  AsyncOp op = 3;              // reuse the same op definitions
+}
+
+message SessionResult {
+  uint32     seq_num = 1;    // matches the request seq_num
+  CudaStatus status  = 2;
+  bytes      payload = 3;    // optional return data (e.g., DtoH result, handle)
+}
+
+// ============================================================================
+// Async batch response — sent once when the client closes the stream.
+// ============================================================================
+
+message AsyncBatchResponse {
+  CudaStatus status = 1;       // overall status (first error, or SUCCESS)
+  uint32 ops_processed = 2;    // number of ops successfully dispatched
+  uint32 first_error_seq = 3;  // seq_num of first failed op (0 = none)
+}
+
+// ============================================================================
+// Streaming data transfer messages
+// ============================================================================
+
+message DataChunk {
+  bytes  data   = 1;
+  uint64 offset = 2;   // byte offset within the full transfer
+  bool   final  = 3;   // true on the last chunk
+}
+
+message HtoDChunk {
+  // First message in stream must set dst and total_size.
+  // Subsequent messages only need data.
+  DevicePtr dst        = 1;
+  uint64    total_size = 2;   // total bytes to transfer (set on first chunk)
+  bytes     data       = 3;
+  uint64    offset     = 4;   // byte offset within transfer
+}
+
+// ============================================================================
+// Request / Response messages for unary RPCs
+// ============================================================================
+
+message Empty {}
+
+// --- Initialization ---
+
+message InitRequest {
+  uint32 flags = 1;
+}
+
+message VersionResponse {
+  CudaStatus status  = 1;
+  int32      version = 2;
+}
+
+// --- Device management ---
+
+message DeviceCountResponse {
+  CudaStatus status = 1;
+  int32      count  = 2;
+}
+
+message DeviceGetRequest {
+  int32 ordinal = 1;
+}
+
+message DeviceGetResponse {
+  CudaStatus status = 1;
+  int32      device = 2;  // CUdevice is an int
+}
+
+message DeviceGetNameRequest {
+  int32 device = 1;
+}
+
+message DeviceGetNameResponse {
+  CudaStatus status = 1;
+  string     name   = 2;
+}
+
+message DeviceTotalMemRequest {
+  int32 device = 1;
+}
+
+message DeviceTotalMemResponse {
+  CudaStatus status    = 1;
+  uint64     total_mem = 2;
+}
+
+message DeviceGetAttributeRequest {
+  int32 attribute = 1;  // CUdevice_attribute enum value
+  int32 device    = 2;
+}
+
+message DeviceGetAttributeResponse {
+  CudaStatus status = 1;
+  int32      value  = 2;
+}
+
+// --- Context ---
+
+message CtxCreateRequest {
+  uint32 flags  = 1;
+  int32  device = 2;
+}
+
+message CtxCreateResponse {
+  CudaStatus status = 1;
+  Handle     ctx    = 2;
+}
+
+message DevicePrimaryCtxRetainRequest {
+  int32 device = 1;
+}
+
+// --- Memory ---
+
+message MemAllocRequest {
+  uint64 byte_size = 1;
+}
+
+message MemAllocResponse {
+  CudaStatus status = 1;
+  DevicePtr  ptr    = 2;
+}
+
+message MemcpyDtoHRequest {
+  DevicePtr src       = 1;
+  uint64    byte_count = 2;
+}
+
+message MemcpyDtoHResponse {
+  CudaStatus status = 1;
+  bytes      data   = 2;
+}
+
+message MemGetInfoResponse {
+  CudaStatus status     = 1;
+  uint64     free_bytes = 2;
+  uint64     total_bytes = 3;
+}
+
+// --- Module / Function ---
+
+message ModuleLoadDataRequest {
+  bytes image = 1;   // PTX text or CUBIN binary (can be multi-MB)
+}
+
+message ModuleLoadDataResponse {
+  CudaStatus status = 1;
+  Handle     module = 2;
+}
+
+message ModuleGetFunctionRequest {
+  Handle module = 1;
+  string name   = 2;
+}
+
+message ModuleGetFunctionResponse {
+  CudaStatus status   = 1;
+  Handle     function = 2;
+}
+
+message FuncGetAttributeRequest {
+  int32  attribute = 1;  // CUfunction_attribute enum
+  Handle function  = 2;
+}
+
+message FuncGetAttributeResponse {
+  CudaStatus status = 1;
+  int32      value  = 2;
+}
+
+// --- Stream / Event ---
+
+message StreamCreateRequest {
+  uint32 flags = 1;
+}
+
+message StreamCreateResponse {
+  CudaStatus status = 1;
+  Handle     stream = 2;
+}
+
+message EventCreateRequest {
+  uint32 flags = 1;
+}
+
+message EventCreateResponse {
+  CudaStatus status = 1;
+  Handle     event  = 2;
+}
+
+message EventElapsedTimeRequest {
+  Handle start = 1;
+  Handle end   = 2;
+}
+
+message EventElapsedTimeResponse {
+  CudaStatus status = 1;
+  float      ms     = 2;
+}
+
+message StreamSynchronizeRequest {
+  Handle stream = 1;
+}
+
+message EventSynchronizeRequest {
+  Handle event = 1;
+}
+
+// --- cuBLAS / cuDNN handle creation ---
+
+message CublasCreateResponse {
+  CudaStatus status = 1;
+  Handle     handle = 2;
+}
+
+message CudnnCreateResponse {
+  CudaStatus status = 1;
+  Handle     handle = 2;
+}
+
+message CudnnDescriptorResponse {
+  CudaStatus status     = 1;
+  Handle     descriptor = 2;
+}
+
+message CudnnConvWorkspaceSizeRequest {
+  Handle cudnn_handle = 1;
+  Handle x_desc       = 2;
+  Handle w_desc       = 3;
+  Handle conv_desc    = 4;
+  Handle y_desc       = 5;
+  int32  algo         = 6;
+}
+
+message CudnnWorkspaceSizeResponse {
+  CudaStatus status         = 1;
+  uint64     size_in_bytes  = 2;
+}
+
+// ============================================================================
+// Async operation payloads
+// ============================================================================
+
+// --- Memory operations ---
+
+message MemFreeOp {
+  DevicePtr ptr = 1;
+}
+
+message MemcpyHtoDOp {
+  DevicePtr dst        = 1;
+  uint64    byte_count = 2;
+  bytes     data       = 3;  // the actual host data (inlined for small xfers)
+}
+
+message MemcpyDtoDOp {
+  DevicePtr dst        = 1;
+  DevicePtr src        = 2;
+  uint64    byte_count = 3;
+}
+
+message MemsetOp {
+  DevicePtr dst   = 1;
+  uint32    value = 2;    // fill value (D8/D16/D32)
+  uint64    count = 3;    // number of elements
+  int32     width = 4;    // 1=D8, 2=D16, 4=D32
+}
+
+// --- Kernel launch ---
+
+message LaunchKernelOp {
+  Handle function       = 1;
+  Dim3   grid_dim       = 2;
+  Dim3   block_dim      = 3;
+  uint32 shared_mem     = 4;
+  Handle stream         = 5;
+  bytes  param_buffer   = 6;  // contiguous kernel parameter buffer
+}
+
+// --- Event / Stream control ---
+
+message EventRecordOp {
+  Handle event  = 1;
+  Handle stream = 2;
+}
+
+message StreamWaitEventOp {
+  Handle stream = 1;
+  Handle event  = 2;
+  uint32 flags  = 3;
+}
+
+// --- cuBLAS ---
+
+message GemmExOp {
+  Handle    handle       = 1;
+  int32     transa       = 2;   // cublasOperation_t
+  int32     transb       = 3;
+  int32     m            = 4;
+  int32     n            = 5;
+  int32     k            = 6;
+  bytes     alpha        = 7;   // scalar value (up to 8 bytes, type from compute_type)
+  DevicePtr A            = 8;
+  int32     A_type       = 9;   // cudaDataType
+  int32     lda          = 10;
+  DevicePtr B            = 11;
+  int32     B_type       = 12;
+  int32     ldb          = 13;
+  bytes     beta         = 14;  // scalar value
+  DevicePtr C            = 15;
+  int32     C_type       = 16;
+  int32     ldc          = 17;
+  int32     compute_type = 18;  // cublasComputeType_t
+  int32     algo         = 19;  // cublasGemmAlgo_t
+}
+
+message GemmStridedBatchedOp {
+  Handle    handle         = 1;
+  int32     transa         = 2;
+  int32     transb         = 3;
+  int32     m              = 4;
+  int32     n              = 5;
+  int32     k              = 6;
+  bytes     alpha          = 7;
+  DevicePtr A              = 8;
+  int32     A_type         = 9;
+  int32     lda            = 10;
+  int64     stride_A       = 11;
+  DevicePtr B              = 12;
+  int32     B_type         = 13;
+  int32     ldb            = 14;
+  int64     stride_B       = 15;
+  bytes     beta           = 16;
+  DevicePtr C              = 17;
+  int32     C_type         = 18;
+  int32     ldc            = 19;
+  int64     stride_C       = 20;
+  int32     batch_count    = 21;
+  int32     compute_type   = 22;
+  int32     algo           = 23;
+}
+
+// cublasLtMatmul — carries the full matmul descriptor + 4 matrix layouts
+// inline, matching the current 308-byte wire payload.
+message CublasLtMatmulOp {
+  Handle    lt_handle    = 1;
+
+  // Matmul descriptor fields
+  int32     transa       = 2;
+  int32     transb       = 3;
+  int32     compute_type = 4;
+  int32     scale_type   = 5;
+  int32     epilogue     = 6;   // CUBLASLT_EPILOGUE_*
+  DevicePtr bias_pointer = 7;
+
+  // Matrix layouts: A, B, C, D
+  repeated MatrixLayout layouts = 8;  // exactly 4 entries
+
+  bytes     alpha        = 9;   // scalar (up to 8 bytes)
+  bytes     beta         = 10;
+
+  DevicePtr A            = 11;
+  DevicePtr B            = 12;
+  DevicePtr C            = 13;
+  DevicePtr D            = 14;
+  Handle    stream       = 15;
+  bytes     algo         = 16;  // 64-byte opaque algo struct
+}
+
+message MatrixLayout {
+  int32  dtype              = 1;  // cudaDataType (CUDA_R_32F=0, CUDA_R_16F=2, etc.)
+  uint64 rows               = 2;
+  uint64 cols               = 3;
+  int64  ld                 = 4;  // leading dimension
+  int32  batch_count        = 5;
+  int64  strided_batch_offset = 6;
+}
+
+// --- cuBLAS configuration (async, no response needed) ---
+
+message CublasSetStreamOp {
+  Handle cublas_handle = 1;
+  Handle stream        = 2;
+}
+
+message CublasSetMathModeOp {
+  Handle cublas_handle = 1;
+  int32  math_mode     = 2;
+}
+
+// --- cuDNN operations ---
+
+message CudnnSetStreamOp {
+  Handle cudnn_handle = 1;
+  Handle stream       = 2;
+}
+
+message CudnnSetTensor4dOp {
+  Handle descriptor = 1;
+  int32  format     = 2;  // cudnnTensorFormat_t
+  int32  data_type  = 3;  // cudnnDataType_t
+  int32  n          = 4;
+  int32  c          = 5;
+  int32  h          = 6;
+  int32  w          = 7;
+}
+
+message CudnnSetFilterNdOp {
+  Handle        descriptor = 1;
+  int32         data_type  = 2;
+  int32         format     = 3;
+  repeated int32 dims      = 4;  // variable-length dimension array
+}
+
+message CudnnSetConv2dOp {
+  Handle descriptor = 1;
+  int32  pad_h      = 2;
+  int32  pad_w      = 3;
+  int32  stride_h   = 4;
+  int32  stride_w   = 5;
+  int32  dilation_h = 6;
+  int32  dilation_w = 7;
+  int32  mode       = 8;  // cudnnConvolutionMode_t
+  int32  compute_type = 9;
+}
+
+message CudnnSetActivationOp {
+  Handle descriptor = 1;
+  int32  mode       = 2;  // cudnnActivationMode_t
+  int32  nan_prop   = 3;
+  double coef       = 4;
+}
+
+message CudnnSetConvMathTypeOp {
+  Handle descriptor = 1;
+  int32  math_type  = 2;
+}
+
+message CudnnSetConvGroupCountOp {
+  Handle descriptor = 1;
+  int32  group_count = 2;
+}
+
+// cuDNN forward/backward ops — all async, all follow the same pattern:
+// handle + descriptors + device pointers + scalars
+
+message CudnnConvForwardOp {
+  Handle    cudnn_handle = 1;
+  bytes     alpha        = 2;   // scalar (up to 8 bytes)
+  Handle    x_desc       = 3;
+  DevicePtr x            = 4;
+  Handle    w_desc       = 5;
+  DevicePtr w            = 6;
+  Handle    conv_desc    = 7;
+  int32     algo         = 8;
+  DevicePtr workspace    = 9;
+  uint64    workspace_size = 10;
+  bytes     beta         = 11;
+  Handle    y_desc       = 12;
+  DevicePtr y            = 13;
+}
+
+message CudnnConvBwdDataOp {
+  Handle    cudnn_handle = 1;
+  bytes     alpha        = 2;
+  Handle    w_desc       = 3;
+  DevicePtr w            = 4;
+  Handle    dy_desc      = 5;
+  DevicePtr dy           = 6;
+  Handle    conv_desc    = 7;
+  int32     algo         = 8;
+  DevicePtr workspace    = 9;
+  uint64    workspace_size = 10;
+  bytes     beta         = 11;
+  Handle    dx_desc      = 12;
+  DevicePtr dx           = 13;
+}
+
+message CudnnConvBwdFilterOp {
+  Handle    cudnn_handle = 1;
+  bytes     alpha        = 2;
+  Handle    x_desc       = 3;
+  DevicePtr x            = 4;
+  Handle    dy_desc      = 5;
+  DevicePtr dy           = 6;
+  Handle    conv_desc    = 7;
+  int32     algo         = 8;
+  DevicePtr workspace    = 9;
+  uint64    workspace_size = 10;
+  bytes     beta         = 11;
+  Handle    dw_desc      = 12;
+  DevicePtr dw           = 13;
+}
+
+message CudnnBatchNormFwdOp {
+  Handle    cudnn_handle       = 1;
+  int32     mode               = 2;  // cudnnBatchNormMode_t
+  bytes     alpha              = 3;
+  bytes     beta               = 4;
+  Handle    x_desc             = 5;
+  DevicePtr x                  = 6;
+  Handle    y_desc             = 7;
+  DevicePtr y                  = 8;
+  Handle    bn_scale_bias_desc = 9;
+  DevicePtr bn_scale           = 10;
+  DevicePtr bn_bias            = 11;
+  double    exp_avg_factor     = 12;
+  DevicePtr running_mean       = 13;
+  DevicePtr running_var        = 14;
+  double    epsilon            = 15;
+  DevicePtr save_mean          = 16;
+  DevicePtr save_inv_var       = 17;
+}
+
+message CudnnBatchNormBwdOp {
+  Handle    cudnn_handle       = 1;
+  int32     mode               = 2;
+  bytes     alpha_data_diff    = 3;
+  bytes     beta_data_diff     = 4;
+  bytes     alpha_param_diff   = 5;
+  bytes     beta_param_diff    = 6;
+  Handle    x_desc             = 7;
+  DevicePtr x                  = 8;
+  Handle    dy_desc            = 9;
+  DevicePtr dy                 = 10;
+  Handle    dx_desc            = 11;
+  DevicePtr dx                 = 12;
+  Handle    bn_scale_bias_desc = 13;
+  DevicePtr bn_scale           = 14;
+  DevicePtr d_bn_scale         = 15;
+  DevicePtr d_bn_bias          = 16;
+  double    epsilon            = 17;
+  DevicePtr saved_mean         = 18;
+  DevicePtr saved_inv_var      = 19;
+}
+
+message CudnnActivationFwdOp {
+  Handle    cudnn_handle = 1;
+  Handle    act_desc     = 2;
+  bytes     alpha        = 3;
+  Handle    x_desc       = 4;
+  DevicePtr x            = 5;
+  bytes     beta         = 6;
+  Handle    y_desc       = 7;
+  DevicePtr y            = 8;
+}
+
+message CudnnSoftmaxFwdOp {
+  Handle    cudnn_handle = 1;
+  int32     algo         = 2;  // cudnnSoftmaxAlgorithm_t
+  int32     mode         = 3;  // cudnnSoftmaxMode_t
+  bytes     alpha        = 4;
+  Handle    x_desc       = 5;
+  DevicePtr x            = 6;
+  bytes     beta         = 7;
+  Handle    y_desc       = 8;
+  DevicePtr y            = 9;
+}
+
+// --- Destroy operations ---
+
+message DestroyHandleOp {
+  Handle handle    = 1;
+  int32  handle_type = 2;  // disambiguate: 0=cublas, 1=cublasLt, 2=cudnn, etc.
+}
+
+message StreamDestroyOp {
+  Handle stream = 1;
+}
+
+message EventDestroyOp {
+  Handle event = 1;
+}
+
+// --- Fat binary / function registration ---
+
+message RegisterFatBinaryOp {
+  bytes  image    = 1;   // fat binary data (CUBIN/PTX)
+  uint64 cookie   = 2;   // client-side handle for RegisterFunction references
+}
+
+message RegisterFunctionOp {
+  uint64 fat_binary_cookie = 1;
+  string host_fun_name     = 2;  // __device_stub_xxx
+  string device_fun_name   = 3;
+}
+
+// ============================================================================
+// DESIGN NOTES — gRPC vs Current Wire Protocol Comparison
+// ============================================================================
+//
+// 1. MESSAGE SIZE COMPARISON
+//
+//    Current protocol:
+//      Request:  16 bytes header + payload
+//      Response: 12 bytes header + payload
+//
+//    gRPC/protobuf:
+//      Each field = 1-byte tag + varint/data. An AsyncOp wrapping a MemFreeOp:
+//        - AsyncOp outer: ~0 bytes (no length prefix needed in streaming)
+//        - seq_num: 1 tag + 1-4 varint = 2-5 bytes
+//        - oneof tag for mem_free: 1 byte
+//        - MemFreeOp: 1 tag + DevicePtr(1 tag + 1-9 varint) = 3-12 bytes
+//        Total: ~6-18 bytes
+//
+//      Compare: current protocol sends 16 + 8 = 24 bytes for cuMemFree.
+//
+//      For cuMemAlloc (request):
+//        Current: 16 + 8 = 24 bytes
+//        Proto:   MemAllocRequest { byte_size: uint64 } = ~2-10 bytes
+//                 + gRPC frame header (5 bytes) + HTTP/2 frame (9 bytes)
+//                 = ~16-24 bytes total on wire
+//
+//      For cublasGemmEx (async):
+//        Current: 16 header + 100 payload = 116 bytes
+//        Proto:   GemmExOp with all fields = ~80-100 bytes serialized
+//                 + gRPC framing = ~94-114 bytes
+//
+//      For cuLaunchKernel (async, 256-byte param buffer):
+//        Current: 16 + 44 + 1 + 4 + 256 = 321 bytes
+//        Proto:   LaunchKernelOp = ~280-300 bytes + framing = ~294-314 bytes
+//
+//      For cublasLtMatmul (async):
+//        Current: 16 + 308 = 324 bytes
+//        Proto:   CublasLtMatmulOp = ~250-280 bytes + framing = ~264-294 bytes
+//
+//      Summary: protobuf messages are similar size or slightly smaller for
+//      metadata-heavy messages (field tags vs fixed offsets trade off). The
+//      overhead comes from gRPC framing (5-byte length-prefixed message +
+//      HTTP/2 DATA frames). For async batches in a streaming RPC, the
+//      framing is amortized across many messages in one HTTP/2 stream.
+//
+// 2. LARGE PAYLOAD HANDLING (cuMemcpyHtoD 64MB)
+//
+//    Current: 16-byte header + 16-byte (ptr+size) + 64MB inline data.
+//    Server has a 256KB batch buffer; oversized payloads fall through to
+//    a direct socket read. Simple and fast.
+//
+//    gRPC options:
+//    a) Inline bytes field: protobuf has no message size limit, but gRPC
+//       defaults to 4MB max message. Can be raised, but 64MB single
+//       messages cause allocation spikes.
+//    b) Client-streaming (MemcpyHtoDStreaming): client sends 1-4MB chunks.
+//       Server accumulates or copies directly. Better memory profile.
+//    c) Separate data channel: use gRPC for control, raw TCP for bulk data.
+//       Defeats the purpose of migrating to gRPC.
+//
+//    Recommendation: use client-streaming with 1MB chunks for transfers
+//    above 4MB. Below 4MB, use the inline bytes field in MemcpyHtoDOp
+//    within the async batch stream for simplicity.
+//
+// 3. ASYNC BATCHING STRATEGY
+//
+//    Current: CHIDORI_FLAG_ASYNC tells server "don't send response."
+//    TCP_CORK batches multiple writes into one TCP segment. The server's
+//    256KB recv buffer processes all complete requests in a tight loop.
+//
+//    gRPC client-streaming achieves similar behavior:
+//    - Client sends AsyncOp messages on a single HTTP/2 stream
+//    - HTTP/2 flow control and TCP Nagle/CORK handle batching
+//    - Server reads from the stream in a loop, dispatching each op
+//    - No per-op response overhead
+//
+//    The main difference: gRPC adds per-message framing (5 bytes) and
+//    HTTP/2 DATA frame headers (9 bytes). For a burst of 100 async ops
+//    averaging 100 bytes each: current = 11,600 bytes total (16+100 each),
+//    gRPC = ~11,400 bytes (100+14 framing each). Roughly equivalent.
+//
+// 4. BIDIRECTIONAL STREAMING vs SEPARATE RPCS
+//
+//    The Session() bidi-stream RPC mirrors the current protocol most
+//    closely: one connection, interleaved sync and async calls. The
+//    client tags each op with expect_response. The server only sends
+//    SessionResult messages for sync ops.
+//
+//    Pro: single stream, natural ordering, matches existing architecture.
+//    Con: head-of-line blocking — a slow sync RPC blocks all async ops
+//    behind it in the same HTTP/2 stream.
+//
+//    Alternative: use separate unary RPCs for sync calls and a dedicated
+//    ExecuteAsync stream for async calls. This uses two HTTP/2 streams
+//    (the sync RPCs each get their own stream). No HOL blocking between
+//    sync and async paths.
+//
+//    Recommendation: the separate-RPC approach is cleaner. The current
+//    protocol's sync path already flushes TCP_CORK before waiting,
+//    effectively creating a barrier. Two gRPC streams replicate this
+//    naturally.
+//
+// 5. POINTER HANDLES
+//
+//    Remote GPU pointers (CUdeviceptr) are uint64 values that only the
+//    server can dereference. They flow through the protocol as opaque
+//    tokens. Using DevicePtr wrapper messages (vs raw uint64 fields)
+//    adds 2 bytes of protobuf overhead per pointer but provides schema
+//    clarity and prevents mixing pointer types.
+//
+//    The server's handle_map (mapping wire handles to real pointers)
+//    remains unchanged — the gRPC layer just serializes the uint64
+//    differently.
+//
+// 6. WHAT gRPC BUYS
+//
+//    + TLS/mTLS for free (production security without custom crypto)
+//    + Built-in flow control (backpressure on fast client / slow GPU)
+//    + Connection multiplexing (HTTP/2 streams for concurrent ops)
+//    + Schema evolution (add fields without breaking old clients)
+//    + Cross-language clients (Go control plane + C worker can share .proto)
+//    + Health checking, load balancing, interceptors (observability)
+//    + Compression (gzip/zstd at transport level, replaces custom zstd)
+//
+// 7. WHAT gRPC COSTS
+//
+//    - Latency: ~5-15us per RPC overhead vs ~1-2us for raw TCP send.
+//      For sync RPCs (cuMemAlloc, cudaDeviceSynchronize), this adds to
+//      the network RTT. For async RPCs (the hot path), it's amortized.
+//    - Memory: protobuf serialization allocates. The current protocol
+//      does zero-copy dispatch from the recv buffer.
+//    - Complexity: gRPC runtime, HTTP/2 stack, protobuf codegen.
+//      The current protocol is ~200 lines of C.
+//    - Binary size: gRPC + protobuf-c adds ~1-2MB to the client library.
+//      The current libchidori.so is ~200KB.
+//
+// 8. HYBRID APPROACH (RECOMMENDED)
+//
+//    Use gRPC for the control plane and session setup. Keep raw TCP for
+//    the data plane (bulk memory transfers and async compute batches).
+//    The gRPC service handles: init, device queries, handle creation/
+//    destruction, synchronization. The raw TCP fast path handles: HtoD,
+//    DtoH, kernel launch, GEMM — the operations that fire 1000s of
+//    times per second during training.
+//
+//    This gives the best of both worlds: schema safety and TLS for
+//    control operations, zero-overhead for the performance-critical path.

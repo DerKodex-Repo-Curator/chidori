@@ -1,0 +1,39 @@
+[13:36:29] === Cross-Architecture Test Suite ===
+[13:36:29] Server: ssh7.vast.ai:14434 → localhost:43212
+[13:36:29] Client: lenovo → /home/fabricio/chidori/chidori-worker/build
+[13:36:29] Python: /home/fabricio/chidori/chidori-worker/../.venv/bin/python
+[13:36:29] Log: /home/fabricio/chidori/chidori-worker/.claude/crossarch_20260322_133629.log
+[13:36:29] 
+[13:36:36] Server GPU: 
+[13:36:36] 
+[13:36:36] --- TEST: init_device ---
+[13:36:44] RESULT: init_device FAIL (exit=0)
+TEST_GPU: 
+TEST_VRAM: 0 GB
+TEST_TIME: 0.1s
+TEST_PASS: False
+[13:36:44] 
+[13:36:44] --- TEST: tensor_readback ---
+[13:36:51] RESULT: tensor_readback FAIL (exit=1)
+
+[13:36:51] 
+[13:36:51] --- TEST: kernel_elementwise ---
+[13:36:58] RESULT: kernel_elementwise FAIL (exit=1)
+
+[13:36:58] 
+[13:36:58] --- TEST: matmul_verified ---
+[13:37:06] RESULT: matmul_verified FAIL (exit=1)
+
+[13:37:06] 
+[13:37:06] --- TEST: matmul_large_verified ---
+[13:37:13] RESULT: matmul_large_verified FAIL (exit=1)
+
+[13:37:13] 
+[13:37:13] --- TEST: training_convergence ---
+[13:37:21] RESULT: training_convergence FAIL (exit=1)
+
+[13:37:21] 
+[13:37:21] === RESULTS ===
+[13:37:21] 0/6 passed, 6 failed
+[13:37:21] Log saved to: /home/fabricio/chidori/chidori-worker/.claude/crossarch_20260322_133629.log
+[13:37:21] SOME TESTS FAILED

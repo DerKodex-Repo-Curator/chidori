@@ -1,0 +1,23 @@
+1151517
+=== test_train.py ===
+RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasLtMatmulDescCreate(&raw_descriptor, compute_type, scale_type)`
+=== test_training_fp16.py ===
+  step   0  loss=9.4088  tokens/s=59587  elapsed=0.0s
+  step  10  loss=9.4228  tokens/s=88881  elapsed=0.3s
+  step  20  loss=9.4330  tokens/s=91717  elapsed=0.5s
+RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasLtMatmulDescCreate(&raw_descriptor, compute_type, scale_type)`
+=== test_training.py ===
+  step   0  loss=9.4113  tokens/s=59726  elapsed=0.0s
+  step  10  loss=9.3841  tokens/s=72280  elapsed=0.2s
+  step  20  loss=9.3524  tokens/s=73275  elapsed=0.3s
+  step  30  loss=9.3350  tokens/s=73467  elapsed=0.4s
+  step  40  loss=9.2914  tokens/s=73540  elapsed=0.6s
+[VERIFY] OK — loss is decreasing, training is working
+TRAINING:   0.7s (50 steps)
+PASS: test_training
+=== test_inference.py ===
+[INFERENCE] Prompt: Explain how GPU-over-IP works in simple terms:
+[INFERENCE] Generating 200 tokens...
+RuntimeError: CUDA error: CUBLAS_STATUS_INVALID_VALUE when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Cdesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`
+=== ALL REMOTE TESTS DONE ===
+Terminated                 nohup build/chidori-worker --standalone 43211 > /tmp/server.log 2>&1

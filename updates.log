@@ -1,5 +1,84 @@
 # Updates Log - Partial GPU Offloading
 
+## Session: 2026-03-22 (continued 2) - FP16 cuBLAS Investigation
+
+### Key findings: Version script + dlsym interception
+
+1. **Version script was missing on Lenovo** — cuBLAS/cuBLASLt symbols exported
+   as unversioned (Base), not matching PyTorch's `@libcublas.so.12` references.
+   Fixed by copying the correct chidori_client.map and Makefile.
+
+2. **dlsym interception added** — PyTorch may cache cuBLAS function pointers
+   via `dlsym(cublas_handle, "cublasGemmEx")`. Our `dlsym()` interceptor
+   redirects cuBLAS/cuBLASLt symbol lookups to our LD_PRELOAD'd versions.
+   Uses `dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34")` to bootstrap the real dlsym.
+   All internal code uses `__real_dlsym()` to bypass our interceptor.
+
+3. **dlopen redirect made unconditional** — Previously gated on g_dlopen_redirect_active
+   or g_in_real_cuda. Now ALWAYS redirects dlopen("libcuda.so.1") to the real driver.
+   Needed because cuBLAS bypasses our PLT interception.
+
+### Critical discovery: PyTorch cuBLAS bypasses PLT entirely
+
+Despite LD_DEBUG showing PLT bindings to our library:
+- `cublasGemmEx`, `cublasLtMatmul`, `cublasSgemm_v2` are NEVER called through PLT
+- `cublasCreate_v2`, `cublasGetMathMode` ARE called through our PLT interception
+- GOT entries verified via /proc/self/mem — point to our functions
+- Direct ctypes call DOES trigger our function
+- PyTorch uses internal cuBLAS dispatch via handles, not PLT calls
+
+FP32 matmul works because: real cuBLAS handles local GPU directly, FP32 kernels
+are pre-loaded. No driver function calls needed beyond what's already cached.
+
+### FP16 root cause (still under investigation)
+
+FP16 fails ONLY in partial offload mode:
+- Without LD_PRELOAD: FP16 works fine
+- With LD_PRELOAD, remote-only mode: FP16 works fine
+- With LD_PRELOAD, partial offload: FP16 fails (CUBLAS_STATUS_NOT_INITIALIZED)
+- Bypassing cuGetProcAddress: still fails
+- Unconditional dlopen redirect: still fails
+
+Something in our interception layer disrupts cuBLAS's FP16 lazy kernel loading
+when partial offload is enabled. Suspects:
+- `__cudaRegisterFatBinary` dual registration (local + remote) may corrupt cuBLAS kernels
+- `cuDeviceGetCount` reporting 2 devices may confuse cuBLAS initialization
+- Context management interference between local and remote device tracking
+
+### ROOT CAUSE FOUND: libcublas.so.12 has SYMBOLIC flag!
+
+```
+readelf -d libcublas.so.12 | grep FLAGS
+ 0x000000000000001e (FLAGS)  SYMBOLIC
+```
+
+The SYMBOLIC flag means ALL internal calls within libcublas.so.12 bind to the
+library's OWN symbols, completely bypassing LD_PRELOAD. This explains:
+
+- `cublasCreate_v2` IS intercepted (called from libtorch_cuda.so → our PLT)
+- `cublasGemmEx` is NOT intercepted (called internally within libcublas.so.12)
+- Our probes NEVER fire despite GOT pointing to our function
+- The GOT is correct for libtorch_cuda.so's PLT, but libtorch_cuda.so
+  doesn't call cublasGemmEx directly — it calls a cuBLAS dispatch function
+  that internally calls cublasGemmEx within the SYMBOLIC library
+
+For FP16 specifically: our `cublasCreate_v2` interception creates a handle
+via the real cuBLAS. The handle IS valid. But something about the partial
+offload environment (possibly our driver function interception via
+cuGetProcAddress) causes cuBLAS's internal FP16 kernel loading to fail.
+
+### Correct fix approach
+Since we CANNOT intercept cuBLAS at the library level (SYMBOLIC blocks it),
+we must intercept at the CUDA driver level:
+1. Fix the driver-level interception (cuModuleLoadData, cuLaunchKernel etc.)
+   to be transparent for local device operations
+2. Ensure cuGetProcAddress returns functions that are fully transparent for
+   local device — currently our functions add overhead/indirection
+3. OR: don't intercept cuGetProcAddress at all for the local device case
+   (let cuBLAS get real driver functions directly)
+
+---
+
 ## Session: 2026-03-22 (continued) - cuBLAS Local Routing FIXED
 
 ### MILESTONE: cuBLAS matmul on local GPU works!
