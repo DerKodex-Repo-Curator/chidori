@@ -478,6 +478,31 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         res = cuCtxSynchronize();
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
 
+    case CHIDORI_CU_CTX_SET_LIMIT: {
+        if (req->payload_size >= 12) {
+            int32_t limit = 0;
+            uint64_t value = 0;
+            memcpy(&limit, payload, 4);
+            memcpy(&value, (char *)payload + 4, 8);
+            res = cuCtxSetLimit((CUlimit)limit, (size_t)value);
+        } else {
+            res = CUDA_ERROR_INVALID_VALUE;
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_CTX_GET_LIMIT: {
+        if (req->payload_size >= 4) {
+            int32_t limit = 0;
+            memcpy(&limit, payload, 4);
+            size_t value = 0;
+            res = cuCtxGetLimit(&value, (CUlimit)limit);
+            uint64_t val64 = (uint64_t)value;
+            return chidori_send_response(fd, req->seq_num, res, &val64, 8);
+        }
+        return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+    }
+
     case CHIDORI_CU_CTX_GET_DEVICE: {
         int32_t dev = (int32_t)g_devices[g_current_dev];
         return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS, &dev, sizeof(dev));

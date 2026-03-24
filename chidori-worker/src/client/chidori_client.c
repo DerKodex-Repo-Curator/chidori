@@ -1567,6 +1567,27 @@ CUresult cuCtxSynchronize(void) {
     return chidori_rpc(CHIDORI_CU_CTX_SYNCHRONIZE, NULL, 0, NULL, NULL);
 }
 
+CUresult cuCtxSetLimit(int limit, size_t value) {
+    if (g_in_real_cuda) return CUDA_SUCCESS;
+    if (g_partial_offload && is_local_device(g_current_device)) return CUDA_SUCCESS;
+    struct __attribute__((packed)) { int32_t limit; uint64_t value; } req;
+    req.limit = limit;
+    req.value = (uint64_t)value;
+    return chidori_rpc(CHIDORI_CU_CTX_SET_LIMIT, &req, sizeof(req), NULL, NULL);
+}
+
+CUresult cuCtxGetLimit(size_t *pvalue, int limit) {
+    if (g_in_real_cuda) return CUDA_SUCCESS;
+    if (g_partial_offload && is_local_device(g_current_device)) return CUDA_SUCCESS;
+    struct __attribute__((packed)) { int32_t limit; } req;
+    req.limit = limit;
+    uint64_t val = 0;
+    size_t val_len = sizeof(val);
+    CUresult r = chidori_rpc(CHIDORI_CU_CTX_GET_LIMIT, &req, sizeof(req), &val, &val_len);
+    if (pvalue) *pvalue = (size_t)val;
+    return r;
+}
+
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
     if (g_in_real_cuda && g_real.cuDevicePrimaryCtxRetain) return g_real.cuDevicePrimaryCtxRetain(pctx, dev);
     if (g_partial_offload && is_local_device(dev) && g_real.cuDevicePrimaryCtxRetain) {
@@ -8415,6 +8436,7 @@ static const char *g_intercepted_symbols[] = {
     "cuDeviceTotalMem", "cuDeviceTotalMem_v2",
     "cuDeviceGetAttribute", "cuDeviceGetUuid",
     "cuCtxGetCurrent", "cuCtxSetCurrent", "cuCtxSynchronize",
+    "cuCtxSetLimit", "cuCtxGetLimit",
     "cuModuleLoadData", "cuModuleGetFunction", "cuModuleUnload",
     "cuMemAlloc", "cuMemAlloc_v2", "cuMemFree", "cuMemFree_v2",
     "cuMemcpyHtoD", "cuMemcpyHtoD_v2", "cuMemcpyDtoH", "cuMemcpyDtoH_v2",
