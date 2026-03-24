@@ -26,22 +26,37 @@ set -o pipefail
 if [ -z "$1" ]; then
     echo "Chidori Test Suite"
     echo ""
-    echo "Usage: ./tests/run_suite.sh <server_ip> [port] [server_ssh]"
+    echo "Usage: ./tests/run_suite.sh <server_ip> [port] [server_ssh] [--with-inference]"
     echo ""
-    echo "  server_ip    IP of the GPU server (required)"
-    echo "  port         Server port (default: 43211)"
-    echo "  server_ssh   SSH target for server restart, e.g. ubuntu@1.2.3.4"
-    echo "               If omitted, server must already be running."
+    echo "  server_ip        IP of the GPU server (required)"
+    echo "  port             Server port (default: 43211)"
+    echo "  server_ssh       SSH target for server restart, e.g. ubuntu@1.2.3.4"
+    echo "  --with-inference Also run TinyLlama inference (slow, network-bound)"
     echo ""
     echo "Examples:"
     echo "  ./tests/run_suite.sh 185.216.20.105"
     echo "  ./tests/run_suite.sh 185.216.20.105 43211 ubuntu@185.216.20.105"
+    echo "  ./tests/run_suite.sh 185.216.20.105 43211 ubuntu@185.216.20.105 --with-inference"
     exit 1
 fi
 
-SERVER_IP="$1"
-PORT="${2:-43211}"
-SERVER_SSH="${3:-}"
+SERVER_IP=""
+PORT="43211"
+SERVER_SSH=""
+WITH_INFERENCE=0
+
+# Parse args
+for arg in "$@"; do
+    case "$arg" in
+        --with-inference) WITH_INFERENCE=1 ;;
+        *)
+            if [ -z "$SERVER_IP" ]; then SERVER_IP="$arg"
+            elif [ "$PORT" = "43211" ] && echo "$arg" | grep -qP '^\d+$'; then PORT="$arg"
+            else SERVER_SSH="$arg"
+            fi
+            ;;
+    esac
+done
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="/tmp/chidori-tests"
 mkdir -p "$LOGDIR"
@@ -224,7 +239,7 @@ run_test \
     180
 
 echo ""
-echo "--- Matmul & Inference ---"
+echo "--- Matmul & Ops ---"
 echo ""
 
 run_test \
@@ -237,10 +252,15 @@ run_test \
     "$PY $DIR/tests/test_pytorch.py" \
     60
 
-run_test \
-    "TinyLlama 1.1B inference" \
-    "$PY $DIR/tests/test_inference.py" \
-    900
+if [ "$WITH_INFERENCE" -eq 1 ]; then
+    echo ""
+    echo "--- Inference (network-bound, low GPU util) ---"
+    echo ""
+    run_test \
+        "TinyLlama 1.1B inference" \
+        "$PY $DIR/tests/test_inference.py" \
+        900
+fi
 
 # ── GPU monitoring summary ──────────────────────────────────
 if [ -n "$SERVER_SSH" ]; then
