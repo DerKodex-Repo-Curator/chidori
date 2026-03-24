@@ -479,6 +479,18 @@ static int replay_intercept(uint16_t func_id, const void *payload, size_t payloa
     if (g_replay_mode != 2) return 0; /* not intercepting */
     if (func_id >= 0x0400) return 0;  /* don't intercept replay control messages */
 
+    /* Do NOT intercept D2H calls — let them pass through as normal RPCs.
+     * The GPU has the data from REPLAY_EXECUTE; D2H reads it back normally. */
+    if (func_id == CHIDORI_CU_MEMCPY_D_TO_H || func_id == 0x0076 /*DtoH async*/) {
+        return 0;
+    }
+    if ((func_id == CHIDORI_CUDA_MEMCPY || func_id == CHIDORI_CUDA_MEMCPY_ASYNC) &&
+        payload_len >= 28) {
+        int32_t kind = 0;
+        memcpy(&kind, (char*)payload + 24, 4);
+        if (kind == 2) return 0; /* DtoH — don't intercept */
+    }
+
     /* Hash func_id into running fingerprint for validation */
     g_replay_call_hash = replay_fnv1a_update(g_replay_call_hash, &func_id, 2);
 
@@ -493,15 +505,38 @@ static int replay_intercept(uint16_t func_id, const void *payload, size_t payloa
         }
     }
 
+    /* Collect H2D data (driver API async: cuMemcpyHtoDAsync payload = dst(8)+size(8)+stream(8)+data) */
+    if (func_id == 0x0075 && payload_len > 24) {
+        if (g_replay_h2d_count < REPLAY_MAX_H2D_COLLECT) {
+            uint32_t data_size = payload_len - 24;
+            g_replay_h2d_collected[g_replay_h2d_count].data = malloc(data_size);
+            memcpy(g_replay_h2d_collected[g_replay_h2d_count].data, (char*)payload + 24, data_size);
+            g_replay_h2d_collected[g_replay_h2d_count].size = data_size;
+            g_replay_h2d_count++;
+        }
+    }
+
     /* Collect H2D data (runtime API: cudaMemcpy HtoD payload = dst(8)+src(8)+size(8)+kind(4)+data) */
     if (func_id == CHIDORI_CUDA_MEMCPY && payload_len > 28) {
-        /* Check kind field at offset 24: cudaMemcpyHostToDevice == 1 */
         int32_t kind = 0;
         memcpy(&kind, (char*)payload + 24, 4);
         if (kind == 1 && g_replay_h2d_count < REPLAY_MAX_H2D_COLLECT) {
             uint32_t data_size = payload_len - 28;
             g_replay_h2d_collected[g_replay_h2d_count].data = malloc(data_size);
             memcpy(g_replay_h2d_collected[g_replay_h2d_count].data, (char*)payload + 28, data_size);
+            g_replay_h2d_collected[g_replay_h2d_count].size = data_size;
+            g_replay_h2d_count++;
+        }
+    }
+
+    /* Collect H2D data (runtime API async: cudaMemcpyAsync HtoD payload = dst(8)+src(8)+size(8)+kind(4)+stream(8)+data) */
+    if (func_id == CHIDORI_CUDA_MEMCPY_ASYNC && payload_len > 36) {
+        int32_t kind = 0;
+        memcpy(&kind, (char*)payload + 24, 4);
+        if (kind == 1 && g_replay_h2d_count < REPLAY_MAX_H2D_COLLECT) {
+            uint32_t data_size = payload_len - 36;
+            g_replay_h2d_collected[g_replay_h2d_count].data = malloc(data_size);
+            memcpy(g_replay_h2d_collected[g_replay_h2d_count].data, (char*)payload + 36, data_size);
             g_replay_h2d_collected[g_replay_h2d_count].size = data_size;
             g_replay_h2d_count++;
         }

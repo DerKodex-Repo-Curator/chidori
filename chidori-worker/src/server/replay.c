@@ -40,16 +40,30 @@ static uint64_t fnv1a_update(uint64_t hash, const void *data, size_t len) {
  * Call classification
  * ============================================================ */
 
-static replay_call_type_t classify_call(uint16_t func_id) {
+static replay_call_type_t classify_call(uint16_t func_id,
+                                         const void *payload,
+                                         uint32_t payload_size) {
     switch (func_id) {
     /* H2D transfers — data changes every step */
     case CHIDORI_CU_MEMCPY_H_TO_D:
-    case CHIDORI_CUDA_MEMCPY:       /* when kind=HtoD */
-    case CHIDORI_CUDA_MEMCPY_ASYNC: /* when kind=HtoD */
+    case 0x0075: /* CHIDORI_CU_MEMCPY_H_TO_D_ASYNC */
         return REPLAY_CALL_H2D;
+
+    /* Runtime API memcpy — direction depends on kind field at offset 24 */
+    case CHIDORI_CUDA_MEMCPY:
+    case CHIDORI_CUDA_MEMCPY_ASYNC: {
+        if (payload && payload_size >= 28) {
+            int32_t kind = 0;
+            memcpy(&kind, (const char *)payload + 24, 4);
+            if (kind == 1) return REPLAY_CALL_H2D;  /* cudaMemcpyHostToDevice */
+            if (kind == 2) return REPLAY_CALL_D2H;  /* cudaMemcpyDeviceToHost */
+        }
+        return REPLAY_CALL_FIXED; /* DtoD or unknown */
+    }
 
     /* D2H transfers — output that must be returned */
     case CHIDORI_CU_MEMCPY_D_TO_H:
+    case 0x0076: /* CHIDORI_CU_MEMCPY_D_TO_H_ASYNC */
         return REPLAY_CALL_D2H;
 
     /* Kernel launches — fixed structure, variable param buffer */
@@ -97,14 +111,28 @@ static void identify_var_slots(replay_call_t *call) {
     call->d2h_size = 0;
 
     switch (call->type) {
-    case REPLAY_CALL_H2D:
-        /* H2D: bytes [16..end] are the data payload (after dst(8)+size(8) header) */
-        if (call->payload_size > 16) {
-            call->var_slots[0].offset = 16;
-            call->var_slots[0].length = call->payload_size - 16;
+    case REPLAY_CALL_H2D: {
+        /* H2D data offset depends on which memcpy variant */
+        uint32_t data_offset;
+        switch (call->func_id) {
+        case 0x0072: /* cuMemcpyHtoD: dst(8)+size(8)+data */
+            data_offset = 16; break;
+        case 0x0075: /* cuMemcpyHtoDAsync: dst(8)+size(8)+stream(8)+data */
+            data_offset = 24; break;
+        case 0x0102: /* cudaMemcpy: dst(8)+src(8)+size(8)+kind(4)+data */
+            data_offset = 28; break;
+        case 0x0103: /* cudaMemcpyAsync: dst(8)+src(8)+size(8)+kind(4)+stream(8)+data */
+            data_offset = 36; break;
+        default:
+            data_offset = 16; break;
+        }
+        if (call->payload_size > data_offset) {
+            call->var_slots[0].offset = data_offset;
+            call->var_slots[0].length = call->payload_size - data_offset;
             call->var_slot_count = 1;
         }
         break;
+    }
 
     case REPLAY_CALL_D2H:
         /* D2H: payload is dst(8)+size(8). Size tells us how much output to expect. */
@@ -172,7 +200,8 @@ void replay_init(void) {
 
 void replay_shutdown(void) {
     for (int i = 0; i < REPLAY_MAX_SEQUENCES; i++) {
-        replay_invalidate(i);
+        if (g_sequences[i].active)
+            replay_invalidate(g_sequences[i].sequence_id);
     }
     g_recording = 0;
     g_recording_seq_idx = -1;
@@ -227,7 +256,7 @@ int replay_record_call(uint16_t func_id, uint16_t flags,
     replay_call_t *call = &seq->calls[seq->call_count];
     call->func_id = func_id;
     call->flags = flags;
-    call->type = classify_call(func_id);
+    call->type = classify_call(func_id, payload, payload_size);
     call->needs_response = !(flags & CHIDORI_FLAG_ASYNC);
 
     /* Snapshot payload */

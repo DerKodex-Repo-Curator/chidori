@@ -290,7 +290,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     /* Record this call if replay recording is active.
      * Only record normal CUDA calls (func_id < 0x0400), not replay control messages. */
     if (replay_is_recording() && req->func_id < 0x0400) {
-        replay_record_call(req->func_id, req->flags, payload, req->payload_size);
+        if (replay_record_call(req->func_id, req->flags, payload, req->payload_size) < 0) {
+            fprintf(stderr, "[replay] Recording overflow at call %d, aborting\n",
+                    req->func_id);
+        }
     }
 
     CUresult res;
