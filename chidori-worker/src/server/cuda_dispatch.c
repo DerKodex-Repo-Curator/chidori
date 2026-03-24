@@ -51,6 +51,9 @@ static handle_map_t g_rt_events;   /* Runtime API cudaEvent_t handles */
 static handle_map_t g_cublas_handles;  /* cublasHandle_t handles */
 
 /* Handle maps for cuDNN */
+static handle_map_t g_graphs;                      /* CUgraph handles */
+static handle_map_t g_graph_execs;                 /* CUgraphExec handles */
+
 static handle_map_t g_cudnn_handles;              /* cudnnHandle_t */
 static handle_map_t g_cudnn_tensor_descs;          /* cudnnTensorDescriptor_t */
 static handle_map_t g_cudnn_filter_descs;          /* cudnnFilterDescriptor_t */
@@ -169,6 +172,8 @@ int cuda_dispatch_init(const char *pcibus) {
     hmap_init(&g_rt_streams);
     hmap_init(&g_rt_events);
     hmap_init(&g_cublas_handles);
+    hmap_init(&g_graphs);
+    hmap_init(&g_graph_execs);
     hmap_init(&g_cudnn_handles);
     hmap_init(&g_cudnn_tensor_descs);
     hmap_init(&g_cudnn_filter_descs);
@@ -3835,6 +3840,150 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             hmap_remove(&g_cudnn_rnn_descs, wire);
         }
         return chidori_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
+    }
+
+    /* ================================================================
+     * CUDA Graph API
+     * ================================================================ */
+    case CHIDORI_CU_STREAM_BEGIN_CAPTURE: {
+        uint64_t stream_handle = 0;
+        int32_t mode = 0;
+        if (req->payload_size >= 12) {
+            memcpy(&stream_handle, payload, 8);
+            memcpy(&mode, (char *)payload + 8, 4);
+        }
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        res = cuStreamBeginCapture(stream, (CUstreamCaptureMode)mode);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_STREAM_END_CAPTURE: {
+        uint64_t stream_handle = 0;
+        if (req->payload_size >= 8)
+            memcpy(&stream_handle, payload, 8);
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        CUgraph graph = NULL;
+        res = cuStreamEndCapture(stream, &graph);
+        if (res == CUDA_SUCCESS && graph) {
+            uint64_t handle = alloc_handle();
+            hmap_put(&g_graphs, handle, (uint64_t)(uintptr_t)graph);
+            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_STREAM_IS_CAPTURING: {
+        uint64_t stream_handle = 0;
+        if (req->payload_size >= 8)
+            memcpy(&stream_handle, payload, 8);
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        CUstreamCaptureStatus status = CU_STREAM_CAPTURE_STATUS_NONE;
+        res = cuStreamIsCapturing(stream, &status);
+        int32_t st = (int32_t)status;
+        return chidori_send_response(fd, req->seq_num, res, &st, sizeof(st));
+    }
+
+    case CHIDORI_CU_GRAPH_CREATE: {
+        uint32_t flags = 0;
+        if (req->payload_size >= 4)
+            memcpy(&flags, payload, 4);
+        CUgraph graph = NULL;
+        res = cuGraphCreate(&graph, flags);
+        if (res == CUDA_SUCCESS && graph) {
+            uint64_t handle = alloc_handle();
+            hmap_put(&g_graphs, handle, (uint64_t)(uintptr_t)graph);
+            return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_GRAPH_DESTROY: {
+        uint64_t handle = 0;
+        if (req->payload_size >= 8)
+            memcpy(&handle, payload, 8);
+        CUgraph graph = (CUgraph)(uintptr_t)hmap_get(&g_graphs, handle);
+        if (graph) {
+            res = cuGraphDestroy(graph);
+            hmap_remove(&g_graphs, handle);
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_GRAPH_INSTANTIATE: {
+        uint64_t graph_handle = 0;
+        if (req->payload_size >= 8)
+            memcpy(&graph_handle, payload, 8);
+        CUgraph graph = (CUgraph)(uintptr_t)hmap_get(&g_graphs, graph_handle);
+        CUgraphExec exec = NULL;
+        if (graph) {
+            res = cuGraphInstantiate(&exec, graph, 0);
+            if (res == CUDA_SUCCESS && exec) {
+                uint64_t handle = alloc_handle();
+                hmap_put(&g_graph_execs, handle, (uint64_t)(uintptr_t)exec);
+                return chidori_send_response(fd, req->seq_num, res, &handle, sizeof(handle));
+            }
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_GRAPH_EXEC_DESTROY: {
+        uint64_t handle = 0;
+        if (req->payload_size >= 8)
+            memcpy(&handle, payload, 8);
+        CUgraphExec exec = (CUgraphExec)(uintptr_t)hmap_get(&g_graph_execs, handle);
+        if (exec) {
+            res = cuGraphExecDestroy(exec);
+            hmap_remove(&g_graph_execs, handle);
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_GRAPH_LAUNCH: {
+        uint64_t exec_handle = 0, stream_handle = 0;
+        if (req->payload_size >= 16) {
+            memcpy(&exec_handle, payload, 8);
+            memcpy(&stream_handle, (char *)payload + 8, 8);
+        }
+        CUgraphExec exec = (CUgraphExec)(uintptr_t)hmap_get(&g_graph_execs, exec_handle);
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        if (exec) {
+            res = cuGraphLaunch(exec, stream);
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_GRAPH_EXEC_UPDATE: {
+        uint64_t exec_handle = 0, graph_handle = 0;
+        if (req->payload_size >= 16) {
+            memcpy(&exec_handle, payload, 8);
+            memcpy(&graph_handle, (char *)payload + 8, 8);
+        }
+        CUgraphExec exec = (CUgraphExec)(uintptr_t)hmap_get(&g_graph_execs, exec_handle);
+        CUgraph graph = (CUgraph)(uintptr_t)hmap_get(&g_graphs, graph_handle);
+        if (exec && graph) {
+            CUgraphExecUpdateResultInfo info = {0};
+            res = cuGraphExecUpdate(exec, graph, &info);
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
+    case CHIDORI_CU_GRAPH_UPLOAD: {
+        uint64_t exec_handle = 0, stream_handle = 0;
+        if (req->payload_size >= 16) {
+            memcpy(&exec_handle, payload, 8);
+            memcpy(&stream_handle, (char *)payload + 8, 8);
+        }
+        CUgraphExec exec = (CUgraphExec)(uintptr_t)hmap_get(&g_graph_execs, exec_handle);
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        if (exec) {
+            res = cuGraphUpload(exec, stream);
+        }
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
 
     /* ================================================================

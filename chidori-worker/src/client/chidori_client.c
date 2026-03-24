@@ -6340,56 +6340,73 @@ cudaError_t cudaMemPoolGetAccess(int *flags, void *memPool, void *location) {
     return cudaSuccess;
 }
 
-/* ---- CUDA Graphs (stubs) ---- */
+/* ---- CUDA Graphs (real RPCs to server) ---- */
 
 cudaError_t cudaGraphCreate(void **pGraph, unsigned int flags) {
-    (void)flags;
-    static int fake_graph;
-    *pGraph = (void *)&fake_graph;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    uint32_t f = flags;
+    uint64_t handle = 0;
+    size_t handle_len = sizeof(handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_CREATE, &f, sizeof(f), &handle, &handle_len);
+    if (pGraph) *pGraph = (void *)(uintptr_t)handle;
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaGraphDestroy(void *graph) {
-    (void)graph;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    uint64_t handle = (uint64_t)(uintptr_t)graph;
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaGraphExecDestroy(void *graphExec) {
-    (void)graphExec;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    uint64_t handle = (uint64_t)(uintptr_t)graphExec;
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_EXEC_DESTROY, &handle, sizeof(handle), NULL, NULL);
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaGraphInstantiate(void **pGraphExec, void *graph,
                                   void *pErrorNode, char *pLogBuffer,
                                   size_t bufferSize) {
-    (void)graph; (void)pErrorNode; (void)pLogBuffer; (void)bufferSize;
-    static int fake_exec;
-    *pGraphExec = (void *)&fake_exec;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    (void)pErrorNode; (void)pLogBuffer; (void)bufferSize;
+    uint64_t graph_handle = (uint64_t)(uintptr_t)graph;
+    uint64_t exec_handle = 0;
+    size_t exec_len = sizeof(exec_handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_INSTANTIATE, &graph_handle, sizeof(graph_handle),
+                             &exec_handle, &exec_len);
+    if (pGraphExec) *pGraphExec = (void *)(uintptr_t)exec_handle;
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaGraphLaunch(void *graphExec, void *stream) {
-    (void)graphExec; (void)stream;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    struct __attribute__((packed)) { uint64_t exec; uint64_t stream; } req;
+    req.exec = (uint64_t)(uintptr_t)graphExec;
+    req.stream = (uint64_t)(uintptr_t)stream;
+    CUresult r = chidori_rpc_async(CHIDORI_CU_GRAPH_LAUNCH, &req, sizeof(req));
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaStreamBeginCapture(void *stream, int mode) {
-    (void)stream; (void)mode;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    struct __attribute__((packed)) { uint64_t stream; int32_t mode; } req;
+    req.stream = (uint64_t)(uintptr_t)stream;
+    req.mode = mode;
+    CUresult r = chidori_rpc(CHIDORI_CU_STREAM_BEGIN_CAPTURE, &req, sizeof(req), NULL, NULL);
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaStreamEndCapture(void *stream, void **pGraph) {
-    (void)stream;
-    static int fake_graph;
-    if (pGraph) *pGraph = (void *)&fake_graph;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
+    uint64_t graph_handle = 0;
+    size_t graph_len = sizeof(graph_handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_STREAM_END_CAPTURE, &stream_handle, sizeof(stream_handle),
+                             &graph_handle, &graph_len);
+    if (pGraph) *pGraph = (void *)(uintptr_t)graph_handle;
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 /* ---- Texture / Surface (stubs PyTorch may reference) ---- */
@@ -6838,48 +6855,63 @@ CUresult cuMemGetAllocationPropertiesFromHandle(void *prop, void *handle) {
     return CUDA_SUCCESS;
 }
 
-/* ---- Stream Capture / CUDA Graphs (Driver API) ---- */
+/* ---- Stream Capture / CUDA Graphs (Driver API — real RPCs) ---- */
 
 CUresult cuStreamBeginCapture_v2(CUstream hStream, int mode) {
-    (void)hStream; (void)mode;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t stream; int32_t mode; } req;
+    req.stream = (uint64_t)(uintptr_t)hStream;
+    req.mode = mode;
+    return chidori_rpc(CHIDORI_CU_STREAM_BEGIN_CAPTURE, &req, sizeof(req), NULL, NULL);
 }
 
 CUresult cuStreamEndCapture(CUstream hStream, void **phGraph) {
-    (void)hStream;
-    static int fake_graph;
-    if (phGraph) *phGraph = (void *)&fake_graph;
-    return CUDA_SUCCESS;
+    uint64_t stream_handle = (uint64_t)(uintptr_t)hStream;
+    uint64_t graph_handle = 0;
+    size_t graph_len = sizeof(graph_handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_STREAM_END_CAPTURE, &stream_handle, sizeof(stream_handle),
+                             &graph_handle, &graph_len);
+    if (phGraph) *phGraph = (void *)(uintptr_t)graph_handle;
+    return r;
 }
 
 CUresult cuStreamIsCapturing(CUstream hStream, int *captureStatus) {
-    (void)hStream;
-    if (captureStatus) *captureStatus = 0;
-    return CUDA_SUCCESS;
+    uint64_t stream_handle = (uint64_t)(uintptr_t)hStream;
+    int32_t status = 0;
+    size_t status_len = sizeof(status);
+    CUresult r = chidori_rpc(CHIDORI_CU_STREAM_IS_CAPTURING, &stream_handle, sizeof(stream_handle),
+                             &status, &status_len);
+    if (captureStatus) *captureStatus = status;
+    return r;
 }
 
 CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
-    (void)hGraphExec; (void)hStream;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t exec; uint64_t stream; } req;
+    req.exec = (uint64_t)(uintptr_t)hGraphExec;
+    req.stream = (uint64_t)(uintptr_t)hStream;
+    return chidori_rpc_async(CHIDORI_CU_GRAPH_LAUNCH, &req, sizeof(req));
 }
 
 CUresult cuGraphInstantiate_v2(void **phGraphExec, void *hGraph,
                                 void **phErrorNode, char *logBuffer,
                                 size_t bufferSize) {
-    (void)hGraph; (void)phErrorNode; (void)logBuffer; (void)bufferSize;
-    static int fake_exec;
-    if (phGraphExec) *phGraphExec = (void *)&fake_exec;
-    return CUDA_SUCCESS;
+    (void)phErrorNode; (void)logBuffer; (void)bufferSize;
+    uint64_t graph_handle = (uint64_t)(uintptr_t)hGraph;
+    uint64_t exec_handle = 0;
+    size_t exec_len = sizeof(exec_handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_INSTANTIATE, &graph_handle, sizeof(graph_handle),
+                             &exec_handle, &exec_len);
+    if (phGraphExec) *phGraphExec = (void *)(uintptr_t)exec_handle;
+    return r;
 }
 
 CUresult cuGraphExecDestroy(void *hGraphExec) {
-    (void)hGraphExec;
-    return CUDA_SUCCESS;
+    uint64_t handle = (uint64_t)(uintptr_t)hGraphExec;
+    return chidori_rpc(CHIDORI_CU_GRAPH_EXEC_DESTROY, &handle, sizeof(handle), NULL, NULL);
 }
 
 CUresult cuGraphDestroy(void *hGraph) {
-    (void)hGraph;
-    return CUDA_SUCCESS;
+    uint64_t handle = (uint64_t)(uintptr_t)hGraph;
+    return chidori_rpc(CHIDORI_CU_GRAPH_DESTROY, &handle, sizeof(handle), NULL, NULL);
 }
 
 /* ---- Stream (Driver API additional) ---- */
