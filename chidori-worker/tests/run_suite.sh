@@ -183,19 +183,35 @@ else
 fi
 echo ""
 
+# ── GPU monitoring ──────────────────────────────────────────
+# Start nvidia-smi polling on server if we have SSH
+NVMON_PID=""
+if [ -n "$SERVER_SSH" ]; then
+    ssh -o ConnectTimeout=5 "$SERVER_SSH" \
+        "nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,temperature.gpu \
+         --format=csv -l 2 > /tmp/gpu_monitor.csv 2>/dev/null &
+         echo \$!" 2>/dev/null | read NVMON_PID
+    echo "  GPU monitoring started on server (nvidia-smi polling every 2s)"
+    echo ""
+fi
+
 # ── Tests ───────────────────────────────────────────────────
-echo "--- Core Tests (single remote GPU) ---"
+echo "--- GPU Stress (watch nvidia-smi — should see 90%+ util) ---"
+echo ""
+
+run_test \
+    "GPU stress (FP32+FP16 matmul + train)" \
+    "$PY $DIR/tests/test_gpu_stress.py" \
+    300
+
+echo ""
+echo "--- Training Tests ---"
 echo ""
 
 run_test \
     "FP32 MLP training (MSE loss)" \
     "$DIR/tests/run_training_test.sh $SERVER_IP $PORT" \
     60
-
-run_test \
-    "FP32 matmul throughput (4096x4096)" \
-    "$PY $DIR/tests/test_train.py" \
-    180
 
 run_test \
     "FP32 transformer training (23M)" \
@@ -207,6 +223,15 @@ run_test \
     "$PY $DIR/tests/test_training_fp16.py" \
     180
 
+echo ""
+echo "--- Matmul & Inference ---"
+echo ""
+
+run_test \
+    "FP32 matmul throughput (4096x4096)" \
+    "$PY $DIR/tests/test_train.py" \
+    180
+
 run_test \
     "Basic PyTorch ops (tensor, matmul)" \
     "$PY $DIR/tests/test_pytorch.py" \
@@ -216,6 +241,17 @@ run_test \
     "TinyLlama 1.1B inference" \
     "$PY $DIR/tests/test_inference.py" \
     900
+
+# ── GPU monitoring summary ──────────────────────────────────
+if [ -n "$SERVER_SSH" ]; then
+    # Kill monitor, show peak GPU util
+    ssh -o ConnectTimeout=5 "$SERVER_SSH" \
+        "pkill -f 'nvidia-smi.*gpu_monitor' 2>/dev/null; \
+         if [ -f /tmp/gpu_monitor.csv ]; then
+             echo ''; echo '--- Server GPU Utilization (sampled every 2s) ---';
+             echo 'Peak:'; sort -t',' -k2 -rn /tmp/gpu_monitor.csv | head -5;
+         fi" 2>/dev/null
+fi
 
 # ── Summary ─────────────────────────────────────────────────
 echo ""
