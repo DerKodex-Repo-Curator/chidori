@@ -2685,6 +2685,8 @@ cudaError_t cudaDeviceSynchronize(void) {
      * All CUDA calls since the last sync were intercepted by replay_intercept() and
      * their H2D data was collected.  Now pack it all into one message. */
     if (g_replay_mode == 2) {
+        fprintf(stderr, "[replay-client] REPLAY_EXECUTE building: h2d_count=%d step=%d\n",
+                g_replay_h2d_count, g_replay_step_count);
         /* Build REPLAY_EXECUTE payload: seq_id(4) + fingerprint(8) + h2d_count(4) + [size(4)+data]... */
         size_t total = 16; /* header: 4+8+4 */
         for (int i = 0; i < g_replay_h2d_count; i++)
