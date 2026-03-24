@@ -132,11 +132,14 @@ for step in range(STEPS):
     logits = model(data)
     loss = loss_fn(logits.view(-1, VOCAB), data.view(-1))
 
+    # Read loss BEFORE backward — tensor is still live and unmodified
+    torch.cuda.synchronize()
+    l = loss.item()
+
     loss.backward()
     optimizer.step()
-
-    l = loss.item()
     torch.cuda.synchronize()
+
     losses.append(l)
     elapsed = time.time() - t0
     print(f"  step {step:3d}  loss={l:.6f}  elapsed={elapsed:.1f}s")

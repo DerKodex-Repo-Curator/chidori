@@ -328,10 +328,6 @@ int replay_end_record(uint32_t sequence_id,
 
         /* Build H2D manifest */
         if (c->type == REPLAY_CALL_H2D && seq->h2d_slot_count < REPLAY_MAX_H2D_SLOTS) {
-            fprintf(stderr, "[replay] H2D slot %d: call_index=%d func_id=0x%04x payload_size=%u var_offset=%u var_len=%u\n",
-                    seq->h2d_slot_count, i, c->func_id, c->payload_size,
-                    c->var_slot_count > 0 ? c->var_slots[0].offset : 0,
-                    c->var_slot_count > 0 ? c->var_slots[0].length : 0);
             c->h2d_var_index = seq->h2d_slot_count;
             seq->h2d_manifest[seq->h2d_slot_count].call_index = i;
             seq->h2d_manifest[seq->h2d_slot_count].expected_size =

@@ -488,8 +488,6 @@ static int replay_intercept(uint16_t func_id, const void *payload, size_t payloa
         payload_len >= 28) {
         int32_t kind = 0;
         memcpy(&kind, (char*)payload + 24, 4);
-        fprintf(stderr, "[replay-client] D2H check: func=0x%04x kind=%d payload_len=%zu\n",
-                func_id, kind, payload_len);
         if (kind == 2) return 0; /* DtoH — don't intercept */
     }
 
@@ -535,8 +533,6 @@ static int replay_intercept(uint16_t func_id, const void *payload, size_t payloa
     if (func_id == CHIDORI_CUDA_MEMCPY_ASYNC && payload_len > 36) {
         int32_t kind = 0;
         memcpy(&kind, (char*)payload + 24, 4);
-        fprintf(stderr, "[replay-client] intercept 0x0103 kind=%d payload_len=%zu h2d_count=%d\n",
-                kind, payload_len, g_replay_h2d_count);
         if (kind == 1 && g_replay_h2d_count < REPLAY_MAX_H2D_COLLECT) {
             uint32_t data_size = payload_len - 36;
             g_replay_h2d_collected[g_replay_h2d_count].data = malloc(data_size);
@@ -2685,8 +2681,6 @@ cudaError_t cudaDeviceSynchronize(void) {
      * All CUDA calls since the last sync were intercepted by replay_intercept() and
      * their H2D data was collected.  Now pack it all into one message. */
     if (g_replay_mode == 2) {
-        fprintf(stderr, "[replay-client] REPLAY_EXECUTE building: h2d_count=%d step=%d\n",
-                g_replay_h2d_count, g_replay_step_count);
         /* Build REPLAY_EXECUTE payload: seq_id(4) + fingerprint(8) + h2d_count(4) + [size(4)+data]... */
         size_t total = 16; /* header: 4+8+4 */
         for (int i = 0; i < g_replay_h2d_count; i++)
