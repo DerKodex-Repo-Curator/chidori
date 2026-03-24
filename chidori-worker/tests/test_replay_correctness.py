@@ -135,8 +135,8 @@ for step in range(STEPS):
     loss.backward()
     optimizer.step()
 
-    torch.cuda.synchronize()
     l = loss.item()
+    torch.cuda.synchronize()
     losses.append(l)
     elapsed = time.time() - t0
     print(f"  step {step:3d}  loss={l:.6f}  elapsed={elapsed:.1f}s")
