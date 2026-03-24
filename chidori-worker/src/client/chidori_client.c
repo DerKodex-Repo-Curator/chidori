@@ -548,7 +548,8 @@ static int replay_intercept(uint16_t func_id, const void *payload, size_t payloa
 static int is_replay_enabled(void) {
     if (g_replay_enabled == -1) {
         const char *v = getenv("CHIDORI_REPLAY");
-        g_replay_enabled = (v && v[0] == '1') ? 1 : 0;
+        /* Default ON — disable with CHIDORI_REPLAY=0 */
+        g_replay_enabled = (v && v[0] == '0') ? 0 : 1;
         if (g_replay_enabled) {
             const char *w = getenv("CHIDORI_REPLAY_WARMUP");
             if (w) g_replay_warmup = atoi(w);
