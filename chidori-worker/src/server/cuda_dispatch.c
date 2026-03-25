@@ -2726,6 +2726,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         cublasLtHandle_t ltHandle = ensure_lt_handle();
 
+        /* Force FP32 accumulation for FP16 compute — prevents NaN overflow */
+        if (computeType == 64) { computeType = 68; scaleType = 0; }
+
         cublasLtMatmulDesc_t opDesc;
         cublasLtMatmulDescCreate(&opDesc, (cublasComputeType_t)computeType, (cudaDataType_t)scaleType);
         cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
@@ -2823,6 +2826,31 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         cublasLtHandle_t ltHandle = ensure_lt_handle();
 
+        /* Force FP32 accumulation for FP16 compute — prevents NaN overflow.
+         * Also convert alpha/beta from FP16 to FP32 when upgrading compute type. */
+        int upgraded_compute = 0;
+        float alpha_f32 = 1.0f, beta_f32 = 0.0f;
+        if (computeType == 64 /* CUBLAS_COMPUTE_16F */) {
+            computeType = 68; /* CUBLAS_COMPUTE_32F */
+            scaleType = 0;    /* CUDA_R_32F */
+            upgraded_compute = 1;
+            /* Convert FP16 alpha/beta to FP32 */
+            uint16_t ah, bh;
+            memcpy(&ah, alpha_bytes, 2);
+            memcpy(&bh, beta_bytes, 2);
+            /* FP16 → FP32 */
+            uint32_t as = (uint32_t)(ah >> 15) << 31;
+            uint32_t ae = (ah >> 10) & 0x1F;
+            uint32_t am = ah & 0x3FF;
+            uint32_t af = (ae == 0) ? as : (as | ((ae + 112) << 23) | (am << 13));
+            memcpy(&alpha_f32, &af, 4);
+            uint32_t bs = (uint32_t)(bh >> 15) << 31;
+            uint32_t be = (bh >> 10) & 0x1F;
+            uint32_t bm = bh & 0x3FF;
+            uint32_t bf = (be == 0) ? bs : (bs | ((be + 112) << 23) | (bm << 13));
+            memcpy(&beta_f32, &bf, 4);
+        }
+
         cublasLtMatmulDesc_t opDesc;
         cublasLtMatmulDescCreate(&opDesc, (cublasComputeType_t)computeType, (cudaDataType_t)scaleType);
         cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
@@ -2849,18 +2877,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_wire);
         if (!stream && stream_wire)
             stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_wire);
-        /* During graph capture: redirect NULL stream to capture stream */
         if (!stream && g_capturing_stream)
             stream = g_capturing_stream;
 
         cublasLtMatmulAlgo_t *algo = (cublasLtMatmulAlgo_t *)algo_bytes;
 
-        /* Allocate persistent 32 MB workspace on first use. This buffer is
-         * reused across all cublasLtMatmul calls — avoids per-call
-         * cudaMalloc/cudaFree overhead and guarantees every algorithm has
-         * enough workspace (the previous code only allocated what the
-         * server-side heuristic reported, which could be far too small if
-         * the client chose a different algorithm). */
         if (!g_lt_workspace) {
             cudaError_t ws_err = cudaMalloc(&g_lt_workspace, CHIDORI_LT_WORKSPACE_SIZE);
             if (ws_err == cudaSuccess) {
@@ -2868,8 +2889,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 fprintf(stderr, "[cublas_lt] allocated persistent workspace: %zu bytes\n",
                         g_lt_workspace_size);
             } else {
-                fprintf(stderr, "[cublas_lt] WARNING: workspace cudaMalloc failed (%d), "
-                        "falling back to no workspace\n", (int)ws_err);
                 g_lt_workspace = NULL;
                 g_lt_workspace_size = 0;
             }
@@ -2877,15 +2896,13 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         void *workspace = g_lt_workspace;
         size_t workspaceSize = g_lt_workspace_size;
 
-        fprintf(stderr, "[cublas_lt] matmul: A=%p B=%p C=%p D=%p stream=%p ws=%zu\n",
-                (void *)(uintptr_t)A_ptr, (void *)(uintptr_t)B_ptr,
-                (void *)(uintptr_t)C_ptr, (void *)(uintptr_t)D_ptr,
-                (void *)stream, workspaceSize);
+        void *alpha_ptr = upgraded_compute ? (void *)&alpha_f32 : (void *)alpha_bytes;
+        void *beta_ptr = upgraded_compute ? (void *)&beta_f32 : (void *)beta_bytes;
 
         cublasStatus_t st = cublasLtMatmul(ltHandle, opDesc,
-            alpha_bytes, (void *)(uintptr_t)A_ptr, descs[0],
+            alpha_ptr, (void *)(uintptr_t)A_ptr, descs[0],
             (void *)(uintptr_t)B_ptr, descs[1],
-            beta_bytes, (void *)(uintptr_t)C_ptr, descs[2],
+            beta_ptr, (void *)(uintptr_t)C_ptr, descs[2],
             (void *)(uintptr_t)D_ptr, descs[3],
             algo, workspace, workspaceSize, (cudaStream_t)stream);
 
