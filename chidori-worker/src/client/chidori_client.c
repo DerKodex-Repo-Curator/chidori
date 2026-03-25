@@ -2832,15 +2832,6 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 
 cudaError_t cudaDeviceSynchronize(void) {
-    /* Fast path: skip sync during model loading (before any kernel launch).
-     * All pending HtoD data is already in the TCP pipeline — the server
-     * processes requests in order, so the data IS there. The sync would
-     * just waste a 57ms round-trip confirming what TCP already guarantees. */
-    if (!g_any_kernel_launched && !g_partial_offload) {
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
-    }
-
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuCtxSynchronize) {
         /* Use real driver's cuCtxSynchronize instead of cudart's cudaDeviceSynchronize
          * to avoid cudart's internal driver API calls hitting our interceptors */
@@ -2953,11 +2944,6 @@ cudaError_t cudaStreamDestroy(void *stream) {
 }
 
 cudaError_t cudaStreamSynchronize(void *stream) {
-    /* Skip sync during model loading — no kernels launched yet */
-    if (!g_any_kernel_launched && !g_partial_offload) {
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
-    }
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuStreamSynchronize) {
         /* Use real driver's cuStreamSynchronize instead of cudart's version
          * to avoid cudart's internal driver API calls hitting our interceptors */
