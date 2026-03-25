@@ -102,8 +102,11 @@ with torch.no_grad():
 generated.append(warmup_next.item())
 torch.cuda.synchronize()
 
-# Try CUDA Graph capture
+# Try CUDA Graph capture using direct driver API (bypasses PyTorch's memory pool setup)
 try:
+    import ctypes
+    lib = ctypes.CDLL("build/libcuda.so.1")
+
     # Create a CUDA stream for capture
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -124,9 +127,13 @@ try:
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
 
-    # Now capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=s):
+    # Capture using driver API directly (not torch.cuda.graph which needs memory pools)
+    stream_ptr = ctypes.c_void_p(s.cuda_stream)
+    r = lib.cuStreamBeginCapture_v2(stream_ptr, ctypes.c_int(0))
+    if r != 0:
+        raise RuntimeError(f"cuStreamBeginCapture failed: {r}")
+
+    with torch.cuda.stream(s):
         with torch.no_grad():
             static_output = model(
                 static_input,
@@ -135,9 +142,19 @@ try:
                 cache_position=static_position,
             )
 
+    graph_ptr = ctypes.c_void_p(0)
+    r = lib.cuStreamEndCapture(stream_ptr, ctypes.byref(graph_ptr))
+    if r != 0 or not graph_ptr.value:
+        raise RuntimeError(f"cuStreamEndCapture failed: r={r} graph={graph_ptr.value}")
+
+    exec_ptr = ctypes.c_void_p(0)
+    r = lib.cuGraphInstantiate(ctypes.byref(exec_ptr), graph_ptr, ctypes.c_ulonglong(0))
+    if r != 0 or not exec_ptr.value:
+        raise RuntimeError(f"cuGraphInstantiate failed: r={r}")
+
     print(f"[GRAPH] Capture successful!")
 
-    # Generate tokens using graph replay
+    # Generate tokens using graph replay via driver API
     torch.cuda.synchronize()
     t0 = time.time()
     for i in range(MAX_NEW_TOKENS - 2):  # -2 for prefill + warmup tokens
@@ -146,7 +163,7 @@ try:
         static_position.fill_(prompt_len + 2 + i)
 
         # Replay the graph — ONE RPC instead of ~100
-        graph.replay()
+        lib.cuGraphLaunch(exec_ptr, stream_ptr)
 
         # Get next token from static output
         warmup_next = static_output.logits[:, -1:, :].argmax(dim=-1)
