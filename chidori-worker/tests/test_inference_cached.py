@@ -115,9 +115,68 @@ print(f"[CACHED] {cached_toks} tokens in {cached_dt:.1f}s = {cached_tps:.1f} tok
 # VERIFY OUTPUT
 # ============================================================
 text = tokenizer.decode(cached_out[0].cpu().tolist(), skip_special_tokens=True)
-print(f"\n--- Output ---")
 print(text[:500])
-print(f"--- End ---")
+
+# ============================================================
+# SERVER-SIDE GRAPH DECODE (if available)
+# ============================================================
+server_tps = 0
+server_toks = 0
+try:
+    import ctypes
+    lib = ctypes.CDLL("build/libcuda.so.1")
+    if hasattr(lib, 'chidori_graph_decode'):
+        print(f"\n[SERVER] Setting up CUDA Graph + server-side decode...")
+
+        static_cache2 = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        with torch.no_grad():
+            pf = model(inputs["input_ids"], past_key_values=static_cache2, use_cache=True)
+            nt = pf.logits[:, -1:, :].argmax(-1)
+        cp = torch.tensor([prompt_len], device="cuda")
+        with torch.no_grad():
+            model(nt, past_key_values=static_cache2, use_cache=True, cache_position=cp)
+        torch.cuda.synchronize()
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        si = nt.clone()
+        sp = torch.tensor([prompt_len + 1], device="cuda", dtype=torch.long)
+        with torch.cuda.stream(s):
+            with torch.no_grad():
+                so = model(si, past_key_values=static_cache2, use_cache=True, cache_position=sp)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+
+        sptr = ctypes.c_void_p(s.cuda_stream)
+        lib.cuStreamBeginCapture_v2(sptr, ctypes.c_int(0))
+        with torch.cuda.stream(s):
+            with torch.no_grad():
+                so = model(si, past_key_values=static_cache2, use_cache=True, cache_position=sp)
+        gptr = ctypes.c_void_p(0)
+        lib.cuStreamEndCapture(sptr, ctypes.byref(gptr))
+        eptr = ctypes.c_void_p(0)
+        lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
+
+        out_tokens = (ctypes.c_int32 * MAX_NEW_TOKENS)()
+        out_count = ctypes.c_int32(0)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        lib.chidori_graph_decode(
+            ctypes.c_uint64(eptr.value), ctypes.c_uint64(sptr.value),
+            ctypes.c_uint64(si.data_ptr()), ctypes.c_uint64(sp.data_ptr()),
+            ctypes.c_uint64(so.logits[:, -1:, :].contiguous().data_ptr()),
+            ctypes.c_int32(model.config.vocab_size),
+            ctypes.c_int32(MAX_NEW_TOKENS - 2), ctypes.c_int32(prompt_len + 2),
+            out_tokens, ctypes.byref(out_count),
+        )
+        server_dt = time.time() - t0
+        server_toks = out_count.value
+        server_tps = server_toks / server_dt if server_dt > 0 else 0
+        server_text = tokenizer.decode([out_tokens[i] for i in range(server_toks)], skip_special_tokens=True)
+        print(f"[SERVER] {server_toks} tokens in {server_dt:.1f}s = {server_tps:.1f} tok/s")
+        print(f"[SERVER] {server_text[:200]}")
+except Exception as e:
+    print(f"[SERVER] Graph decode not available: {e}")
 
 # ============================================================
 # SUMMARY
@@ -131,7 +190,8 @@ print(f"  Model:        {MODEL}")
 print(f"  GPU load:     {load_gpu_dt:.1f}s ({mem_mb:.0f} MB)")
 print(f"  Baseline:     {baseline_tps:.1f} tok/s (dynamic KV, {baseline_toks} tokens)")
 print(f"  StaticCache:  {cached_tps:.1f} tok/s ({cached_toks} tokens)")
-print(f"  Speedup:      {speedup:.1f}x")
+if server_tps > 0:
+    print(f"  ServerDecode: {server_tps:.1f} tok/s ({server_toks} tokens)")
 print(f"{'='*60}")
 
 if cached_toks >= 100 and math.isfinite(cached_tps) and cached_tps > 0:
