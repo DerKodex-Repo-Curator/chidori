@@ -6343,26 +6343,50 @@ static uint64_t lazy_register_fat_binary(int idx) {
     if (g_fat_binaries[idx].server_handle != 0)
         return g_fat_binaries[idx].server_handle;
 
-    /* Flush all pending registrations at once — amortizes the cost
-     * when multiple modules need registration during model loading */
-    flush_fat_binary_registrations();
+    /* Client-side deduplication: if another fat binary with identical content
+     * was already registered, reuse its server handle (no RPC needed). */
+    if (g_fat_binaries[idx].data) {
+        uint64_t h = hash_fat_binary(g_fat_binaries[idx].data, g_fat_binaries[idx].size);
+        for (int j = 0; j < g_fat_binary_count; j++) {
+            if (j == idx) continue;
+            if (g_fat_binaries[j].server_handle == 0) continue;
+            if (g_fat_binaries[j].size != g_fat_binaries[idx].size) continue;
+            if (hash_fat_binary(g_fat_binaries[j].data, g_fat_binaries[j].size) == h) {
+                g_fat_binaries[idx].server_handle = g_fat_binaries[j].server_handle;
+                fprintf(stderr, "[chidori] fat_binary[%d] dedup: reuse handle=0x%llx from [%d]\n",
+                        idx, (unsigned long long)g_fat_binaries[j].server_handle, j);
+                return g_fat_binaries[idx].server_handle;
+            }
+        }
+    }
 
-    if (g_fat_binaries[idx].server_handle != 0)
-        return g_fat_binaries[idx].server_handle;
+    /* Register ONLY this specific module on demand.
+     * Of ~462 total fat binaries registered by PyTorch + libraries,
+     * only ~20-30 are actually used during inference. Registering all
+     * upfront wastes 210s on cuModuleLoadData for unused modules.
+     * Each on-demand registration costs ~0.5s (RTT + server processing). */
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
 
-    /* Fallback: register just this one */
     uint64_t handle = 0;
     size_t out_len = sizeof(handle);
     CUresult r = chidori_rpc(CHIDORI_CUDA_REGISTER_FAT_BINARY,
                              g_fat_binaries[idx].data,
                              (size_t)g_fat_binaries[idx].size,
                              &handle, &out_len);
+
+    gettimeofday(&t1, NULL);
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+
     if (r != 0 || handle == 0) {
         const unsigned char *d = (const unsigned char *)g_fat_binaries[idx].data;
         uint32_t mag = 0;
         memcpy(&mag, d, 4);
-        fprintf(stderr, "[chidori] fat_binary[%d] FAILED: size=%zu r=%d handle=%llu magic=0x%08x\n",
-                idx, (size_t)g_fat_binaries[idx].size, r, (unsigned long long)handle, mag);
+        fprintf(stderr, "[chidori] fat_binary[%d] FAILED: size=%zu r=%d handle=%llu magic=0x%08x (%.2fs)\n",
+                idx, (size_t)g_fat_binaries[idx].size, r, (unsigned long long)handle, mag, elapsed);
+    } else {
+        fprintf(stderr, "[chidori] fat_binary[%d] registered: size=%zu handle=0x%llx (%.2fs)\n",
+                idx, (size_t)g_fat_binaries[idx].size, (unsigned long long)handle, elapsed);
     }
     if (r == 0 && handle != 0)
         g_fat_binaries[idx].server_handle = handle;

@@ -66,6 +66,49 @@ static handle_map_t g_cudnn_rnn_descs;             /* cudnnRNNDescriptor_t */
 
 static uint64_t g_next_handle = 0x10000;
 
+/* ----------------------------------------------------------------
+ * Fat binary module cache — avoids redundant cuModuleLoadData for
+ * identical fat binaries. Keyed by FNV-1a hash of content.
+ * With PyTorch + cuBLAS + cuDNN, ~462 fat binaries are registered
+ * but many have duplicate content or are never used.
+ * ---------------------------------------------------------------- */
+#define FAT_CACHE_MAX 1024
+static struct {
+    uint64_t hash;         /* FNV-1a of first 4KB + last 4KB + size */
+    uint32_t payload_size; /* full payload size (for collision check) */
+    uint64_t wire_handle;  /* allocated wire handle */
+} g_fat_cache[FAT_CACHE_MAX];
+static int g_fat_cache_count = 0;
+
+static uint64_t fat_cache_hash(const void *data, uint32_t size) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)data;
+    size_t head = size < 4096 ? size : 4096;
+    for (size_t i = 0; i < head; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    if (size > 8192) {
+        const uint8_t *tail = p + size - 4096;
+        for (size_t i = 0; i < 4096; i++) { h ^= tail[i]; h *= 0x100000001b3ULL; }
+    }
+    h ^= (uint64_t)size; h *= 0x100000001b3ULL;
+    return h;
+}
+
+static uint64_t fat_cache_lookup(uint64_t hash, uint32_t size) {
+    for (int i = 0; i < g_fat_cache_count; i++) {
+        if (g_fat_cache[i].hash == hash && g_fat_cache[i].payload_size == size)
+            return g_fat_cache[i].wire_handle;
+    }
+    return 0;
+}
+
+static void fat_cache_insert(uint64_t hash, uint32_t size, uint64_t wire_handle) {
+    if (g_fat_cache_count >= FAT_CACHE_MAX) return;
+    g_fat_cache[g_fat_cache_count].hash = hash;
+    g_fat_cache[g_fat_cache_count].payload_size = size;
+    g_fat_cache[g_fat_cache_count].wire_handle = wire_handle;
+    g_fat_cache_count++;
+}
+
 /* Persistent workspace for cublasLtMatmul — allocated once, reused for all calls.
  * 32 MB is sufficient for all cublasLt algorithms. */
 #define CHIDORI_LT_WORKSPACE_SIZE (32ULL * 1024 * 1024)
@@ -1496,6 +1539,16 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
          * compressed cubins and PTX JIT across architectures (e.g., sm_89
          * client -> sm_120 server). The Runtime handle is stored with bit 63
          * set so REGISTER_FUNCTION knows to use the Runtime API path. */
+
+        /* Cache lookup — skip cuModuleLoadData for identical fat binaries */
+        uint64_t fb_hash = fat_cache_hash(payload, req->payload_size);
+        uint64_t cached = fat_cache_lookup(fb_hash, req->payload_size);
+        if (cached != 0) {
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: CACHE HIT (size=%u hash=0x%llx handle=0x%llx)\n",
+                    req->payload_size, (unsigned long long)fb_hash, (unsigned long long)cached);
+            return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &cached, sizeof(cached));
+        }
+
         CUmodule mod;
 
         /* Ensure we have an active CUDA context before loading modules */
@@ -1519,6 +1572,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             /* Same-arch: store as a normal Driver API module (no bit 63) */
             uint64_t handle = alloc_handle();
             hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+            fat_cache_insert(fb_hash, req->payload_size, handle);
             if (s_verbose)
                 fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Driver API success, handle=0x%llx\n",
                         (unsigned long long)handle);
@@ -1669,6 +1723,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     if (res == CUDA_SUCCESS) {
                         uint64_t handle = alloc_handle();
                         hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)mod);
+                        fat_cache_insert(fb_hash, req->payload_size, handle);
                         fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: zstd+cuModuleLoadData SUCCESS "
                                 "(type=%d, handle=0x%llx)\n", best_type, (unsigned long long)handle);
                         if (raw != (void *)best_data) free(raw);
@@ -1707,6 +1762,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 uint64_t handle = alloc_handle();
                 /* Store with bit 63 set to indicate Runtime API module */
                 hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)rt_handle | (1ULL << 63));
+                fat_cache_insert(fb_hash, req->payload_size, handle);
                 fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: Runtime API fallback SUCCESS "
                         "(handle=0x%llx, rt_handle=%p)\n",
                         (unsigned long long)handle, (void *)rt_handle);
