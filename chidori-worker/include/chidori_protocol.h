@@ -324,6 +324,9 @@ typedef enum {
     CHIDORI_REPLAY_INVALIDATE            = 0x0403,  /* Discard a recorded sequence */
     CHIDORI_REPLAY_STATUS                = 0x0404,  /* Query replay state/stats */
 
+    /* Bulk Transfer (0x0500) — combined alloc + HtoD in one RPC */
+    CHIDORI_ALLOC_AND_TRANSFER           = 0x0500,
+
     /* Sentinel */
     CHIDORI_FUNC_MAX                     = 0xFFFF,
 } chidori_func_id_t;

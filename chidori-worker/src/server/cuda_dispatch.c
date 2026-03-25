@@ -3865,6 +3865,49 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     /* ================================================================
+     * Bulk Transfer — combined alloc + HtoD in one RPC
+     * ================================================================ */
+    case CHIDORI_ALLOC_AND_TRANSFER: {
+        /* Payload: alloc_size(8) + data_len(8) + memset_val(4) + data(data_len)
+         * Response: real_ptr(8)
+         * Server allocates GPU memory, copies data into it, returns the pointer. */
+        if (req->payload_size < 20) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+        uint64_t alloc_size = 0, data_len = 0;
+        int32_t memset_val = -1; /* -1 = no memset, 0+ = memset value */
+        memcpy(&alloc_size, payload, 8);
+        memcpy(&data_len, (char *)payload + 8, 8);
+        memcpy(&memset_val, (char *)payload + 16, 4);
+
+        void *devPtr = NULL;
+        res = cuMemAlloc((CUdeviceptr *)&devPtr, (size_t)alloc_size);
+        if (res != CUDA_SUCCESS) {
+            return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+        }
+
+        /* Copy weight data if provided */
+        if (data_len > 0 && req->payload_size >= 20 + data_len) {
+            CUresult cp = cuMemcpyHtoD((CUdeviceptr)devPtr,
+                                        (char *)payload + 20,
+                                        (size_t)data_len);
+            if (cp != CUDA_SUCCESS) {
+                fprintf(stderr, "[bulk] HtoD failed: %d (size=%llu)\n",
+                        (int)cp, (unsigned long long)data_len);
+            }
+        }
+
+        /* Memset if requested (for bias zeroing) */
+        if (memset_val >= 0 && data_len == 0) {
+            cuMemsetD8((CUdeviceptr)devPtr, (unsigned char)memset_val,
+                       (size_t)alloc_size);
+        }
+
+        uint64_t ptr64 = (uint64_t)(uintptr_t)devPtr;
+        return chidori_send_response(fd, req->seq_num, 0, &ptr64, 8);
+    }
+
+    /* ================================================================
      * CUDA Graph API
      * ================================================================ */
     case CHIDORI_CU_STREAM_BEGIN_CAPTURE: {
