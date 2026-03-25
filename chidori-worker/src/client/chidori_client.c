@@ -3001,7 +3001,10 @@ cudaError_t cudaDeviceSynchronize(void) {
         return cudaSuccess;
     }
 
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_DEVICE_SYNCHRONIZE, NULL, 0, NULL, NULL);
+    /* Send as ASYNC — server still syncs GPU, but client doesn't block.
+     * The next SYNC operation (DtoH for .item()) naturally waits via TCP ordering.
+     * Saves 57ms RTT per training step for loss readback. */
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_DEVICE_SYNCHRONIZE, NULL, 0);
 
     /* Replay state machine: count sync points as step boundaries */
     if (is_replay_enabled() && !g_partial_offload) {
