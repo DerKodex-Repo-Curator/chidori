@@ -1980,6 +1980,76 @@ CUresult cuLaunchKernel(CUfunction f,
         }
     }
 
+    /* --- Cross-device pointer translation for partial offload backward pass ---
+     * During backward, autograd kernels may receive pointers to local GPU memory
+     * as parameters. These are invalid on the remote server. Scan the param buffer
+     * for local GPU pointers and transfer the data to the remote device, replacing
+     * the local pointer with the remote pointer in the param buffer.
+     */
+    if (g_partial_offload && param_buffer != NULL && param_buffer_size >= 8) {
+        size_t off = 0;
+        while (off + 8 <= param_buffer_size) {
+            uint64_t val = 0;
+            memcpy(&val, (char *)param_buffer + off, 8);
+            /* Check if this looks like a GPU pointer from a local device */
+            if (val > 0x100000 && val < 0x800000000000ULL) { /* plausible GPU address range */
+                int dev = alloc_track_device((uintptr_t)val);
+                if (dev >= 0 && is_local_device(dev)) {
+                    /* This parameter points to local GPU memory.
+                     * Find the allocation, copy data to remote, substitute pointer. */
+                    pthread_mutex_lock(&g_alloc_track_lock);
+                    for (int i = g_alloc_track_count - 1; i >= 0; i--) {
+                        if (val >= g_alloc_track[i].ptr &&
+                            val < g_alloc_track[i].ptr + g_alloc_track[i].size) {
+                            size_t alloc_size = g_alloc_track[i].size;
+                            uintptr_t base = g_alloc_track[i].ptr;
+                            size_t offset_in_alloc = (size_t)(val - base);
+                            pthread_mutex_unlock(&g_alloc_track_lock);
+
+                            /* Allocate remote buffer + copy via staging */
+                            void *staging = malloc(alloc_size);
+                            if (staging) {
+                                /* DtoH from local GPU */
+                                g_in_real_cuda++;
+                                if (g_real.cuMemcpyDtoH_v2)
+                                    g_real.cuMemcpyDtoH_v2(staging, (CUdeviceptr)base, alloc_size);
+                                g_in_real_cuda--;
+
+                                /* Allocate on remote + HtoD */
+                                uint64_t remote_size = (uint64_t)alloc_size;
+                                uint64_t remote_ptr = 0;
+                                size_t rlen = sizeof(remote_ptr);
+                                chidori_rpc(CHIDORI_CUDA_MALLOC, &remote_size, sizeof(remote_size),
+                                           &remote_ptr, &rlen);
+
+                                if (remote_ptr) {
+                                    /* HtoD to remote */
+                                    size_t htod_len = 16 + alloc_size;
+                                    void *htod_payload = malloc(htod_len);
+                                    memcpy(htod_payload, &remote_ptr, 8);
+                                    uint64_t sz = (uint64_t)alloc_size;
+                                    memcpy((char *)htod_payload + 8, &sz, 8);
+                                    memcpy((char *)htod_payload + 16, staging, alloc_size);
+                                    chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+                                    free(htod_payload);
+
+                                    /* Substitute pointer in param buffer */
+                                    uint64_t new_val = remote_ptr + offset_in_alloc;
+                                    memcpy((char *)param_buffer + off, &new_val, 8);
+                                }
+                                free(staging);
+                            }
+                            goto next_param;
+                        }
+                    }
+                    pthread_mutex_unlock(&g_alloc_track_lock);
+                }
+            }
+            next_param:
+            off += 8;
+        }
+    }
+
     /* --- Build the wire payload --- */
     uint8_t has_params = (param_buffer != NULL && param_buffer_size > 0) ? 1 : 0;
     size_t header_size = 44; /* func(8) + grid(12) + block(12) + shared(4) + stream(8) */
