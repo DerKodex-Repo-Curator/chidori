@@ -6201,10 +6201,36 @@ static uint64_t hash_fat_binary(const void *data, size_t size) {
 }
 
 /* Lazily register a fat binary on the server, returns server module handle */
+/* Pre-register all pending fat binaries asynchronously.
+ * Called before the first cuModuleGetFunction to flush all pending registrations. */
+static void flush_fat_binary_registrations(void) {
+    for (int i = 0; i < g_fat_binary_count; i++) {
+        if (g_fat_binaries[i].server_handle != 0) continue;
+        if (g_fat_binaries[i].data == NULL) continue;
+
+        uint64_t handle = 0;
+        size_t out_len = sizeof(handle);
+        CUresult r = chidori_rpc(CHIDORI_CUDA_REGISTER_FAT_BINARY,
+                                 g_fat_binaries[i].data,
+                                 (size_t)g_fat_binaries[i].size,
+                                 &handle, &out_len);
+        if (r == 0 && handle != 0)
+            g_fat_binaries[i].server_handle = handle;
+    }
+}
+
 static uint64_t lazy_register_fat_binary(int idx) {
     if (g_fat_binaries[idx].server_handle != 0)
         return g_fat_binaries[idx].server_handle;
 
+    /* Flush all pending registrations at once — amortizes the cost
+     * when multiple modules need registration during model loading */
+    flush_fat_binary_registrations();
+
+    if (g_fat_binaries[idx].server_handle != 0)
+        return g_fat_binaries[idx].server_handle;
+
+    /* Fallback: register just this one */
     uint64_t handle = 0;
     size_t out_len = sizeof(handle);
     CUresult r = chidori_rpc(CHIDORI_CUDA_REGISTER_FAT_BINARY,
