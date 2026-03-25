@@ -2454,6 +2454,25 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
+    /* Before any kernel launch: buffer mallocs for combined alloc+transfer.
+     * Return a placeholder pointer. When cudaMemcpy HtoD follows, send both
+     * in one ALLOC_AND_TRANSFER RPC (still sync, but 1 RTT instead of 3). */
+    if (!g_any_kernel_launched && g_bulk_count < BULK_MAX_PENDING) {
+        uint64_t placeholder = g_bulk_next_placeholder;
+        g_bulk_next_placeholder += ((size + 4095) & ~4095ULL); /* align to 4KB */
+        g_bulk_pending[g_bulk_count].placeholder = placeholder;
+        g_bulk_pending[g_bulk_count].alloc_size = (uint64_t)size;
+        g_bulk_pending[g_bulk_count].data = NULL;
+        g_bulk_pending[g_bulk_count].data_len = 0;
+        g_bulk_pending[g_bulk_count].memset_val = -1;
+        g_bulk_count++;
+        *devPtr = (void *)(uintptr_t)placeholder;
+        alloc_track_add(placeholder, size, g_current_device);
+        g_bulk_active = 1;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+
     uint64_t size64 = (uint64_t)size;
     uint64_t ptr64 = 0;
     size_t len = sizeof(uint64_t);
@@ -2461,7 +2480,6 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
     if (r == cudaSuccess) {
         *devPtr = (void *)(uintptr_t)ptr64;
         alloc_track_add(ptr64, size, g_current_device);
-        /* Track remote GPU address range for host pointer detection */
         if (ptr64 < g_remote_gpu_addr_min) g_remote_gpu_addr_min = ptr64;
         if (ptr64 + size > g_remote_gpu_addr_max) g_remote_gpu_addr_max = ptr64 + size;
     }
@@ -2515,8 +2533,40 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
 
     switch (kind) {
     case cudaMemcpyHostToDevice: {
-        /* Payload: dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + data(count)
-         * Same header layout as DtoH/DtoD so kind is always at offset 24. */
+        /* Check if dst is a bulk placeholder — combine alloc + transfer */
+        if (is_bulk_placeholder((uintptr_t)dst)) {
+            for (int bi = 0; bi < g_bulk_count; bi++) {
+                if (g_bulk_pending[bi].placeholder == (uint64_t)(uintptr_t)dst) {
+                    /* Send combined ALLOC_AND_TRANSFER — 1 sync RPC instead of 3 */
+                    size_t pl = 20 + count; /* header(20) + data */
+                    void *payload = malloc(pl);
+                    if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
+                    char *p = (char *)payload;
+                    memcpy(p, &g_bulk_pending[bi].alloc_size, 8); p += 8;
+                    uint64_t dl = (uint64_t)count;
+                    memcpy(p, &dl, 8); p += 8;
+                    int32_t mv = -1;
+                    memcpy(p, &mv, 4); p += 4;
+                    memcpy(p, src, count);
+
+                    uint64_t real_ptr = 0;
+                    size_t rlen = sizeof(real_ptr);
+                    CUresult cr = chidori_rpc(CHIDORI_ALLOC_AND_TRANSFER, payload, pl, &real_ptr, &rlen);
+                    free(payload);
+
+                    if (cr == CUDA_SUCCESS && real_ptr) {
+                        alloc_track_update((uintptr_t)g_bulk_pending[bi].placeholder, (uintptr_t)real_ptr);
+                        if (real_ptr < g_remote_gpu_addr_min) g_remote_gpu_addr_min = real_ptr;
+                        if (real_ptr + g_bulk_pending[bi].alloc_size > g_remote_gpu_addr_max)
+                            g_remote_gpu_addr_max = real_ptr + g_bulk_pending[bi].alloc_size;
+                    }
+                    g_last_error = (cudaError_t)cr;
+                    return (cudaError_t)cr;
+                }
+            }
+        }
+
+        /* Standard path: dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + data(count) */
         size_t payload_len = 8 + 8 + 8 + 4 + count;
         void *payload = malloc(payload_len);
         if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
@@ -2636,8 +2686,39 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 
     switch (kind) {
     case cudaMemcpyHostToDevice: {
-        /* Payload: dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + stream(8) + data(count)
-         * Same header layout as DtoH/DtoD so kind is always at offset 24. */
+        /* Check if dst is a bulk placeholder — combine alloc + transfer */
+        if (is_bulk_placeholder((uintptr_t)dst)) {
+            for (int bi = 0; bi < g_bulk_count; bi++) {
+                if (g_bulk_pending[bi].placeholder == (uint64_t)(uintptr_t)dst) {
+                    size_t pl = 20 + count;
+                    void *payload = malloc(pl);
+                    if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
+                    char *p = (char *)payload;
+                    memcpy(p, &g_bulk_pending[bi].alloc_size, 8); p += 8;
+                    uint64_t dl = (uint64_t)count;
+                    memcpy(p, &dl, 8); p += 8;
+                    int32_t mv = -1;
+                    memcpy(p, &mv, 4); p += 4;
+                    memcpy(p, src, count);
+
+                    uint64_t real_ptr = 0;
+                    size_t rlen = sizeof(real_ptr);
+                    CUresult cr = chidori_rpc(CHIDORI_ALLOC_AND_TRANSFER, payload, pl, &real_ptr, &rlen);
+                    free(payload);
+
+                    if (cr == CUDA_SUCCESS && real_ptr) {
+                        alloc_track_update((uintptr_t)g_bulk_pending[bi].placeholder, (uintptr_t)real_ptr);
+                        if (real_ptr < g_remote_gpu_addr_min) g_remote_gpu_addr_min = real_ptr;
+                        if (real_ptr + g_bulk_pending[bi].alloc_size > g_remote_gpu_addr_max)
+                            g_remote_gpu_addr_max = real_ptr + g_bulk_pending[bi].alloc_size;
+                    }
+                    g_last_error = (cudaError_t)cr;
+                    return (cudaError_t)cr;
+                }
+            }
+        }
+
+        /* Standard async path */
         size_t payload_len = 8 + 8 + 8 + 4 + 8 + count;
         void *payload = malloc(payload_len);
         if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
@@ -2706,6 +2787,36 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 }
 
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+    /* Handle bulk placeholder — send alloc+memset as combined RPC */
+    if (is_bulk_placeholder((uintptr_t)devPtr)) {
+        for (int bi = 0; bi < g_bulk_count; bi++) {
+            if (g_bulk_pending[bi].placeholder == (uint64_t)(uintptr_t)devPtr) {
+                size_t pl = 20; /* no data, just memset */
+                void *payload = malloc(pl);
+                char *p = (char *)payload;
+                memcpy(p, &g_bulk_pending[bi].alloc_size, 8); p += 8;
+                uint64_t dl = 0;
+                memcpy(p, &dl, 8); p += 8;
+                int32_t mv = value;
+                memcpy(p, &mv, 4);
+
+                uint64_t real_ptr = 0;
+                size_t rlen = sizeof(real_ptr);
+                CUresult cr = chidori_rpc(CHIDORI_ALLOC_AND_TRANSFER, payload, pl, &real_ptr, &rlen);
+                free(payload);
+
+                if (cr == CUDA_SUCCESS && real_ptr) {
+                    alloc_track_update((uintptr_t)g_bulk_pending[bi].placeholder, (uintptr_t)real_ptr);
+                    if (real_ptr < g_remote_gpu_addr_min) g_remote_gpu_addr_min = real_ptr;
+                    if (real_ptr + g_bulk_pending[bi].alloc_size > g_remote_gpu_addr_max)
+                        g_remote_gpu_addr_max = real_ptr + g_bulk_pending[bi].alloc_size;
+                }
+                g_last_error = (cudaError_t)cr;
+                return (cudaError_t)cr;
+            }
+        }
+    }
+
     /* Route based on the ADDRESS, not current device — the backward pass
      * may zero gradient buffers on device 0 while the current device is 1.
      * Sending a local GPU address to the remote server causes illegal access. */
