@@ -155,15 +155,21 @@ try:
     print(f"[GRAPH] Capture successful!")
 
     # Generate tokens using graph replay via driver API
+    # All ops must be on the SAME stream as the graph to ensure ordering.
+    # The graph was captured on stream s, so we run everything there.
     torch.cuda.synchronize()
     t0 = time.time()
     for i in range(MAX_NEW_TOKENS - 2):  # -2 for prefill + warmup tokens
-        # Update input for this step
-        static_input.copy_(warmup_next)
-        static_position.fill_(prompt_len + 2 + i)
+        # Update input for this step (on capture stream for ordering)
+        with torch.cuda.stream(s):
+            static_input.copy_(warmup_next)
+            static_position.fill_(prompt_len + 2 + i)
 
         # Replay the graph — ONE RPC instead of ~100
         lib.cuGraphLaunch(exec_ptr, stream_ptr)
+
+        # Wait for graph to finish before reading output
+        torch.cuda.current_stream().wait_stream(s)
 
         # Get next token from static output
         warmup_next = static_output.logits[:, -1:, :].argmax(dim=-1)
