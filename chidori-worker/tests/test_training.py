@@ -20,7 +20,7 @@ SEQ = 64
 VOCAB = 10000
 STEPS = 50
 
-# Disable Flash/SDPA attention — Chidori doesn't proxy CUTLASS kernels yet
+# Disable Flash/SDPA attention — use math-only path for deterministic training
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)

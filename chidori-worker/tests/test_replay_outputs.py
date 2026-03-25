@@ -39,7 +39,7 @@ torch.backends.cudnn.benchmark = False
 if hasattr(torch, "use_deterministic_algorithms"):
     torch.use_deterministic_algorithms(True, warn_only=True)
 
-# Disable Flash/SDPA attention — Chidori doesn't proxy CUTLASS kernels
+# Disable Flash/SDPA attention — use math-only path for deterministic replay
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)

@@ -34,7 +34,7 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# Disable Flash/SDPA attention — Chidori doesn't proxy CUTLASS kernels yet
+# Disable Flash/SDPA attention — use math-only path for deterministic replay
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)

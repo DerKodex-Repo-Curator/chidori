@@ -447,33 +447,20 @@ static void alloc_track_update(uintptr_t old_ptr, uintptr_t new_ptr) {
  * 200 × RTT into 1 × RTT + bandwidth-limited streaming.
  * ============================================================================ */
 #define BULK_MAX_PENDING 4096
-#define BULK_PLACEHOLDER_BASE 0xCH1D000000000000ULL
 
 static struct {
     uint64_t placeholder;    /* client-side placeholder pointer */
     uint64_t alloc_size;     /* requested allocation size */
-    void *data;              /* weight data (NULL if memset instead) */
-    size_t data_len;         /* size of data */
-    int memset_val;          /* -1 = no memset, 0+ = memset value */
-    int alloc_track_idx;     /* index in g_alloc_track for patching */
 } g_bulk_pending[BULK_MAX_PENDING];
 static int g_bulk_count = 0;
-static uint64_t g_bulk_next_placeholder = 0xDE00000000000000ULL;
-static int g_bulk_active = 0; /* 1 = currently buffering */
 
 static int is_bulk_placeholder(uintptr_t ptr) {
     return (ptr >> 56) == 0xDE;
 }
 
 /* Track whether any kernels have been launched — used to skip unnecessary
- * syncs during model loading phase. Before any kernel launch, syncs are
- * just confirming HtoD transfers which are already in the TCP pipeline. */
+ * syncs during model loading phase and to optimize per-token RPCs. */
 static int g_any_kernel_launched = 0;
-
-/* bulk_flush — not used in current approach */
-static void bulk_flush(void) {
-    (void)g_bulk_pending; (void)g_bulk_count; (void)g_bulk_active;
-}
 
 static uint32_t g_local_device_mask = 0;  /* bitmask: bit N = device N is local */
 static int g_local_device_count = 0;      /* number of local GPUs */
@@ -3371,9 +3358,8 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
     typedef cublasStatus_t (*create_fn)(cublasHandle_t *);
     create_fn real_create = (create_fn)__real_dlsym(h, "cublasCreate_v2");
     if (!real_create) return NULL;
-    /* The DEEPBIND cuBLAS uses the real CUDA driver via its own dependency scope.
-     * Our intercepted cudaSetDevice(0) sets the local GPU context via the real driver.
-     * Call it to ensure the context is current (matching the ctypes test that worked). */
+    /* cuBLAS uses the real CUDA driver via its own dlopen scope.
+     * Ensure the local GPU context is current before creating the handle. */
     /* Ensure real CUDA context is current for the local device */
     extern int cudaSetDevice(int);
     cudaSetDevice(0);
