@@ -302,6 +302,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         }
     }
 
+    /* Trace all calls during graph capture */
+    if (g_capturing_stream && req->func_id < 0x0400) {
+        fprintf(stderr, "[graph-trace] func_id=0x%04x payload_size=%u\n",
+                req->func_id, req->payload_size);
+    }
+
     CUresult res;
 
     switch (req->func_id) {
