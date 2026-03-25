@@ -3854,7 +3854,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         }
         CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
         if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+        fprintf(stderr, "[graph] BeginCapture: wire_handle=0x%llx real_stream=%p mode=%d\n",
+                (unsigned long long)stream_handle, (void*)stream, mode);
         res = cuStreamBeginCapture(stream, (CUstreamCaptureMode)mode);
+        fprintf(stderr, "[graph] BeginCapture result=%d\n", (int)res);
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
 

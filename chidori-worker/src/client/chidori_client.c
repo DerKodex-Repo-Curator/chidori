@@ -6390,11 +6390,13 @@ cudaError_t cudaGraphLaunch(void *graphExec, void *stream) {
 }
 
 cudaError_t cudaStreamBeginCapture(void *stream, int mode) {
-    fprintf(stderr, "[chidori] cudaStreamBeginCapture called stream=%p mode=%d\n", stream, mode);
+    fprintf(stderr, "[chidori] cudaStreamBeginCapture called stream=%p mode=%d func_id=0x%04x\n",
+            stream, mode, CHIDORI_CU_STREAM_BEGIN_CAPTURE);
     struct __attribute__((packed)) { uint64_t stream; int32_t mode; } req;
     req.stream = (uint64_t)(uintptr_t)stream;
     req.mode = mode;
     CUresult r = chidori_rpc(CHIDORI_CU_STREAM_BEGIN_CAPTURE, &req, sizeof(req), NULL, NULL);
+    fprintf(stderr, "[chidori] cudaStreamBeginCapture returned r=%d\n", (int)r);
     g_last_error = (cudaError_t)r;
     return (cudaError_t)r;
 }
