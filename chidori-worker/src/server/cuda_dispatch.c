@@ -53,6 +53,7 @@ static handle_map_t g_cublas_handles;  /* cublasHandle_t handles */
 /* Handle maps for cuDNN */
 static handle_map_t g_graphs;                      /* CUgraph handles */
 static handle_map_t g_graph_execs;                 /* CUgraphExec handles */
+static CUstream g_capturing_stream = NULL;         /* Stream currently in capture mode */
 
 static handle_map_t g_cudnn_handles;              /* cudnnHandle_t */
 static handle_map_t g_cudnn_tensor_descs;          /* cudnnTensorDescriptor_t */
@@ -775,10 +776,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
             if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         }
-        /* Debug: log stream for graph capture debugging */
-        if (s_verbose || stream_handle != 0)
-            fprintf(stderr, "[cuda_dispatch] LAUNCH: wire_stream=0x%llx real_stream=%p\n",
-                    (unsigned long long)stream_handle, (void*)stream);
+        /* During graph capture: redirect NULL stream to the capture stream */
+        if (!stream && g_capturing_stream) {
+            stream = g_capturing_stream;
+        }
 
         /* Parse kernel parameters if present */
         size_t remaining = req->payload_size - 44;
@@ -2763,6 +2764,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_wire);
         if (!stream && stream_wire)
             stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_wire);
+        /* During graph capture: redirect NULL stream to capture stream */
+        if (!stream && g_capturing_stream)
+            stream = g_capturing_stream;
 
         cublasLtMatmulAlgo_t *algo = (cublasLtMatmulAlgo_t *)algo_bytes;
 
@@ -3861,6 +3865,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         fprintf(stderr, "[graph] BeginCapture: wire_handle=0x%llx real_stream=%p mode=%d\n",
                 (unsigned long long)stream_handle, (void*)stream, mode);
         res = cuStreamBeginCapture(stream, (CUstreamCaptureMode)mode);
+        if (res == CUDA_SUCCESS) g_capturing_stream = stream;
         fprintf(stderr, "[graph] BeginCapture result=%d\n", (int)res);
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
@@ -3873,6 +3878,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         CUgraph graph = NULL;
         res = cuStreamEndCapture(stream, &graph);
+        g_capturing_stream = NULL; /* Capture ended */
         if (res == CUDA_SUCCESS && graph) {
             uint64_t handle = alloc_handle();
             hmap_put(&g_graphs, handle, (uint64_t)(uintptr_t)graph);
