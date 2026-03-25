@@ -3862,7 +3862,11 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         }
         CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
         if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
-        fprintf(stderr, "[graph] BeginCapture: wire_handle=0x%llx real_stream=%p mode=%d\n",
+        /* Force relaxed mode — global mode fails over wire because non-capture
+         * operations (device queries, etc.) hit the default stream and invalidate.
+         * Relaxed mode only records operations on the capture stream. */
+        mode = 1; /* CU_STREAM_CAPTURE_MODE_RELAXED */
+        fprintf(stderr, "[graph] BeginCapture: wire_handle=0x%llx real_stream=%p mode=%d (forced relaxed)\n",
                 (unsigned long long)stream_handle, (void*)stream, mode);
         res = cuStreamBeginCapture(stream, (CUstreamCaptureMode)mode);
         if (res == CUDA_SUCCESS) g_capturing_stream = stream;
