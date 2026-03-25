@@ -775,6 +775,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
             if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
         }
+        /* Debug: log stream for graph capture debugging */
+        if (s_verbose || stream_handle != 0)
+            fprintf(stderr, "[cuda_dispatch] LAUNCH: wire_stream=0x%llx real_stream=%p\n",
+                    (unsigned long long)stream_handle, (void*)stream);
 
         /* Parse kernel parameters if present */
         size_t remaining = req->payload_size - 44;
