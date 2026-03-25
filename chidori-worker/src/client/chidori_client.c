@@ -3085,6 +3085,32 @@ cudaError_t cudaStreamSynchronize(void *stream) {
     return r;
 }
 
+/* Event pool — pre-allocate events to avoid sync RPC per cudaEventCreate.
+ * PyTorch creates/destroys events frequently during inference for profiling.
+ * Each create/destroy pair costs 2 × 57ms = 114ms RTT overhead. */
+#define EVENT_POOL_SIZE 256
+static uint64_t g_event_pool[EVENT_POOL_SIZE];
+static int g_event_pool_count = 0;
+static int g_event_pool_inited = 0;
+
+static void event_pool_fill(void) {
+    /* Pre-allocate events on the server in a single burst.
+     * Uses pipelined sync: send all requests, then read all responses. */
+    int batch = EVENT_POOL_SIZE - g_event_pool_count;
+    if (batch <= 0) return;
+    if (batch > 64) batch = 64; /* Refill in chunks */
+
+    for (int i = 0; i < batch; i++) {
+        uint64_t handle = 0;
+        size_t len = sizeof(uint64_t);
+        CUresult r = chidori_rpc(CHIDORI_CUDA_EVENT_CREATE, NULL, 0, &handle, &len);
+        if (r == 0 && handle != 0) {
+            g_event_pool[g_event_pool_count++] = handle;
+        }
+    }
+    g_event_pool_inited = 1;
+}
+
 cudaError_t cudaEventCreate(void **pEvent) {
     /* Local device: create event on real driver */
     if (g_partial_offload && is_local_device(g_current_device) && g_real.cuEventCreate) {
@@ -3095,6 +3121,27 @@ cudaError_t cudaEventCreate(void **pEvent) {
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
+    /* Try event pool first — O(0) network cost */
+    if (g_event_pool_count > 0) {
+        uint64_t handle = g_event_pool[--g_event_pool_count];
+        *pEvent = (void *)(uintptr_t)handle;
+        event_track_add(handle, g_current_device);
+        g_last_error = cudaSuccess;
+        /* Refill pool in background when running low */
+        if (g_event_pool_count < 16 && g_event_pool_inited)
+            event_pool_fill();
+        return cudaSuccess;
+    }
+    /* Pool empty — fill it and try again */
+    event_pool_fill();
+    if (g_event_pool_count > 0) {
+        uint64_t handle = g_event_pool[--g_event_pool_count];
+        *pEvent = (void *)(uintptr_t)handle;
+        event_track_add(handle, g_current_device);
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+    /* Fallback: direct RPC */
     uint64_t handle = 0;
     size_t len = sizeof(uint64_t);
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_EVENT_CREATE, NULL, 0, &handle, &len);
@@ -3173,8 +3220,17 @@ cudaError_t cudaEventDestroy(void *event) {
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
+    /* Return to event pool instead of destroying — saves future create RPCs */
     uint64_t handle = (uint64_t)(uintptr_t)event;
+    if (g_event_pool_count < EVENT_POOL_SIZE) {
+        g_event_pool[g_event_pool_count++] = handle;
+        event_track_remove(handle);
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+    /* Pool full — actually destroy */
     cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_EVENT_DESTROY, &handle, sizeof(handle));
+    event_track_remove(handle);
     g_last_error = r;
     return r;
 }
@@ -6032,13 +6088,19 @@ cudaError_t cudaStreamAddCallback(void *stream, void *callback, void *userData, 
     return cudaSuccess;
 }
 
+/* Client-side capture state: set by BeginCapture, cleared by EndCapture.
+ * Avoids sync RPC for every cudaStreamIsCapturing query (called ~10x/token). */
+static int g_client_capture_active = 0;
+
 cudaError_t cudaStreamIsCapturing(void *stream, int *pCaptureStatus) {
-    /* Before any kernel launch, we know capture isn't active — skip RPC */
-    if (!g_any_kernel_launched) {
+    /* Fast path: if we haven't called BeginCapture, we know we're not capturing.
+     * This eliminates ~10 sync RPCs per inference token (each costs 57ms RTT). */
+    if (!g_client_capture_active) {
         if (pCaptureStatus) *pCaptureStatus = 0; /* cudaStreamCaptureStatusNone */
         g_last_error = cudaSuccess;
         return cudaSuccess;
     }
+    /* During active capture, ask the server for real status */
     uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
     int32_t status = 0;
     size_t status_len = sizeof(status);
@@ -6866,6 +6928,7 @@ cudaError_t cudaStreamBeginCapture(void *stream, int mode) {
     req.stream = (uint64_t)(uintptr_t)stream;
     req.mode = mode;
     CUresult r = chidori_rpc(CHIDORI_CU_STREAM_BEGIN_CAPTURE, &req, sizeof(req), NULL, NULL);
+    if (r == CUDA_SUCCESS) g_client_capture_active = 1;
     fprintf(stderr, "[chidori] cudaStreamBeginCapture returned r=%d\n", (int)r);
     g_last_error = (cudaError_t)r;
     return (cudaError_t)r;
@@ -6877,6 +6940,7 @@ cudaError_t cudaStreamEndCapture(void *stream, void **pGraph) {
     size_t graph_len = sizeof(graph_handle);
     CUresult r = chidori_rpc(CHIDORI_CU_STREAM_END_CAPTURE, &stream_handle, sizeof(stream_handle),
                              &graph_handle, &graph_len);
+    g_client_capture_active = 0; /* Capture ended regardless of success */
     if (pGraph) *pGraph = (void *)(uintptr_t)graph_handle;
     g_last_error = (cudaError_t)r;
     return (cudaError_t)r;
