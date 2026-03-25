@@ -3071,16 +3071,18 @@ cudaError_t cudaStreamSynchronize(void *stream) {
         g_last_error = (cudaError_t)cr;
         return (cudaError_t)cr;
     }
-    /* During model loading (before any kernel launch), skip stream sync.
-     * HtoD memcpys are already in the TCP pipeline and CUDA guarantees
-     * stream ordering — they'll complete before the first kernel executes.
-     * This eliminates ~200 × 57ms = 11.4s of unnecessary round-trips. */
+    /* During model loading (before any kernel launch), skip entirely.
+     * After kernels launch, send as ASYNC — the server still syncs the GPU
+     * stream, but we don't block waiting for the response. The next SYNC
+     * operation (e.g., DtoH memcpy for .item()) will wait for all prior
+     * server operations due to TCP ordering. This saves 57ms RTT per call
+     * during inference — from ~2 SYNC/token to ~1 SYNC/token. */
     if (!g_any_kernel_launched) {
         g_last_error = cudaSuccess;
         return cudaSuccess;
     }
     uint64_t handle = (uint64_t)(uintptr_t)stream;
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
+    cudaError_t r = (cudaError_t)chidori_rpc_async(CHIDORI_CUDA_STREAM_SYNCHRONIZE, &handle, sizeof(handle));
     g_last_error = r;
     return r;
 }
