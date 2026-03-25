@@ -487,6 +487,8 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CU_CTX_SYNCHRONIZE:
+        if (g_capturing_stream)
+            return chidori_send_response(fd, req->seq_num, 0, NULL, 0);
         res = cuCtxSynchronize();
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
 
@@ -1223,6 +1225,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_DEVICE_SYNCHRONIZE: {
+        /* Skip sync during graph capture */
+        if (g_capturing_stream)
+            return chidori_send_response(fd, req->seq_num, 0, NULL, 0);
         cudaError_t err = cudaDeviceSynchronize();
         return chidori_send_response(fd, req->seq_num, (int32_t)err, NULL, 0);
     }
@@ -1254,6 +1259,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     case CHIDORI_CUDA_STREAM_SYNCHRONIZE: {
+        /* Skip sync during graph capture — sync invalidates capture */
+        if (g_capturing_stream) {
+            return chidori_send_response(fd, req->seq_num, 0, NULL, 0);
+        }
         uint64_t handle = 0;
         if (req->payload_size >= 8)
             memcpy(&handle, payload, 8);
