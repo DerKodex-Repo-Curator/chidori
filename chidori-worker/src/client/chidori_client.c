@@ -6390,6 +6390,7 @@ cudaError_t cudaGraphLaunch(void *graphExec, void *stream) {
 }
 
 cudaError_t cudaStreamBeginCapture(void *stream, int mode) {
+    fprintf(stderr, "[chidori] cudaStreamBeginCapture called stream=%p mode=%d\n", stream, mode);
     struct __attribute__((packed)) { uint64_t stream; int32_t mode; } req;
     req.stream = (uint64_t)(uintptr_t)stream;
     req.mode = mode;
@@ -6858,10 +6859,30 @@ CUresult cuMemGetAllocationPropertiesFromHandle(void *prop, void *handle) {
 /* ---- Stream Capture / CUDA Graphs (Driver API — real RPCs) ---- */
 
 CUresult cuStreamBeginCapture_v2(CUstream hStream, int mode) {
+    fprintf(stderr, "[chidori] cuStreamBeginCapture_v2 called stream=%p mode=%d\n", (void*)hStream, mode);
     struct __attribute__((packed)) { uint64_t stream; int32_t mode; } req;
     req.stream = (uint64_t)(uintptr_t)hStream;
     req.mode = mode;
     return chidori_rpc(CHIDORI_CU_STREAM_BEGIN_CAPTURE, &req, sizeof(req), NULL, NULL);
+}
+
+/* Additional variants PyTorch may call */
+CUresult cuStreamBeginCapture(CUstream hStream, int mode) {
+    return cuStreamBeginCapture_v2(hStream, mode);
+}
+
+CUresult cuStreamBeginCapture_v3(CUstream hStream, int mode) {
+    return cuStreamBeginCapture_v2(hStream, mode);
+}
+
+CUresult cuGraphInstantiate(void **phGraphExec, void *hGraph,
+                            unsigned long long flags) {
+    return cuGraphInstantiate_v2(phGraphExec, hGraph, NULL, NULL, 0);
+}
+
+CUresult cuGraphInstantiate_v3(void **phGraphExec, void *hGraph,
+                               unsigned long long flags) {
+    return cuGraphInstantiate_v2(phGraphExec, hGraph, NULL, NULL, 0);
 }
 
 CUresult cuStreamEndCapture(CUstream hStream, void **phGraph) {
