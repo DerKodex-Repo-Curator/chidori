@@ -5764,18 +5764,27 @@ cudaError_t cudaStreamAddCallback(void *stream, void *callback, void *userData, 
 }
 
 cudaError_t cudaStreamIsCapturing(void *stream, int *pCaptureStatus) {
-    (void)stream;
-    if (pCaptureStatus) *pCaptureStatus = 0; /* cudaStreamCaptureStatusNone */
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
+    int32_t status = 0;
+    size_t status_len = sizeof(status);
+    CUresult r = chidori_rpc(CHIDORI_CU_STREAM_IS_CAPTURING, &stream_handle, sizeof(stream_handle),
+                             &status, &status_len);
+    if (pCaptureStatus) *pCaptureStatus = status;
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaStreamGetCaptureInfo(void *stream, int *captureStatus, unsigned long long *id) {
-    (void)stream;
-    if (captureStatus) *captureStatus = 0;
-    if (id) *id = 0;
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    /* Query server for capture status */
+    uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
+    int32_t status = 0;
+    size_t status_len = sizeof(status);
+    CUresult r = chidori_rpc(CHIDORI_CU_STREAM_IS_CAPTURING, &stream_handle, sizeof(stream_handle),
+                             &status, &status_len);
+    if (captureStatus) *captureStatus = status;
+    if (id) *id = (status != 0) ? 1 : 0; /* non-zero ID if capturing */
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaThreadExchangeStreamCaptureMode(int *mode) {
