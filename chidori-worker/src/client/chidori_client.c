@@ -6201,22 +6201,142 @@ static uint64_t hash_fat_binary(const void *data, size_t size) {
 }
 
 /* Lazily register a fat binary on the server, returns server module handle */
-/* Pre-register all pending fat binaries asynchronously.
- * Called before the first cuModuleGetFunction to flush all pending registrations. */
+/* Pre-register all pending fat binaries using PIPELINED sync RPCs.
+ * Instead of send-wait-send-wait (N × RTT), this sends ALL requests first,
+ * then reads ALL responses. TCP ordering guarantees responses arrive in order.
+ * Converts ~100 × 57ms = 5.7s into ~1.6s (bandwidth-limited, 1 RTT pipeline). */
 static void flush_fat_binary_registrations(void) {
+    /* Collect indices that need registration */
+    int pending_indices[MAX_FAT_BINARIES];
+    int pending_count = 0;
     for (int i = 0; i < g_fat_binary_count; i++) {
         if (g_fat_binaries[i].server_handle != 0) continue;
         if (g_fat_binaries[i].data == NULL) continue;
-
-        uint64_t handle = 0;
-        size_t out_len = sizeof(handle);
-        CUresult r = chidori_rpc(CHIDORI_CUDA_REGISTER_FAT_BINARY,
-                                 g_fat_binaries[i].data,
-                                 (size_t)g_fat_binaries[i].size,
-                                 &handle, &out_len);
-        if (r == 0 && handle != 0)
-            g_fat_binaries[i].server_handle = handle;
+        pending_indices[pending_count++] = i;
     }
+    if (pending_count == 0) return;
+
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+    fprintf(stderr, "[chidori] flush_fat_binary: pipelining %d registrations...\n", pending_count);
+
+    pthread_mutex_lock(&g_lock);
+
+    /* Flush any prior async responses */
+    if (g_pending_responses > 0)
+        chidori_flush_responses();
+
+    if (g_server_fd < 0) {
+        if (chidori_connect() != 0) {
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+    }
+
+    /* Uncork TCP — we want each send to go out immediately for pipelining */
+    if (g_cork_active && g_server_fd >= 0) {
+#ifdef TCP_CORK
+        int cork = 0;
+        setsockopt(g_server_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+        g_cork_active = 0;
+    }
+
+    /* Disable Nagle — we're sending large payloads, don't buffer them */
+    int nodelay = 1;
+    setsockopt(g_server_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    /* Phase 1: Send ALL fat binary requests without waiting for responses.
+     * TCP flow control handles buffering — send() blocks when buffer is full,
+     * which is fine since the server is draining data from its side. */
+    uint64_t total_bytes = 0;
+    for (int i = 0; i < pending_count; i++) {
+        int idx = pending_indices[i];
+        chidori_request_t req = {0};
+        req.func_id = CHIDORI_CUDA_REGISTER_FAT_BINARY;
+        req.flags = CHIDORI_FLAG_SYNC;
+        req.seq_num = ++g_seq_num;
+
+        if (chidori_send_request(g_server_fd, &req,
+                                  g_fat_binaries[idx].data,
+                                  (size_t)g_fat_binaries[idx].size) != 0) {
+            fprintf(stderr, "[chidori] flush_fat_binary: send failed at %d/%d: %s\n",
+                    i, pending_count, strerror(errno));
+            close(g_server_fd);
+            g_server_fd = -1;
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+        total_bytes += g_fat_binaries[idx].size;
+        g_sync_count++;
+    }
+
+    /* Phase 2: Read ALL responses in order. Server sends responses as it
+     * processes each fat binary, so they arrive in the same order we sent. */
+    int success_count = 0;
+    for (int i = 0; i < pending_count; i++) {
+        int idx = pending_indices[i];
+        chidori_response_t resp;
+        if (chidori_recv_response(g_server_fd, &resp) != 0) {
+            fprintf(stderr, "[chidori] flush_fat_binary: recv failed at %d/%d: %s\n",
+                    i, pending_count, strerror(errno));
+            close(g_server_fd);
+            g_server_fd = -1;
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+
+        size_t resp_payload_len = resp.msg_len - CHIDORI_RESPONSE_HEADER_SIZE;
+        uint64_t handle = 0;
+        if (resp_payload_len > 0) {
+            if (resp_payload_len >= sizeof(handle)) {
+                if (chidori_read_full(g_server_fd, &handle, sizeof(handle)) != 0) {
+                    close(g_server_fd);
+                    g_server_fd = -1;
+                    pthread_mutex_unlock(&g_lock);
+                    return;
+                }
+                /* Drain any extra bytes beyond the handle */
+                size_t remaining = resp_payload_len - sizeof(handle);
+                char drain[4096];
+                while (remaining > 0) {
+                    size_t chunk = remaining < sizeof(drain) ? remaining : sizeof(drain);
+                    if (chidori_read_full(g_server_fd, drain, chunk) != 0) {
+                        close(g_server_fd);
+                        g_server_fd = -1;
+                        pthread_mutex_unlock(&g_lock);
+                        return;
+                    }
+                    remaining -= chunk;
+                }
+            } else {
+                /* Response payload smaller than handle — drain it */
+                char drain[64];
+                if (chidori_read_full(g_server_fd, drain, resp_payload_len) != 0) {
+                    close(g_server_fd);
+                    g_server_fd = -1;
+                    pthread_mutex_unlock(&g_lock);
+                    return;
+                }
+            }
+        }
+
+        if (resp.result == 0 && handle != 0) {
+            g_fat_binaries[idx].server_handle = handle;
+            success_count++;
+        } else {
+            fprintf(stderr, "[chidori] flush_fat_binary: fat_binary[%d] failed result=%d handle=%llu\n",
+                    idx, resp.result, (unsigned long long)handle);
+        }
+    }
+
+    pthread_mutex_unlock(&g_lock);
+
+    gettimeofday(&t1, NULL);
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+    fprintf(stderr, "[chidori] flush_fat_binary: %d/%d registered in %.2fs (%.1f MB sent, %.1f MB/s)\n",
+            success_count, pending_count, elapsed,
+            total_bytes / 1e6, total_bytes / elapsed / 1e6);
 }
 
 static uint64_t lazy_register_fat_binary(int idx) {
