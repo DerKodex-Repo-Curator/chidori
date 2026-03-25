@@ -6185,6 +6185,21 @@ static void replay_deferred_registrations(void) {
     fprintf(stderr, "[chidori] deferred replay: complete\n");
 }
 
+/* Simple FNV-1a hash for fat binary cache lookup */
+static uint64_t hash_fat_binary(const void *data, size_t size) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)data;
+    /* Hash first 4KB + last 4KB + size for speed (don't hash entire 15MB blob) */
+    size_t head = size < 4096 ? size : 4096;
+    for (size_t i = 0; i < head; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    if (size > 8192) {
+        const uint8_t *tail = p + size - 4096;
+        for (size_t i = 0; i < 4096; i++) { h ^= tail[i]; h *= 0x100000001b3ULL; }
+    }
+    h ^= (uint64_t)size; h *= 0x100000001b3ULL;
+    return h;
+}
+
 /* Lazily register a fat binary on the server, returns server module handle */
 static uint64_t lazy_register_fat_binary(int idx) {
     if (g_fat_binaries[idx].server_handle != 0)
