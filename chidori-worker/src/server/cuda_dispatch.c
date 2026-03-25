@@ -3964,6 +3964,98 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     /* ================================================================
+     * Server-side autoregressive decode — run graph + argmax loop locally.
+     * Eliminates per-token RTT: N tokens in 1 RPC instead of N RPCs.
+     * ================================================================ */
+    case CHIDORI_GRAPH_DECODE: {
+        if (req->payload_size < 52) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+        uint64_t exec_handle = 0, stream_handle = 0;
+        uint64_t input_ptr = 0, position_ptr = 0, logits_ptr = 0;
+        int32_t vocab_size = 0, num_tokens = 0, start_position = 0;
+        const char *p = (const char *)payload;
+        memcpy(&exec_handle, p, 8); p += 8;
+        memcpy(&stream_handle, p, 8); p += 8;
+        memcpy(&input_ptr, p, 8); p += 8;
+        memcpy(&position_ptr, p, 8); p += 8;
+        memcpy(&logits_ptr, p, 8); p += 8;
+        memcpy(&vocab_size, p, 4); p += 4;
+        memcpy(&num_tokens, p, 4); p += 4;
+        memcpy(&start_position, p, 4);
+
+        CUgraphExec exec = (CUgraphExec)(uintptr_t)hmap_get(&g_graph_execs, exec_handle);
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+
+        if (!exec || num_tokens <= 0 || num_tokens > 4096 || vocab_size <= 0) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+
+        /* Allocate host buffers for logits readback and token output */
+        size_t logits_bytes = (size_t)vocab_size * 2; /* FP16 = 2 bytes per element */
+        uint16_t *host_logits = (uint16_t *)malloc(logits_bytes);
+        int32_t *tokens = (int32_t *)malloc((size_t)num_tokens * 4);
+        if (!host_logits || !tokens) {
+            free(host_logits); free(tokens);
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_OUT_OF_MEMORY, NULL, 0);
+        }
+
+        int generated = 0;
+        int32_t position = start_position;
+
+        for (int i = 0; i < num_tokens; i++) {
+            /* Update cache position on GPU (single int32) */
+            cuMemcpyHtoD((CUdeviceptr)position_ptr, &position, sizeof(int32_t));
+
+            /* Launch the captured graph */
+            res = cuGraphLaunch(exec, stream);
+            if (res != CUDA_SUCCESS) break;
+
+            /* Wait for graph to complete */
+            res = cuStreamSynchronize(stream);
+            if (res != CUDA_SUCCESS) break;
+
+            /* Read logits from GPU (FP16 × vocab_size) */
+            cuMemcpyDtoH(host_logits, (CUdeviceptr)logits_ptr, logits_bytes);
+
+            /* CPU argmax over FP16 logits */
+            int32_t best_token = 0;
+            uint16_t best_val = host_logits[0];
+            for (int v = 1; v < vocab_size; v++) {
+                if (host_logits[v] > best_val) {
+                    best_val = host_logits[v];
+                    best_token = v;
+                }
+            }
+
+            tokens[generated++] = best_token;
+
+            /* Write next input token to GPU (int64 for PyTorch's LongTensor) */
+            int64_t token64 = (int64_t)best_token;
+            cuMemcpyHtoD((CUdeviceptr)input_ptr, &token64, sizeof(int64_t));
+
+            position++;
+
+            /* Stop on EOS token (configurable, but 2 is common) */
+            if (best_token == 2) break;
+        }
+
+        free(host_logits);
+
+        /* Build response: num_generated(4) + token_ids(4 × N) */
+        size_t resp_len = 4 + (size_t)generated * 4;
+        uint8_t *resp_buf = (uint8_t *)malloc(resp_len);
+        memcpy(resp_buf, &generated, 4);
+        memcpy(resp_buf + 4, tokens, (size_t)generated * 4);
+        free(tokens);
+
+        int ret = chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, resp_buf, resp_len);
+        free(resp_buf);
+        return ret;
+    }
+
+    /* ================================================================
      * CUDA Graph API
      * ================================================================ */
     case CHIDORI_CU_STREAM_BEGIN_CAPTURE: {

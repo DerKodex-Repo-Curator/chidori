@@ -187,11 +187,111 @@ try:
     print(f"--- End ---")
 
     speedup = graph_tps / baseline_tps if baseline_tps > 0 else 0
+
+    # ============================================================
+    # SERVER-SIDE DECODE: Run graph+argmax loop on server, return all tokens
+    # One RPC for N tokens instead of N RPCs
+    # ============================================================
+    server_tps = 0
+    server_toks = 0
+    try:
+        print(f"\n[SERVER] Testing server-side autoregressive decode...")
+        # Reset static cache for fresh generation
+        static_cache2 = StaticCache(
+            config=model.config,
+            max_cache_len=prompt_len + MAX_NEW_TOKENS + 16,
+        )
+        with torch.no_grad():
+            pfout2 = model(
+                inputs["input_ids"],
+                past_key_values=static_cache2,
+                use_cache=True,
+            )
+            nt2 = pfout2.logits[:, -1:, :].argmax(dim=-1)
+
+        # Warmup decode step
+        cp2 = torch.tensor([prompt_len], device="cuda")
+        with torch.no_grad():
+            wo2 = model(nt2, past_key_values=static_cache2, use_cache=True, cache_position=cp2)
+        wn2 = wo2.logits[:, -1:, :].argmax(dim=-1)
+        torch.cuda.synchronize()
+
+        # Re-capture graph with fresh cache
+        s2 = torch.cuda.Stream()
+        s2.wait_stream(torch.cuda.current_stream())
+        si2 = nt2.clone()
+        sp2 = torch.tensor([prompt_len + 1], device="cuda", dtype=torch.long)
+        with torch.cuda.stream(s2):
+            with torch.no_grad():
+                so2 = model(si2, past_key_values=static_cache2, use_cache=True, cache_position=sp2)
+        torch.cuda.current_stream().wait_stream(s2)
+        torch.cuda.synchronize()
+
+        sptr2 = ctypes.c_void_p(s2.cuda_stream)
+        r = lib.cuStreamBeginCapture_v2(sptr2, ctypes.c_int(0))
+        with torch.cuda.stream(s2):
+            with torch.no_grad():
+                so2 = model(si2, past_key_values=static_cache2, use_cache=True, cache_position=sp2)
+        gptr2 = ctypes.c_void_p(0)
+        lib.cuStreamEndCapture(sptr2, ctypes.byref(gptr2))
+        eptr2 = ctypes.c_void_p(0)
+        lib.cuGraphInstantiate(ctypes.byref(eptr2), gptr2, ctypes.c_ulonglong(0))
+
+        # Get GPU addresses for server-side decode
+        input_data_ptr = si2.data_ptr()
+        position_data_ptr = sp2.data_ptr()
+        logits_data_ptr = so2.logits[:, -1:, :].contiguous().data_ptr()
+        vocab = model.config.vocab_size
+
+        # Build GRAPH_DECODE payload
+        import struct
+        decode_payload = struct.pack('<QQQQQiii',
+            eptr2.value,           # graph_exec handle
+            sptr2.value,           # stream handle
+            input_data_ptr,        # input_ptr (GPU)
+            position_data_ptr,     # position_ptr (GPU)
+            logits_data_ptr,       # logits_ptr (GPU)
+            vocab,                 # vocab_size
+            MAX_NEW_TOKENS - 2,    # num_tokens
+            prompt_len + 2,        # start_position
+        )
+
+        # Call chidori_graph_decode — exposed public function in libchidori.so
+        out_tokens = (ctypes.c_int32 * (MAX_NEW_TOKENS))()
+        out_count = ctypes.c_int32(0)
+
+        torch.cuda.synchronize()
+        t0 = time.time()
+        ret = lib.chidori_graph_decode(
+            ctypes.c_uint64(eptr2.value),
+            ctypes.c_uint64(sptr2.value),
+            ctypes.c_uint64(input_data_ptr),
+            ctypes.c_uint64(position_data_ptr),
+            ctypes.c_uint64(logits_data_ptr),
+            ctypes.c_int32(vocab),
+            ctypes.c_int32(MAX_NEW_TOKENS - 2),
+            ctypes.c_int32(prompt_len + 2),
+            out_tokens,
+            ctypes.byref(out_count),
+        )
+        server_dt = time.time() - t0
+        server_toks = out_count.value
+        server_tps = server_toks / server_dt if server_dt > 0 else 0
+
+        server_text = tokenizer.decode([out_tokens[i] for i in range(server_toks)], skip_special_tokens=True)
+        print(f"[SERVER] {server_toks} tokens in {server_dt:.1f}s = {server_tps:.1f} tok/s (ret={ret})")
+        print(f"[SERVER] Text: {server_text[:200]}")
+
+    except Exception as e:
+        print(f"[SERVER] Server decode setup: {e}")
+
     print(f"\n{'='*60}")
     print(f"  CUDA Graph Inference — {dev}")
     print(f"{'='*60}")
     print(f"  Baseline:   {baseline_tps:.1f} tok/s (no graph)")
     print(f"  Graph:      {graph_tps:.1f} tok/s")
+    if server_tps > 0:
+        print(f"  Server:     {server_tps:.1f} tok/s (server-side decode)")
     print(f"  Speedup:    {speedup:.1f}x")
     print(f"{'='*60}")
 

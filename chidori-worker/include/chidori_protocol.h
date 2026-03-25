@@ -327,6 +327,13 @@ typedef enum {
     /* Bulk Transfer (0x0500) — combined alloc + HtoD in one RPC */
     CHIDORI_ALLOC_AND_TRANSFER           = 0x0500,
 
+    /* Server-side autoregressive decode (0x0501)
+     * Runs graph launch + argmax loop on server, returns all tokens.
+     * Payload: graph_exec(8) + stream(8) + input_ptr(8) + position_ptr(8) +
+     *          logits_ptr(8) + vocab_size(4) + num_tokens(4) + start_position(4)
+     * Response: num_generated(4) + token_ids(4 × N) */
+    CHIDORI_GRAPH_DECODE                 = 0x0501,
+
     /* Sentinel */
     CHIDORI_FUNC_MAX                     = 0xFFFF,
 } chidori_func_id_t;

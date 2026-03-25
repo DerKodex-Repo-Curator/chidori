@@ -9028,6 +9028,57 @@ int nvmlShutdown(void) { return NVML_SUCCESS; }
  * When PyTorch requests a symbol we intercept, we return ours.
  */
 
+/* ================================================================
+ * Public API: Server-side autoregressive decode
+ *
+ * Sends one GRAPH_DECODE RPC that runs the graph+argmax loop on
+ * the server and returns all tokens. Python calls this via ctypes.
+ * ================================================================ */
+int chidori_graph_decode(
+    uint64_t graph_exec,    /* Wire handle from cuGraphInstantiate */
+    uint64_t stream,        /* Wire handle for the capture stream */
+    uint64_t input_ptr,     /* GPU address of input token (int64) */
+    uint64_t position_ptr,  /* GPU address of cache position (int64) */
+    uint64_t logits_ptr,    /* GPU address of logits output (float16 × vocab) */
+    int32_t vocab_size,     /* Vocabulary size */
+    int32_t num_tokens,     /* Max tokens to generate */
+    int32_t start_position, /* Starting cache position */
+    int32_t *out_tokens,    /* Output: generated token IDs */
+    int32_t *out_count      /* Output: number of tokens generated */
+) {
+    /* Build payload: exec(8)+stream(8)+input(8)+pos(8)+logits(8)+vocab(4)+num(4)+start(4) = 52 bytes */
+    uint8_t payload[52];
+    char *p = (char *)payload;
+    memcpy(p, &graph_exec, 8); p += 8;
+    memcpy(p, &stream, 8); p += 8;
+    memcpy(p, &input_ptr, 8); p += 8;
+    memcpy(p, &position_ptr, 8); p += 8;
+    memcpy(p, &logits_ptr, 8); p += 8;
+    memcpy(p, &vocab_size, 4); p += 4;
+    memcpy(p, &num_tokens, 4); p += 4;
+    memcpy(p, &start_position, 4);
+
+    /* Response: count(4) + tokens(4 × N), max 4096 tokens */
+    uint8_t resp[4 + 4096 * 4];
+    size_t resp_len = sizeof(resp);
+    CUresult r = chidori_rpc(CHIDORI_GRAPH_DECODE, payload, 52, resp, &resp_len);
+
+    if (r != CUDA_SUCCESS || resp_len < 4) {
+        if (out_count) *out_count = 0;
+        return (int)r;
+    }
+
+    int32_t count = 0;
+    memcpy(&count, resp, 4);
+    if (out_count) *out_count = count;
+
+    if (out_tokens && count > 0 && resp_len >= 4 + (size_t)count * 4) {
+        memcpy(out_tokens, resp + 4, (size_t)count * 4);
+    }
+
+    return 0;
+}
+
 /* Names of CUDA Driver API symbols we intercept. When PyTorch requests
  * any of these via cudaGetDriverEntryPoint, we return our own function
  * pointer (found via dlsym(RTLD_DEFAULT) on ourselves). */
