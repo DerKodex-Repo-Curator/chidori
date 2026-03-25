@@ -1914,13 +1914,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                                          shared, stream,
                                          NULL, extra);
 
-                    {
-                        /* Always sync after kernel launch to catch illegal address errors immediately */
+                    /* Skip post-launch sync during graph capture — sync breaks capture */
+                    if (!g_capturing_stream) {
                         CUresult sync_res = cuCtxSynchronize();
                         if (sync_res != CUDA_SUCCESS) {
                             fprintf(stderr, "[cuda_dispatch] LAUNCH SYNC ERROR=%d after grid=(%u,%u,%u) block=(%u,%u,%u)\n",
                                     sync_res, gridX, gridY, gridZ, blockX, blockY, blockZ);
-                            /* Dump param buffer for diagnosis */
                             fprintf(stderr, "[cuda_dispatch] PARAMS: ");
                             for (uint32_t bi = 0; bi < buf_size && bi < 64; bi++)
                                 fprintf(stderr, "%02x", ((uint8_t*)param_buffer)[bi]);
