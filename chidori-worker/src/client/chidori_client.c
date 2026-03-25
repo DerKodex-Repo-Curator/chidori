@@ -3071,6 +3071,14 @@ cudaError_t cudaStreamSynchronize(void *stream) {
         g_last_error = (cudaError_t)cr;
         return (cudaError_t)cr;
     }
+    /* During model loading (before any kernel launch), skip stream sync.
+     * HtoD memcpys are already in the TCP pipeline and CUDA guarantees
+     * stream ordering — they'll complete before the first kernel executes.
+     * This eliminates ~200 × 57ms = 11.4s of unnecessary round-trips. */
+    if (!g_any_kernel_launched) {
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
     uint64_t handle = (uint64_t)(uintptr_t)stream;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_STREAM_SYNCHRONIZE, &handle, sizeof(handle), NULL, NULL);
     g_last_error = r;
@@ -6025,6 +6033,12 @@ cudaError_t cudaStreamAddCallback(void *stream, void *callback, void *userData, 
 }
 
 cudaError_t cudaStreamIsCapturing(void *stream, int *pCaptureStatus) {
+    /* Before any kernel launch, we know capture isn't active — skip RPC */
+    if (!g_any_kernel_launched) {
+        if (pCaptureStatus) *pCaptureStatus = 0; /* cudaStreamCaptureStatusNone */
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
     uint64_t stream_handle = (uint64_t)(uintptr_t)stream;
     int32_t status = 0;
     size_t status_len = sizeof(status);
