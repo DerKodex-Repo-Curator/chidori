@@ -2183,14 +2183,29 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         int32_t ldc; memcpy(&ldc, p, 4);
 
         cublasHandle_t handle = (cublasHandle_t)(uintptr_t)hmap_get(&g_cublas_handles, wire_handle);
-        /* Use cublasGemmEx for fp16 — avoids __half C type dependency */
+        /* Use cublasGemmEx for fp16 with FP32 accumulation.
+         * CUBLAS_COMPUTE_16F causes NaN on Qwen's GQA attention (large K dims).
+         * FP32 accumulation is standard practice and prevents overflow. */
+        float alpha_f, beta_f;
+        { /* Convert FP16 alpha/beta to FP32 for COMPUTE_32F */
+            uint32_t a_sign = (uint32_t)(alpha_h >> 15) << 31;
+            uint32_t a_exp = (alpha_h >> 10) & 0x1F;
+            uint32_t a_mant = alpha_h & 0x3FF;
+            uint32_t a_f = (a_exp == 0) ? a_sign : (a_sign | ((a_exp + 112) << 23) | (a_mant << 13));
+            memcpy(&alpha_f, &a_f, 4);
+            uint32_t b_sign = (uint32_t)(beta_h >> 15) << 31;
+            uint32_t b_exp = (beta_h >> 10) & 0x1F;
+            uint32_t b_mant = beta_h & 0x3FF;
+            uint32_t b_f = (b_exp == 0) ? b_sign : (b_sign | ((b_exp + 112) << 23) | (b_mant << 13));
+            memcpy(&beta_f, &b_f, 4);
+        }
         cublasStatus_t st = cublasGemmEx(handle,
             (cublasOperation_t)transa, (cublasOperation_t)transb,
-            m, n, k, &alpha_h,
+            m, n, k, &alpha_f,
             (const void *)(uintptr_t)A, CUDA_R_16F, lda,
             (const void *)(uintptr_t)B, CUDA_R_16F, ldb,
-            &beta_h, (void *)(uintptr_t)C, CUDA_R_16F, ldc,
-            CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+            &beta_f, (void *)(uintptr_t)C, CUDA_R_16F, ldc,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         return chidori_send_response(fd, req->seq_num, (int32_t)st, NULL, 0);
     }
 
