@@ -6877,12 +6877,19 @@ CUresult cuStreamBeginCapture_v3(CUstream hStream, int mode) {
 
 CUresult cuGraphInstantiate(void **phGraphExec, void *hGraph,
                             unsigned long long flags) {
-    return cuGraphInstantiate_v2(phGraphExec, hGraph, NULL, NULL, 0);
+    (void)flags;
+    uint64_t graph_handle = (uint64_t)(uintptr_t)hGraph;
+    uint64_t exec_handle = 0;
+    size_t exec_len = sizeof(exec_handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_INSTANTIATE, &graph_handle, sizeof(graph_handle),
+                             &exec_handle, &exec_len);
+    if (phGraphExec) *phGraphExec = (void *)(uintptr_t)exec_handle;
+    return r;
 }
 
 CUresult cuGraphInstantiate_v3(void **phGraphExec, void *hGraph,
                                unsigned long long flags) {
-    return cuGraphInstantiate_v2(phGraphExec, hGraph, NULL, NULL, 0);
+    return cuGraphInstantiate(phGraphExec, hGraph, flags);
 }
 
 CUresult cuStreamEndCapture(CUstream hStream, void **phGraph) {
