@@ -2454,25 +2454,6 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
-    /* Before any kernel launch: buffer mallocs for combined alloc+transfer.
-     * Return a placeholder pointer. When cudaMemcpy HtoD follows, send both
-     * in one ALLOC_AND_TRANSFER RPC (still sync, but 1 RTT instead of 3). */
-    if (!g_any_kernel_launched && g_bulk_count < BULK_MAX_PENDING) {
-        uint64_t placeholder = g_bulk_next_placeholder;
-        g_bulk_next_placeholder += ((size + 4095) & ~4095ULL); /* align to 4KB */
-        g_bulk_pending[g_bulk_count].placeholder = placeholder;
-        g_bulk_pending[g_bulk_count].alloc_size = (uint64_t)size;
-        g_bulk_pending[g_bulk_count].data = NULL;
-        g_bulk_pending[g_bulk_count].data_len = 0;
-        g_bulk_pending[g_bulk_count].memset_val = -1;
-        g_bulk_count++;
-        *devPtr = (void *)(uintptr_t)placeholder;
-        alloc_track_add(placeholder, size, g_current_device);
-        g_bulk_active = 1;
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
-    }
-
     uint64_t size64 = (uint64_t)size;
     uint64_t ptr64 = 0;
     size_t len = sizeof(uint64_t);
