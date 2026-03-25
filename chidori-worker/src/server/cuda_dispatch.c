@@ -4005,8 +4005,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         int32_t position = start_position;
 
         for (int i = 0; i < num_tokens; i++) {
-            /* Update cache position on GPU (single int32) */
-            cuMemcpyHtoD((CUdeviceptr)position_ptr, &position, sizeof(int32_t));
+            /* Update cache position on GPU (int64 for PyTorch LongTensor) */
+            int64_t position64 = (int64_t)position;
+            cuMemcpyHtoD((CUdeviceptr)position_ptr, &position64, sizeof(int64_t));
 
             /* Launch the captured graph */
             res = cuGraphLaunch(exec, stream);
@@ -4019,12 +4020,34 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             /* Read logits from GPU (FP16 × vocab_size) */
             cuMemcpyDtoH(host_logits, (CUdeviceptr)logits_ptr, logits_bytes);
 
-            /* CPU argmax over FP16 logits */
+            /* CPU argmax over FP16 logits — must convert to float for correct comparison.
+             * FP16 as uint16_t doesn't have monotonic ordering (sign bit inverts). */
             int32_t best_token = 0;
-            uint16_t best_val = host_logits[0];
-            for (int v = 1; v < vocab_size; v++) {
-                if (host_logits[v] > best_val) {
-                    best_val = host_logits[v];
+            float best_val = -1e30f;
+            for (int v = 0; v < vocab_size; v++) {
+                /* IEEE 754 half-precision → float conversion */
+                uint16_t h = host_logits[v];
+                uint32_t sign = (uint32_t)(h >> 15) << 31;
+                uint32_t exp  = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) f = sign; /* ±0 */
+                    else { /* denormal */
+                        exp = 1;
+                        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                        mant &= 0x3FF;
+                        f = sign | ((uint32_t)(exp + 127 - 15) << 23) | ((uint32_t)mant << 13);
+                    }
+                } else if (exp == 31) {
+                    f = sign | 0x7F800000 | ((uint32_t)mant << 13); /* inf/nan */
+                } else {
+                    f = sign | ((uint32_t)(exp + 127 - 15) << 23) | ((uint32_t)mant << 13);
+                }
+                float val;
+                memcpy(&val, &f, 4);
+                if (val > best_val) {
+                    best_val = val;
                     best_token = v;
                 }
             }
