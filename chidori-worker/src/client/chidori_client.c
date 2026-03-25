@@ -2524,18 +2524,66 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
-    uint64_t size64 = (uint64_t)size;
-    uint64_t ptr64 = 0;
-    size_t len = sizeof(uint64_t);
-    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MALLOC, &size64, sizeof(size64), &ptr64, &len);
-    if (r == cudaSuccess) {
+    /* ---- GPU memory pool: one big alloc, suballocate locally ----
+     * Instead of 200 sync cudaMalloc RPCs (200 × 57ms = 11.4s),
+     * allocate one big pool on first call (1 × 57ms), then bump
+     * a pointer locally for subsequent calls (0ms each).
+     */
+    static uint64_t pool_base = 0;
+    static uint64_t pool_offset = 0;
+    static uint64_t pool_size = 0;
+
+    /* Align to 256 bytes (CUDA alignment requirement) */
+    size_t aligned_size = (size + 255) & ~(size_t)255;
+
+    /* Try suballocate from existing pool */
+    if (pool_base && pool_offset + aligned_size <= pool_size) {
+        uint64_t ptr64 = pool_base + pool_offset;
+        pool_offset += aligned_size;
         *devPtr = (void *)(uintptr_t)ptr64;
         alloc_track_add(ptr64, size, g_current_device);
-        if (ptr64 < g_remote_gpu_addr_min) g_remote_gpu_addr_min = ptr64;
-        if (ptr64 + size > g_remote_gpu_addr_max) g_remote_gpu_addr_max = ptr64 + size;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
     }
-    g_last_error = r;
-    return r;
+
+    /* Pool exhausted or first call — allocate a new pool.
+     * Size: max(requested * 2, 512MB) to amortize future calls. */
+    uint64_t new_pool_size = aligned_size * 2;
+    if (new_pool_size < 512ULL * 1024 * 1024) new_pool_size = 512ULL * 1024 * 1024;
+    /* If request is huge (>256MB), just allocate exactly what's needed + padding */
+    if (aligned_size > 256ULL * 1024 * 1024) new_pool_size = aligned_size + 64ULL * 1024 * 1024;
+
+    uint64_t pool_ptr = 0;
+    size_t len = sizeof(uint64_t);
+    cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MALLOC, &new_pool_size, sizeof(new_pool_size), &pool_ptr, &len);
+
+    if (r != cudaSuccess || !pool_ptr) {
+        /* Pool alloc failed — try exact size as fallback */
+        uint64_t size64 = (uint64_t)aligned_size;
+        r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_MALLOC, &size64, sizeof(size64), &pool_ptr, &len);
+        if (r == cudaSuccess && pool_ptr) {
+            *devPtr = (void *)(uintptr_t)pool_ptr;
+            alloc_track_add(pool_ptr, size, g_current_device);
+            if (pool_ptr < g_remote_gpu_addr_min) g_remote_gpu_addr_min = pool_ptr;
+            if (pool_ptr + size > g_remote_gpu_addr_max) g_remote_gpu_addr_max = pool_ptr + size;
+        }
+        g_last_error = r;
+        return r;
+    }
+
+    /* New pool allocated — update tracking and suballocate */
+    pool_base = pool_ptr;
+    pool_size = new_pool_size;
+    pool_offset = aligned_size; /* first alloc takes the start */
+
+    uint64_t ptr64 = pool_base;
+    *devPtr = (void *)(uintptr_t)ptr64;
+    alloc_track_add(ptr64, size, g_current_device);
+    if (pool_base < g_remote_gpu_addr_min) g_remote_gpu_addr_min = pool_base;
+    if (pool_base + pool_size > g_remote_gpu_addr_max) g_remote_gpu_addr_max = pool_base + pool_size;
+
+    g_last_error = cudaSuccess;
+    return cudaSuccess;
 }
 
 cudaError_t cudaFree(void *devPtr) {
