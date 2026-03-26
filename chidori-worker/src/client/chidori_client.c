@@ -7038,6 +7038,23 @@ cudaError_t cudaGraphInstantiate(void **pGraphExec, void *graph,
     return (cudaError_t)r;
 }
 
+cudaError_t cudaGraphExecUpdate(void *hGraphExec, void *hGraph,
+                                 void *hErrorNode_out, int *updateResult_out) {
+    (void)hErrorNode_out;
+    struct __attribute__((packed)) { uint64_t exec; uint64_t graph; } req;
+    req.exec = (uint64_t)(uintptr_t)hGraphExec;
+    req.graph = (uint64_t)(uintptr_t)hGraph;
+    CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_EXEC_UPDATE, &req, sizeof(req), NULL, NULL);
+    if (updateResult_out) *updateResult_out = (r == CUDA_SUCCESS) ? 0 : 1;
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
+}
+
+cudaError_t cudaGraphInstantiateWithFlags(void **pGraphExec, void *graph, unsigned long long flags) {
+    (void)flags;
+    return cudaGraphInstantiate(pGraphExec, graph, NULL, NULL, 0);
+}
+
 cudaError_t cudaGraphLaunch(void *graphExec, void *stream) {
     struct __attribute__((packed)) { uint64_t exec; uint64_t stream; } req;
     req.exec = (uint64_t)(uintptr_t)graphExec;
