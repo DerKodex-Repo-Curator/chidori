@@ -101,22 +101,36 @@ torch.cuda.set_device(1)
 default_stream_1 = torch.cuda.current_stream(1)
 ds1_ptr = ctypes.c_void_p(default_stream_1.cuda_stream)
 
-# Begin capture on device 1's default stream
-r = lib.cuStreamBeginCapture_v2(ds1_ptr, ctypes.c_int(0))
-print(f"BeginCapture on dev1 default stream: r={r}", flush=True)
+# Use a dedicated stream on device 1 for capture (default stream can't capture)
+torch.cuda.set_device(1)
+s1 = torch.cuda.Stream(device="cuda:1")
+s1_ptr = ctypes.c_void_p(s1.cuda_stream)
+
+# Warmup on capture stream first
+with torch.cuda.stream(s1):
+    single_inp2 = torch.tensor([[warmup_token]], device="cuda:0", dtype=torch.long)
+    with torch.no_grad():
+        _ = model(single_inp2)
+torch.cuda.synchronize(0)
+torch.cuda.synchronize(1)
+print("Capture stream warmup OK", flush=True)
+
+# Begin capture on dedicated stream
+r = lib.cuStreamBeginCapture_v2(s1_ptr, ctypes.c_int(0))
+print(f"BeginCapture on dedicated stream: r={r}", flush=True)
 
 if r == 0:
-    # Run forward pass — local layers execute normally on dev0,
-    # remote layers get captured into a graph on dev1
-    single_inp2 = torch.tensor([[warmup_token]], device="cuda:0", dtype=torch.long)
-    torch.cuda.set_device(0)  # ensure local ops run on dev0
-    with torch.no_grad():
-        capture_out = model(single_inp2)
+    # Run forward with device 1 using the capture stream
+    with torch.cuda.stream(s1):
+        single_inp3 = torch.tensor([[warmup_token]], device="cuda:0", dtype=torch.long)
+        torch.cuda.set_device(0)
+        with torch.no_grad():
+            capture_out = model(single_inp3)
 
     # End capture
     torch.cuda.set_device(1)
     gptr = ctypes.c_void_p(0)
-    r = lib.cuStreamEndCapture(ds1_ptr, ctypes.byref(gptr))
+    r = lib.cuStreamEndCapture(s1_ptr, ctypes.byref(gptr))
     print(f"EndCapture: r={r} graph={gptr.value}", flush=True)
 
     if r == 0 and gptr.value:
