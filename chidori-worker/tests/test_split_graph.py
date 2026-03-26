@@ -42,17 +42,27 @@ tok = AutoTokenizer.from_pretrained(MODEL)
 lib = ctypes.CDLL("build/libcuda.so.1")
 
 # --- Define forward functions for each half ---
+# New transformers needs position_embeddings (cos, sin) not position_ids.
+# rotary_emb is on cuda:0, we need to compute cos/sin for each device.
+rotary_emb_local = model.model.rotary_emb  # on cuda:0
+
+# Create a copy of rotary_emb on cuda:1 for remote layers
+import copy
+rotary_emb_remote = copy.deepcopy(model.model.rotary_emb).to("cuda:1")
+
 def local_forward(input_ids, position_ids):
     """Run layers 0-HALF on local 4090. Returns hidden states."""
     h = model.model.embed_tokens(input_ids)
+    cos, sin = rotary_emb_local(h, position_ids)
     for i in range(HALF):
-        h = layers[i](h, position_ids=position_ids)[0]
+        h = layers[i](h, position_embeddings=(cos, sin))[0]
     return h
 
 def remote_forward(h, position_ids):
     """Run layers HALF-N on remote A100. Returns logits."""
+    cos, sin = rotary_emb_remote(h, position_ids)
     for i in range(HALF, N):
-        h = layers[i](h, position_ids=position_ids)[0]
+        h = layers[i](h, position_embeddings=(cos, sin))[0]
     h = model.model.norm(h)
     return model.lm_head(h)
 
