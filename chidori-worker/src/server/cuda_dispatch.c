@@ -371,7 +371,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
      * Device Management
      * ================================================================ */
     case CHIDORI_CU_DEVICE_GET_COUNT: {
-        int32_t count = (int32_t)g_device_count;
+        /* Report 1 GPU — standalone worker uses device 0 only.
+         * Multi-GPU apps (llama.cpp) try to init cuBLAS on all devices,
+         * which fails for devices the worker doesn't manage. */
+        int32_t count = 1;
         return chidori_send_response(fd, req->seq_num, CUDA_SUCCESS, &count, sizeof(count));
     }
 
@@ -1084,10 +1087,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
      * ================================================================ */
 
     case CHIDORI_CUDA_GET_DEVICE_COUNT: {
-        int count = 0;
-        cudaError_t err = cudaGetDeviceCount(&count);
-        int32_t count32 = (int32_t)count;
-        return chidori_send_response(fd, req->seq_num, (int32_t)err, &count32, sizeof(count32));
+        /* Report 1 GPU for standalone mode */
+        int32_t count32 = 1;
+        return chidori_send_response(fd, req->seq_num, (int32_t)cudaSuccess, &count32, sizeof(count32));
     }
 
     case CHIDORI_CUDA_GET_DEVICE: {
