@@ -306,7 +306,7 @@ static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set *
 static int g_fatbin_passthrough = -1;    /* 1 if CHIDORI_FATBIN_PASSTHROUGH=1: skip all our fatbin tracking */
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
-static int g_current_device = 0;         /* current active device (global) */
+static __thread int g_current_device = 0; /* current active device (per-thread for thread safety) */
 /* Track remote GPU address range to distinguish GPU vs host pointers.
  * Updated on each remote cudaMalloc return. */
 static uint64_t g_remote_gpu_addr_min = UINT64_MAX;
@@ -2269,7 +2269,7 @@ typedef struct { unsigned int x, y, z; } dim3;
 #define cudaMemcpyDeviceToDevice 3
 
 /* Track last error locally */
-static cudaError_t g_last_error = 0;
+static __thread cudaError_t g_last_error = 0;
 
 /* g_device_count_cache declared in globals section above */
 
