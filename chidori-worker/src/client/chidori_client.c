@@ -3192,20 +3192,45 @@ static int g_event_pool_count = 0;
 static int g_event_pool_inited = 0;
 
 static void event_pool_fill(void) {
-    /* Pre-allocate events on the server in a single burst.
-     * Uses pipelined sync: send all requests, then read all responses. */
+    /* Pre-allocate events on the server using PIPELINED sync RPCs.
+     * Send all create requests at once, then read all responses.
+     * Turns 64 × RTT into bandwidth + 1 RTT. */
     int batch = EVENT_POOL_SIZE - g_event_pool_count;
     if (batch <= 0) return;
-    if (batch > 64) batch = 64; /* Refill in chunks */
+    if (batch > 64) batch = 64;
 
+    pthread_mutex_lock(&g_lock);
+    if (g_pending_responses > 0) chidori_flush_responses();
+    if (g_server_fd < 0) { if (chidori_connect() != 0) { pthread_mutex_unlock(&g_lock); return; } }
+
+    /* Send all requests */
     for (int i = 0; i < batch; i++) {
-        uint64_t handle = 0;
-        size_t len = sizeof(uint64_t);
-        CUresult r = chidori_rpc(CHIDORI_CUDA_EVENT_CREATE, NULL, 0, &handle, &len);
-        if (r == 0 && handle != 0) {
-            g_event_pool[g_event_pool_count++] = handle;
+        chidori_request_t req = {0};
+        req.func_id = CHIDORI_CUDA_EVENT_CREATE;
+        req.flags = CHIDORI_FLAG_SYNC;
+        req.seq_num = ++g_seq_num;
+        if (chidori_send_request(g_server_fd, &req, NULL, 0) != 0) {
+            close(g_server_fd); g_server_fd = -1;
+            pthread_mutex_unlock(&g_lock); return;
         }
     }
+    /* Read all responses */
+    for (int i = 0; i < batch; i++) {
+        chidori_response_t resp;
+        if (chidori_recv_response(g_server_fd, &resp) != 0) {
+            close(g_server_fd); g_server_fd = -1;
+            pthread_mutex_unlock(&g_lock); return;
+        }
+        size_t pl = resp.msg_len - CHIDORI_RESPONSE_HEADER_SIZE;
+        uint64_t handle = 0;
+        if (pl >= 8) {
+            chidori_read_full(g_server_fd, &handle, 8);
+            if (pl > 8) { char d[64]; chidori_read_full(g_server_fd, d, pl - 8); }
+        }
+        if (resp.result == 0 && handle != 0)
+            g_event_pool[g_event_pool_count++] = handle;
+    }
+    pthread_mutex_unlock(&g_lock);
     g_event_pool_inited = 1;
 }
 
