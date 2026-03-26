@@ -1760,7 +1760,7 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t by
         if (src_local != dst_local) {
             /* Cross-device: DtoH from source, HtoD to destination */
             void *staging = malloc(byteCount);
-            if (!staging) return CUDA_ERROR_OUT_OF_MEMORY;
+            if (!staging) return 2; /* CUDA_ERROR_OUT_OF_MEMORY */
             CUresult r;
             if (src_local) {
                 /* src=local → DtoH via real driver, HtoD via RPC */
