@@ -2343,6 +2343,22 @@ cudaError_t cudaSetDevice(int device) {
             g_in_real_cuda--;
             LOG_DEBUG("cudaSetDevice(%d) -> activated local GPU context %p (r=%d)", device, g_local_ctx, cr);
         }
+        /* Clear any stale CUDA runtime error from remote operations.
+         * When switching from remote to local, the real CUDA runtime may
+         * have a stale error state from intercepted operations (e.g., our
+         * LD_PRELOAD functions that returned errors were cached by cudart).
+         * Call the REAL cudaGetLastError to consume and reset it. */
+        {
+            typedef int (*cudaGetLastError_fn)(void);
+            static cudaGetLastError_fn real_getLastError = NULL;
+            if (!real_getLastError && g_real_cuda_handle_for_dlopen)
+                real_getLastError = (cudaGetLastError_fn)__real_dlsym(g_real_cuda_handle_for_dlopen, "cudaGetLastError");
+            if (real_getLastError) {
+                g_in_real_cuda++;
+                real_getLastError(); /* consume and clear any stale error */
+                g_in_real_cuda--;
+            }
+        }
         g_current_device = device;
         g_last_error = cudaSuccess;
         return cudaSuccess;
