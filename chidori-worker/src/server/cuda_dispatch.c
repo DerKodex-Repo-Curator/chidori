@@ -4131,6 +4131,80 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     /* ================================================================
+     * Split GPU decode — one step of pipeline-parallel inference.
+     * Client sends activations from local GPU, server runs remote graph.
+     * ================================================================ */
+    case CHIDORI_GRAPH_DECODE_SPLIT: {
+        /* Payload: exec(8) + stream(8) + act_dst(8) + pos_ptr(8) + logits_ptr(8) +
+         *          vocab_size(4) + position(4) + act_size(4) + act_data(act_size) */
+        if (req->payload_size < 52) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+        uint64_t exec_handle = 0, stream_handle = 0;
+        uint64_t act_dst = 0, pos_ptr = 0, logits_ptr = 0;
+        int32_t vocab_size = 0, position = 0, act_size = 0;
+        const char *p = (const char *)payload;
+        memcpy(&exec_handle, p, 8); p += 8;
+        memcpy(&stream_handle, p, 8); p += 8;
+        memcpy(&act_dst, p, 8); p += 8;
+        memcpy(&pos_ptr, p, 8); p += 8;
+        memcpy(&logits_ptr, p, 8); p += 8;
+        memcpy(&vocab_size, p, 4); p += 4;
+        memcpy(&position, p, 4); p += 4;
+        memcpy(&act_size, p, 4); p += 4;
+        const void *act_data = p;
+
+        CUgraphExec exec = (CUgraphExec)(uintptr_t)hmap_get(&g_graph_execs, exec_handle);
+        CUstream stream = (CUstream)(uintptr_t)hmap_get(&g_streams, stream_handle);
+        if (!stream) stream = (CUstream)(uintptr_t)hmap_get(&g_rt_streams, stream_handle);
+
+        if (!exec || vocab_size <= 0 || act_size <= 0) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+
+        /* 1. Write activations from client to GPU */
+        cuMemcpyHtoD((CUdeviceptr)act_dst, act_data, (size_t)act_size);
+
+        /* 2. Update position */
+        int64_t pos64 = (int64_t)position;
+        cuMemcpyHtoD((CUdeviceptr)pos_ptr, &pos64, sizeof(int64_t));
+
+        /* 3. Launch remote-half graph */
+        res = cuGraphLaunch(exec, stream);
+        if (res != CUDA_SUCCESS) {
+            return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+        }
+        cuStreamSynchronize(stream);
+
+        /* 4. Read logits + argmax */
+        size_t logits_bytes = (size_t)vocab_size * 2;
+        void *pinned = NULL;
+        CUresult pr = cuMemAllocHost(&pinned, logits_bytes);
+        uint16_t *host_logits = pr == CUDA_SUCCESS ? (uint16_t *)pinned
+                                                   : (uint16_t *)malloc(logits_bytes);
+        cuMemcpyDtoH(host_logits, (CUdeviceptr)logits_ptr, logits_bytes);
+
+        int32_t best = 0;
+        uint16_t best_raw = host_logits[0];
+        int best_sign = best_raw >> 15;
+        for (int v = 1; v < vocab_size; v++) {
+            uint16_t h = host_logits[v];
+            int hs = h >> 15;
+            int better = (hs == 0 && best_sign == 0) ? (h > best_raw) :
+                         (hs == 0 && best_sign == 1) ? 1 :
+                         (hs == 1 && best_sign == 0) ? 0 :
+                         (h < best_raw);
+            if (better) { best_raw = h; best_sign = hs; best = v; }
+        }
+
+        if (pr == CUDA_SUCCESS) cuMemFreeHost(pinned);
+        else free(host_logits);
+
+        /* 5. Return token ID */
+        return chidori_send_response(fd, req->seq_num, 0, &best, sizeof(best));
+    }
+
+    /* ================================================================
      * CUDA Graph API
      * ================================================================ */
     case CHIDORI_CU_STREAM_BEGIN_CAPTURE: {

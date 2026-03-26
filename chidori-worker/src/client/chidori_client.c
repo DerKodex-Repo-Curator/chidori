@@ -9162,6 +9162,45 @@ int chidori_graph_decode(
     return 0;
 }
 
+/* Split GPU decode: send activations + run remote graph in one RPC.
+ * Returns the next token ID. Used for pipeline-parallel inference. */
+int chidori_graph_decode_split(
+    uint64_t graph_exec,       /* Remote graph exec handle */
+    uint64_t stream,           /* Remote stream handle */
+    uint64_t activation_dst,   /* GPU address to write activations on remote */
+    uint64_t position_ptr,     /* GPU address of position on remote */
+    uint64_t logits_ptr,       /* GPU address of logits output on remote */
+    int32_t vocab_size,
+    int32_t position,
+    const void *activation_data, /* Activation data from local GPU (host memory) */
+    int32_t activation_size,
+    int32_t *out_token
+) {
+    /* Payload: exec(8)+stream(8)+act_dst(8)+pos(8)+logits(8)+vocab(4)+pos(4)+act_size(4)+data */
+    size_t header = 52;
+    size_t total = header + (size_t)activation_size;
+    void *payload = malloc(total);
+    if (!payload) return -1;
+    char *p = (char *)payload;
+    memcpy(p, &graph_exec, 8); p += 8;
+    memcpy(p, &stream, 8); p += 8;
+    memcpy(p, &activation_dst, 8); p += 8;
+    memcpy(p, &position_ptr, 8); p += 8;
+    memcpy(p, &logits_ptr, 8); p += 8;
+    memcpy(p, &vocab_size, 4); p += 4;
+    memcpy(p, &position, 4); p += 4;
+    memcpy(p, &activation_size, 4); p += 4;
+    memcpy(p, activation_data, activation_size);
+
+    int32_t token = 0;
+    size_t resp_len = sizeof(token);
+    CUresult r = chidori_rpc(CHIDORI_GRAPH_DECODE_SPLIT, payload, total, &token, &resp_len);
+    free(payload);
+
+    if (out_token) *out_token = token;
+    return (int)r;
+}
+
 /* Names of CUDA Driver API symbols we intercept. When PyTorch requests
  * any of these via cudaGetDriverEntryPoint, we return our own function
  * pointer (found via dlsym(RTLD_DEFAULT) on ourselves). */

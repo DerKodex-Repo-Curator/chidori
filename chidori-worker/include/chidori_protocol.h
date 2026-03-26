@@ -334,6 +334,16 @@ typedef enum {
      * Response: num_generated(4) + token_ids(4 × N) */
     CHIDORI_GRAPH_DECODE                 = 0x0501,
 
+    /* Split GPU decode (0x0502)
+     * Client sends activations from local GPU + position. Server writes
+     * activations to GPU, launches remote-half graph, does argmax, returns token.
+     * Used for pipeline-parallel inference across local + remote GPU.
+     * Payload: graph_exec(8) + stream(8) + activation_dst(8) + position_ptr(8) +
+     *          logits_ptr(8) + vocab_size(4) + position(4) + activation_size(4) +
+     *          activation_data(activation_size)
+     * Response: token_id(4) */
+    CHIDORI_GRAPH_DECODE_SPLIT           = 0x0502,
+
     /* Sentinel */
     CHIDORI_FUNC_MAX                     = 0xFFFF,
 } chidori_func_id_t;
