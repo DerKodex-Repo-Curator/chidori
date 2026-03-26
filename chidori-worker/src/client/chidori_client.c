@@ -1741,13 +1741,61 @@ CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t byteCount)
 
 CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t byteCount) {
     if (g_in_real_cuda > 0 && g_real.cuMemcpyDtoD_v2) return g_real.cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount); /* reentrance: forward to real driver */
-    /* Local device: copy within real local GPU */
-    if (g_partial_offload && is_local_device(g_current_device) && g_real.cuMemcpyDtoD_v2) {
-        g_in_real_cuda++;
-        CUresult r = g_real.cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
-        g_in_real_cuda--;
-        return r;
+
+    /* Cross-device DtoD: stage through CPU when src and dst are on different
+     * devices (one local, one remote). Neither GPU can access the other's memory. */
+    if (g_partial_offload) {
+        int src_dev = alloc_track_device((uintptr_t)srcDevice);
+        int dst_dev = alloc_track_device((uintptr_t)dstDevice);
+        int src_local = src_dev >= 0 && is_local_device(src_dev);
+        int dst_local = dst_dev >= 0 && is_local_device(dst_dev);
+
+        if (src_local && dst_local && g_real.cuMemcpyDtoD_v2) {
+            /* Both on local GPU — use real driver */
+            g_in_real_cuda++;
+            CUresult r = g_real.cuMemcpyDtoD_v2(dstDevice, srcDevice, byteCount);
+            g_in_real_cuda--;
+            return r;
+        }
+        if (src_local != dst_local) {
+            /* Cross-device: DtoH from source, HtoD to destination */
+            void *staging = malloc(byteCount);
+            if (!staging) return CUDA_ERROR_OUT_OF_MEMORY;
+            CUresult r;
+            if (src_local) {
+                /* src=local → DtoH via real driver, HtoD via RPC */
+                g_in_real_cuda++;
+                r = g_real.cuMemcpyDtoH_v2(staging, srcDevice, byteCount);
+                g_in_real_cuda--;
+                if (r == CUDA_SUCCESS) {
+                    size_t pl = 16 + byteCount;
+                    void *payload = malloc(pl);
+                    memcpy(payload, &dstDevice, 8);
+                    uint64_t sz = (uint64_t)byteCount;
+                    memcpy((char *)payload + 8, &sz, 8);
+                    memcpy((char *)payload + 16, staging, byteCount);
+                    r = chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, payload, pl);
+                    free(payload);
+                }
+            } else {
+                /* src=remote → DtoH via RPC, HtoD via real driver */
+                struct { uint64_t src; uint64_t size; } req;
+                req.src = (uint64_t)srcDevice;
+                req.size = (uint64_t)byteCount;
+                size_t out_len = byteCount;
+                r = chidori_rpc(CHIDORI_CU_MEMCPY_D_TO_H, &req, sizeof(req), staging, &out_len);
+                if (r == CUDA_SUCCESS && g_real.cuMemcpyHtoD_v2) {
+                    g_in_real_cuda++;
+                    r = g_real.cuMemcpyHtoD_v2(dstDevice, staging, byteCount);
+                    g_in_real_cuda--;
+                }
+            }
+            free(staging);
+            return r;
+        }
+        /* Both on remote — fall through to RPC */
     }
+
     struct { uint64_t dst; uint64_t src; uint64_t size; } req;
     req.dst = (uint64_t)dstDevice;
     req.src = (uint64_t)srcDevice;
@@ -2604,8 +2652,18 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
                 r = g_real.cuMemcpyDtoH_v2(dst, (CUdeviceptr)(uintptr_t)src, count);
             break;
         case 3: /* DtoD */
-            if (g_real.cuMemcpyDtoD_v2)
-                r = g_real.cuMemcpyDtoD_v2((CUdeviceptr)(uintptr_t)dst, (CUdeviceptr)(uintptr_t)src, count);
+            /* Only do local DtoD if BOTH pointers are on local device.
+             * If one is remote, fall through to cross-device handling below. */
+            if (g_real.cuMemcpyDtoD_v2) {
+                int sd = alloc_track_device((uintptr_t)src);
+                int dd = alloc_track_device((uintptr_t)dst);
+                if ((sd < 0 || is_local_device(sd)) && (dd < 0 || is_local_device(dd))) {
+                    r = g_real.cuMemcpyDtoD_v2((CUdeviceptr)(uintptr_t)dst, (CUdeviceptr)(uintptr_t)src, count);
+                } else {
+                    g_in_real_cuda--;
+                    goto dtod_cross_device;
+                }
+            }
             break;
         default: /* HtoH */
             memcpy(dst, src, count);
@@ -2615,6 +2673,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
         g_last_error = (cudaError_t)r;
         return (cudaError_t)r;
     }
+    dtod_cross_device: ;
     cudaError_t r;
 
     switch (kind) {
@@ -2690,7 +2749,29 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
         break;
     }
     case cudaMemcpyDeviceToDevice: {
-        /* Payload: dst_ptr(8) + src_ptr(8) + size(8) + kind(4) */
+        /* Cross-device DtoD: if src and dst are on different devices (one local,
+         * one remote), stage through CPU. Neither device can access the other's
+         * memory directly. */
+        if (g_partial_offload) {
+            int src_dev = alloc_track_device((uintptr_t)src);
+            int dst_dev = alloc_track_device((uintptr_t)dst);
+            if (src_dev >= 0 && dst_dev >= 0 && src_dev != dst_dev) {
+                void *staging = malloc(count);
+                if (!staging) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
+                int saved = g_current_device;
+                cudaSetDevice(src_dev);
+                r = cudaMemcpy(staging, (void *)src, count, 2 /* DtoH */);
+                if (r == cudaSuccess) {
+                    cudaSetDevice(dst_dev);
+                    r = cudaMemcpy(dst, staging, count, 1 /* HtoD */);
+                }
+                free(staging);
+                cudaSetDevice(saved);
+                g_last_error = r;
+                return r;
+            }
+        }
+        /* Same-device DtoD: send both pointers to server (zero network data) */
         struct __attribute__((packed)) {
             uint64_t dst;
             uint64_t src;
