@@ -95,16 +95,16 @@ def server_decode(prompt, max_tokens=100):
 # TEST ROUNDS
 # ============================================================
 prompts = [
-    # Round 1: Factual
-    "What is the capital of France?",
-    # Round 2: Explanation
+    # Round 1: Factual explanation
+    "Explain what the capital of France is and why it is important:",
+    # Round 2: Technical
     "Explain how a neural network learns in simple terms:",
     # Round 3: Code
     "Write a Python function to check if a number is prime:",
     # Round 4: Reasoning
-    "If all roses are flowers and some flowers fade quickly, can we conclude all roses fade quickly? Explain:",
+    "Compare and contrast CPUs and GPUs for machine learning workloads:",
     # Round 5: Creative
-    "Write a haiku about the ocean:",
+    "Write a short poem about the ocean and its waves:",
 ]
 
 results = []
