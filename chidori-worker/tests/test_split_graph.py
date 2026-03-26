@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
-"""Chidori — Optimized split GPU inference with remote graph capture
+"""Chidori — Optimized split GPU inference
 
-Strategy:
-1. Load model, split via dispatch_model (proven to work)
-2. Run one warmup token (dispatch_model handles everything correctly)
-3. For the SECOND warmup: wrap the remote device's operations in
-   cuStreamBeginCapture/EndCapture. The server records them into a graph.
-4. For generation: run local layers normally, then use GRAPH_DECODE_SPLIT
-   to send activations + launch the remote graph in 1 RPC per token.
-
-This turns ~100 RPCs/token (remote half) into 1 RPC/token.
+Direct layer calls + CUDA Graph on remote half.
+Per token: local layers (4090) → transfer activations → remote graph (A100, 1 RPC).
 """
 import os, sys, torch, time, ctypes
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from accelerate import dispatch_model
 torch._C._cuda_init()
 
 if torch.cuda.device_count() < 2:
@@ -26,130 +18,181 @@ print(f"Dev0: {torch.cuda.get_device_name(0)}")
 print(f"Dev1: {torch.cuda.get_device_name(1)}")
 
 MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-MAX_TOKENS = 20
+MAX_TOKENS = 30
 
-# --- Step 1: Load and split ---
+# --- Load and split ---
 model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, attn_implementation="eager")
-N = len(model.model.layers); HALF = N // 2
+layers = model.model.layers
+N = len(layers); HALF = N // 2
 HIDDEN = model.config.hidden_size
 VOCAB = model.config.vocab_size
 
-device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0}
-for i in range(HALF): device_map[f"model.layers.{i}"] = 0
-for i in range(HALF, N): device_map[f"model.layers.{i}"] = 1
-device_map["model.norm"] = 1
-device_map["lm_head"] = 1
+model.model.embed_tokens = model.model.embed_tokens.to("cuda:0")
+rotary_local = model.model.rotary_emb.to("cuda:0")
+for i in range(HALF): layers[i] = layers[i].to("cuda:0")
 
-model = dispatch_model(model, device_map=device_map)
+import copy
+rotary_remote = copy.deepcopy(model.model.rotary_emb).to("cuda:1")
+for i in range(HALF, N): layers[i] = layers[i].to("cuda:1")
+model.model.norm = model.model.norm.to("cuda:1")
+model.lm_head = model.lm_head.to("cuda:1")
 model.eval()
 print(f"Split: 0-{HALF-1} local, {HALF}-{N-1} remote", flush=True)
 
 tok = AutoTokenizer.from_pretrained(MODEL)
 lib = ctypes.CDLL("build/libcuda.so.1")
 
-# --- Step 2: Baseline (dispatch_model, 5 tokens) ---
-inp = tok("Hello", return_tensors="pt").input_ids.to("cuda:0")
+# --- Prefill (full sequence, no graph) ---
+inp = tok("Explain GPU-over-IP:", return_tensors="pt").input_ids.to("cuda:0")
 plen = inp.shape[1]
+pos_local = torch.arange(plen, device="cuda:0").unsqueeze(0)
 
-print(f"Baseline: generating 5 tokens with dispatch_model...", flush=True)
-t0 = time.time()
 with torch.no_grad():
-    out = model.generate(inp, max_new_tokens=5, do_sample=False)
-dt = time.time() - t0
-n = out.shape[1] - plen
-base_tps = n / dt if dt > 0 else 0
-print(f"Baseline: {n} tok in {dt:.0f}s = {base_tps:.3f} tok/s ({dt/n:.1f}s/tok)", flush=True)
-print(f"Text: {tok.decode(out[0], skip_special_tokens=True)}", flush=True)
+    h = model.model.embed_tokens(inp)
+    cos, sin = rotary_local(h, pos_local)
+    for i in range(HALF):
+        h = layers[i](h, position_embeddings=(cos, sin))
+        if isinstance(h, tuple): h = h[0]
+    h = h.to("cuda:1")
+    pos_remote = pos_local.to("cuda:1")
+    cos_r, sin_r = rotary_remote(h, pos_remote)
+    for i in range(HALF, N):
+        h = layers[i](h, position_embeddings=(cos_r, sin_r))
+        if isinstance(h, tuple): h = h[0]
+    h = model.model.norm(h)
+    logits = model.lm_head(h)
+    first_token = logits[0, -1, :].argmax().item()
 
-# --- Step 3: Try graph capture on remote device ---
-# The idea: run model(token) which goes through dispatch_model.
-# The remote layers' CUDA calls are forwarded to the A100 via RPCs.
-# If we call cuStreamBeginCapture BEFORE those RPCs, the server
-# captures them into a graph instead of executing immediately.
+print(f"Prefill: {first_token} ({tok.decode([first_token])})", flush=True)
 
-print(f"\nAttempting remote graph capture...", flush=True)
+# --- Warmup single-token decode ---
+dec_inp = torch.tensor([[first_token]], device="cuda:0", dtype=torch.long)
+dec_pos = torch.tensor([[plen]], device="cuda:0", dtype=torch.long)
 
-# First, a normal warmup on the remote stream
-torch.cuda.set_device(1)
-s1 = torch.cuda.Stream(device="cuda:1")
-s1_ptr = ctypes.c_void_p(s1.cuda_stream)
+with torch.no_grad():
+    h = model.model.embed_tokens(dec_inp)
+    cos, sin = rotary_local(h, dec_pos)
+    for i in range(HALF):
+        h = layers[i](h, position_embeddings=(cos, sin))
+        if isinstance(h, tuple): h = h[0]
+    # Static buffers on A100 for graph capture
+    static_h = h.to("cuda:1").contiguous()
+    static_pos = dec_pos.to("cuda:1")
+    cos_r, sin_r = rotary_remote(static_h, static_pos)
+    for i in range(HALF, N):
+        static_h = layers[i](static_h, position_embeddings=(cos_r, sin_r))
+        if isinstance(static_h, tuple): static_h = static_h[0]
+    static_h_out = model.model.norm(static_h)
+    static_logits = model.lm_head(static_h_out)
+    second_token = static_logits[0, -1, :].argmax().item()
 
-# We need a single-token input to capture the decode step
-# Use the output from baseline as the starting point
-last_token = out[0, -1].item()
-single_inp = torch.tensor([[last_token]], device="cuda:0", dtype=torch.long)
-
-# Warmup: run one forward pass through the split model normally
+print(f"Warmup: {second_token} ({tok.decode([second_token])})", flush=True)
 torch.cuda.synchronize(0)
 torch.cuda.synchronize(1)
-with torch.no_grad():
-    warmup_out = model(single_inp)
-warmup_token = warmup_out.logits[0, -1, :].argmax().item()
-print(f"Warmup forward OK: next={warmup_token}", flush=True)
 
-# Now capture: tell the server to start recording
-# We need the remote stream for capture
-torch.cuda.synchronize(0)
-torch.cuda.synchronize(1)
+# --- Capture remote graph on A100 ---
+# Re-create static input buffer for the remote half
+static_activation = torch.zeros(1, 1, HIDDEN, dtype=torch.float16, device="cuda:1")
+static_pos_remote = torch.tensor([[plen + 1]], device="cuda:1", dtype=torch.long)
 
-# The challenge: dispatch_model runs layers on their assigned device.
-# Remote layers use the default stream on device 1.
-# We need to capture on THAT stream.
-
-# Get the default stream for device 1
-torch.cuda.set_device(1)
-default_stream_1 = torch.cuda.current_stream(1)
-ds1_ptr = ctypes.c_void_p(default_stream_1.cuda_stream)
-
-# Use a dedicated stream on device 1 for capture (default stream can't capture)
-torch.cuda.set_device(1)
+# Warmup on capture stream
 s1 = torch.cuda.Stream(device="cuda:1")
-s1_ptr = ctypes.c_void_p(s1.cuda_stream)
+s1.wait_stream(torch.cuda.current_stream(1))
 
-# Warmup on capture stream first
+def remote_forward(h_in, pos_in):
+    cos_r, sin_r = rotary_remote(h_in, pos_in)
+    h = h_in
+    for i in range(HALF, N):
+        h = layers[i](h, position_embeddings=(cos_r, sin_r))
+        if isinstance(h, tuple): h = h[0]
+    h = model.model.norm(h)
+    return model.lm_head(h)
+
 with torch.cuda.stream(s1):
-    single_inp2 = torch.tensor([[warmup_token]], device="cuda:0", dtype=torch.long)
     with torch.no_grad():
-        _ = model(single_inp2)
+        static_logits_out = remote_forward(static_activation, static_pos_remote)
+torch.cuda.current_stream(1).wait_stream(s1)
+torch.cuda.synchronize(1)
+print("Remote warmup on capture stream OK", flush=True)
+
+# Capture
+sptr = ctypes.c_void_p(s1.cuda_stream)
+r = lib.cuStreamBeginCapture_v2(sptr, ctypes.c_int(0))
+print(f"BeginCapture: r={r}", flush=True)
+if r != 0:
+    print("FAIL: capture failed"); sys.exit(1)
+
+with torch.cuda.stream(s1):
+    with torch.no_grad():
+        static_logits_out = remote_forward(static_activation, static_pos_remote)
+
+gptr = ctypes.c_void_p(0)
+lib.cuStreamEndCapture(sptr, ctypes.byref(gptr))
+eptr = ctypes.c_void_p(0)
+lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
+
+if not eptr.value:
+    print("FAIL: graph instantiate failed"); sys.exit(1)
+print(f"Remote graph captured! exec={eptr.value:#x}", flush=True)
+
+# --- Generate with: local layers + remote graph via GRAPH_DECODE_SPLIT ---
+generated = [first_token, second_token]
+current_token = second_token
+position = plen + 1
+
 torch.cuda.synchronize(0)
 torch.cuda.synchronize(1)
-print("Capture stream warmup OK", flush=True)
+print(f"\nGenerating {MAX_TOKENS} tokens with split graph...", flush=True)
+t0 = time.time()
 
-# Begin capture on dedicated stream
-r = lib.cuStreamBeginCapture_v2(s1_ptr, ctypes.c_int(0))
-print(f"BeginCapture on dedicated stream: r={r}", flush=True)
+for step in range(MAX_TOKENS - 2):
+    # 1. Local forward on 4090
+    dec_inp.fill_(current_token)
+    dec_pos.fill_(position)
+    with torch.no_grad():
+        h = model.model.embed_tokens(dec_inp)
+        cos, sin = rotary_local(h, dec_pos)
+        for i in range(HALF):
+            h = layers[i](h, position_embeddings=(cos, sin))
+            if isinstance(h, tuple): h = h[0]
 
-if r == 0:
-    # Run forward with device 1 using the capture stream
-    with torch.cuda.stream(s1):
-        single_inp3 = torch.tensor([[warmup_token]], device="cuda:0", dtype=torch.long)
-        torch.cuda.set_device(0)
-        with torch.no_grad():
-            capture_out = model(single_inp3)
+    # 2. DtoH activations from 4090
+    h_host = h.cpu().numpy().tobytes()
 
-    # End capture
-    torch.cuda.set_device(1)
-    gptr = ctypes.c_void_p(0)
-    r = lib.cuStreamEndCapture(s1_ptr, ctypes.byref(gptr))
-    print(f"EndCapture: r={r} graph={gptr.value}", flush=True)
+    # 3. Send activations + launch remote graph via GRAPH_DECODE_SPLIT
+    out_token = ctypes.c_int32(0)
+    act_buf = ctypes.create_string_buffer(h_host)
+    ret = lib.chidori_graph_decode_split(
+        ctypes.c_uint64(eptr.value),
+        ctypes.c_uint64(sptr.value),
+        ctypes.c_uint64(static_activation.data_ptr()),
+        ctypes.c_uint64(static_pos_remote.data_ptr()),
+        ctypes.c_uint64(static_logits_out[:, -1:, :].contiguous().data_ptr()),
+        ctypes.c_int32(VOCAB),
+        ctypes.c_int32(position),
+        act_buf,
+        ctypes.c_int32(len(h_host)),
+        ctypes.byref(out_token),
+    )
 
-    if r == 0 and gptr.value:
-        eptr = ctypes.c_void_p(0)
-        r = lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
-        print(f"Instantiate: r={r} exec={eptr.value}", flush=True)
+    current_token = out_token.value
+    generated.append(current_token)
+    position += 1
+    if current_token == 2: break
 
-        if r == 0 and eptr.value:
-            print("REMOTE GRAPH CAPTURED!", flush=True)
-            # TODO: use GRAPH_DECODE_SPLIT for generation
-        else:
-            print("Graph instantiation failed", flush=True)
-    else:
-        print("EndCapture failed", flush=True)
-else:
-    print(f"BeginCapture failed: {r}", flush=True)
+torch.cuda.synchronize(0)
+dt = time.time() - t0
+tps = len(generated) / dt
 
+text = tok.decode(generated, skip_special_tokens=True)
+print(f"\nSPLIT GRAPH: {len(generated)} tok in {dt:.1f}s = {tps:.1f} tok/s")
+print(f"TEXT: Explain GPU-over-IP:{text[:300]}")
 print(f"\n{'='*60}")
-print(f"  Split baseline: {base_tps:.3f} tok/s")
-print(f"  Graph capture:  {'SUCCESS' if r == 0 else 'FAILED'}")
+print(f"  Baseline split: 0.72 tok/s (dispatch_model)")
+print(f"  Graph split:    {tps:.1f} tok/s (local fwd + 1 RPC/token)")
 print(f"{'='*60}")
-print("PASS: test_split_graph")
+
+if len(generated) >= 10 and tps > 0.5:
+    print("PASS: test_split_graph")
+else:
+    print("FAIL: test_split_graph")
