@@ -7681,9 +7681,46 @@ CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
  *
  * Forward directly to the real driver (dlopen'd handle).
  */
+/* Integrity check export table — returns hardcoded magic values.
+ * NVIDIA's driver uses this to detect "fake" CUDA implementations.
+ * For CUDA 12.x (version % 10 == 0), the values are constants.
+ * UUID: {D4082055-BDE6-704B-8D34-BA123C66E1F2} */
+static const uint8_t INTEGRITY_CHECK_UUID[] = {
+    0x55, 0x20, 0x08, 0xD4, 0xE6, 0xBD, 0x4B, 0x70,
+    0x8D, 0x34, 0xBA, 0x12, 0x3C, 0x66, 0xE1, 0xF2
+};
+
+/* Fake integrity check function — returns magic values for CUDA 12.x */
+static CUresult chidori_integrity_check(void *out, /* more args... */ ...) {
+    /* For CUDA 12.x (version % 10 == 0): return hardcoded constants */
+    if (out) {
+        uint64_t magic[2] = { 0x3341181C03CB675CULL, 0x8ED383AA1F4CD1E8ULL };
+        memcpy(out, magic, 16);
+    }
+    return CUDA_SUCCESS;
+}
+
+/* Integrity check table: [size_of, check_fn, ...] */
+static const void *g_integrity_table[3] = { NULL, NULL, NULL };
+static int g_integrity_table_inited = 0;
+
 CUresult cuGetExportTable(const void **ppExportTable, const void *pExportTableId) {
-    if (g_real.cuGetExportTable)
-        return g_real.cuGetExportTable(ppExportTable, pExportTableId);
+    /* Try real driver first */
+    if (g_real.cuGetExportTable) {
+        CUresult r = g_real.cuGetExportTable(ppExportTable, pExportTableId);
+        if (r == CUDA_SUCCESS) return r;
+    }
+    /* Real driver failed or unavailable — check if this is integrity check UUID */
+    if (pExportTableId && memcmp(pExportTableId, INTEGRITY_CHECK_UUID, 16) == 0) {
+        if (!g_integrity_table_inited) {
+            size_t sz = sizeof(g_integrity_table);
+            memcpy((void*)&g_integrity_table[0], &sz, sizeof(void*));
+            *(void**)&g_integrity_table[1] = (void*)chidori_integrity_check;
+            g_integrity_table_inited = 1;
+        }
+        *ppExportTable = g_integrity_table;
+        return CUDA_SUCCESS;
+    }
     return CUDA_ERROR_NOT_INITIALIZED;
 }
 

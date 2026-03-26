@@ -1647,14 +1647,32 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                         (pos+ehdr+2 < fat_size) ? fb[pos+ehdr+2] : 0,
                         (pos+ehdr+3 < fat_size) ? fb[pos+ehdr+3] : 0);
 
-                /* Prefer: ELF matching server SM > PTX (any) */
+                /* Selection priority: ELF exact SM > ELF closest SM > PTX (any).
+                 * Multi-module fallback: if exact SM not found, use closest
+                 * compatible ELF (same major, closest minor). */
                 if (etype == 2 && sm == server_sm) {
+                    /* Exact match — best possible */
                     best_data = fb + pos + ehdr;
                     best_uncomp = uncomp;
                     best_comp = comp;
                     best_flags = flags;
                     best_type = 2;
-                } else if (etype == 1 && best_type != 2) {
+                } else if (etype == 2 && best_type != 2 && sm / 10 == server_sm / 10 && sm <= server_sm) {
+                    /* Same major arch, compatible minor — good fallback */
+                    best_data = fb + pos + ehdr;
+                    best_uncomp = uncomp;
+                    best_comp = comp;
+                    best_flags = flags;
+                    best_type = 2;
+                } else if (etype == 2 && best_type == 1 && sm <= server_sm) {
+                    /* Any older ELF is better than PTX */
+                    best_data = fb + pos + ehdr;
+                    best_uncomp = uncomp;
+                    best_comp = comp;
+                    best_flags = flags;
+                    best_type = 2;
+                } else if (etype == 1 && best_type == 0) {
+                    /* PTX fallback only if nothing else found */
                     best_data = fb + pos + ehdr;
                     best_uncomp = uncomp;
                     best_comp = comp;
@@ -1691,6 +1709,64 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                             raw_size = result;
                             fprintf(stderr, "[cuda_dispatch] zstd decompressed: %zu -> %zu bytes\n",
                                     (size_t)file_sz, raw_size);
+                        }
+                    }
+                } else if (file_sz >= 4 && best_data[0] == 0x04 && best_data[1] == 0x22 &&
+                           best_data[2] == 0x4d && best_data[3] == 0x18) {
+                    /* LZ4 frame compression (magic 04 22 4d 18) — older CUDA 11.x uses this.
+                     * LZ4 frame format: magic(4) + flags(1-2) + blocks... */
+                    raw_size = (size_t)best_uncomp;
+                    raw = malloc(raw_size);
+                    if (raw) {
+                        /* Simple LZ4 block decompression — skip the 7-byte frame header,
+                         * read block size (4 bytes LE), then decompress the block.
+                         * Most fatbin LZ4 frames have a single block. */
+                        size_t hdr_skip = 7; /* magic(4) + FLG(1) + BD(1) + HC(1) */
+                        if (file_sz > hdr_skip + 4) {
+                            uint32_t block_sz = 0;
+                            memcpy(&block_sz, best_data + hdr_skip, 4);
+                            block_sz &= 0x7FFFFFFF; /* clear highest bit (uncompressed flag) */
+                            const uint8_t *block_data = best_data + hdr_skip + 4;
+                            size_t block_avail = file_sz - hdr_skip - 4;
+                            if (block_sz <= block_avail) {
+                                /* LZ4 raw block decompress — use simple decoder */
+                                size_t src_pos = 0, dst_pos = 0;
+                                const uint8_t *src = block_data;
+                                uint8_t *dst = (uint8_t *)raw;
+                                while (src_pos < block_sz && dst_pos < raw_size) {
+                                    uint8_t token = src[src_pos++];
+                                    /* Literal length */
+                                    size_t lit_len = token >> 4;
+                                    if (lit_len == 15) {
+                                        uint8_t b;
+                                        do { b = src[src_pos++]; lit_len += b; } while (b == 255 && src_pos < block_sz);
+                                    }
+                                    if (dst_pos + lit_len > raw_size || src_pos + lit_len > block_sz) break;
+                                    memcpy(dst + dst_pos, src + src_pos, lit_len);
+                                    src_pos += lit_len; dst_pos += lit_len;
+                                    if (src_pos >= block_sz) break;
+                                    /* Match offset + length */
+                                    uint16_t offset = src[src_pos] | ((uint16_t)src[src_pos+1] << 8);
+                                    src_pos += 2;
+                                    size_t match_len = (token & 0x0F) + 4;
+                                    if (match_len == 19) {
+                                        uint8_t b;
+                                        do { b = src[src_pos++]; match_len += b; } while (b == 255 && src_pos < block_sz);
+                                    }
+                                    if (offset == 0 || dst_pos + match_len > raw_size) break;
+                                    size_t match_pos = dst_pos - offset;
+                                    for (size_t k = 0; k < match_len; k++)
+                                        dst[dst_pos + k] = dst[match_pos + k];
+                                    dst_pos += match_len;
+                                }
+                                raw_size = dst_pos;
+                                fprintf(stderr, "[cuda_dispatch] LZ4 decompressed: %zu -> %zu bytes\n",
+                                        (size_t)file_sz, raw_size);
+                            } else {
+                                free(raw); raw = NULL;
+                            }
+                        } else {
+                            free(raw); raw = NULL;
                         }
                     }
                 } else if (file_sz >= 2 && best_data[0] == 0xa2 &&
