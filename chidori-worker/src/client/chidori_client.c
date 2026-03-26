@@ -2373,8 +2373,17 @@ cudaError_t cudaSetDevice(int device) {
         LOG_DEBUG("cudaSetDevice(%d) -> deactivated local GPU context", device);
     }
 
-    /* Route to remote GPU via Chidori RPC */
-    int32_t remote_dev = g_partial_offload ? (device - g_local_device_count) : device;
+    /* Route to remote GPU via Chidori RPC.
+     * In partial offload, the remote server has only 1 GPU (device 0).
+     * Skip the RPC entirely — just update local state. The server
+     * always operates on its device 0. This eliminates ~1000 sync RPCs
+     * per token during split inference (54ms each = 54s saved). */
+    if (g_partial_offload) {
+        g_current_device = device;
+        g_last_error = cudaSuccess;
+        return cudaSuccess;
+    }
+    int32_t remote_dev = device;
     cudaError_t r = (cudaError_t)chidori_rpc(CHIDORI_CUDA_SET_DEVICE, &remote_dev, sizeof(remote_dev), NULL, NULL);
     if (r == cudaSuccess) {
         g_current_device = device;
