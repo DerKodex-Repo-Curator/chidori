@@ -240,7 +240,7 @@ try:
         # Get GPU addresses for server-side decode
         input_data_ptr = si2.data_ptr()
         position_data_ptr = sp2.data_ptr()
-        logits_data_ptr = so2.logits[:, -1:, :].contiguous().data_ptr()
+        logits_data_ptr = so2.logits.data_ptr()
         vocab = model.config.vocab_size
 
         # Build GRAPH_DECODE payload

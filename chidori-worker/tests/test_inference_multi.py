@@ -79,7 +79,7 @@ def server_decode(prompt, max_tokens=100):
     lib.chidori_graph_decode(
         ctypes.c_uint64(eptr.value), ctypes.c_uint64(sptr.value),
         ctypes.c_uint64(si.data_ptr()), ctypes.c_uint64(sp.data_ptr()),
-        ctypes.c_uint64(so.logits[:, -1:, :].contiguous().data_ptr()),
+        ctypes.c_uint64(so.logits.data_ptr()),
         ctypes.c_int32(model.config.vocab_size),
         ctypes.c_int32(max_tokens - 2), ctypes.c_int32(plen + 2),
         out_tokens, ctypes.byref(out_count),
