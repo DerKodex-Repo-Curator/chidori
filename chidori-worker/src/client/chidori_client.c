@@ -1507,6 +1507,14 @@ CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGetAttribute(pi, attrib, dev);
     }
+    /* Override VMM support — Chidori doesn't support CUDA Virtual Memory Management
+     * (cuMemAddressReserve, cuMemCreate, cuMemMap, etc.). Applications like llama.cpp
+     * check this and fall back to regular cudaMalloc if VMM is unsupported. */
+    if (attrib == 117 /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */) {
+        *pi = 0;
+        return CUDA_SUCCESS;
+    }
+
     /* Remap device for remote */
     int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
 
