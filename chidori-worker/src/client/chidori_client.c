@@ -1507,13 +1507,7 @@ CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
         ensure_real_cuda_init();
         return g_real.cuDeviceGetAttribute(pi, attrib, dev);
     }
-    /* Override VMM support — Chidori doesn't support CUDA Virtual Memory Management
-     * (cuMemAddressReserve, cuMemCreate, cuMemMap, etc.). Applications like llama.cpp
-     * check this and fall back to regular cudaMalloc if VMM is unsupported. */
-    if (attrib == 117 /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */) {
-        *pi = 0;
-        return CUDA_SUCCESS;
-    }
+    /* VMM now implemented — let the server report real VMM support */
 
     /* Remap device for remote */
     int remote_dev = g_partial_offload ? (dev - g_local_device_count) : dev;
@@ -7466,55 +7460,83 @@ CUresult cuPointerGetAttributes(unsigned int numAttributes, int *attributes,
 
 /* ---- Virtual Memory (CUDA 10.2+) ---- */
 
+/* ================================================================
+ * Virtual Memory Management (VMM) — real RPCs to server.
+ * Used by PyTorch (expandable segments), llama.cpp, and vLLM.
+ * ================================================================ */
 CUresult cuMemAddressReserve(CUdeviceptr *ptr, size_t size, size_t alignment,
                               CUdeviceptr addr, unsigned long long flags) {
-    (void)alignment; (void)addr; (void)flags; (void)size;
-    if (ptr) *ptr = 0;
-    return CUDA_SUCCESS;
+    if (g_in_real_cuda > 0 && g_real.cuMemAlloc_v2) {
+        /* Reentrance: forward to real driver */
+        return g_real.cuMemAlloc_v2(ptr, size);
+    }
+    struct __attribute__((packed)) { uint64_t size; uint64_t alignment; uint64_t addr; uint64_t flags; } req;
+    req.size = (uint64_t)size; req.alignment = (uint64_t)alignment;
+    req.addr = (uint64_t)addr; req.flags = (uint64_t)flags;
+    uint64_t result_ptr = 0;
+    size_t out_len = sizeof(result_ptr);
+    CUresult r = chidori_rpc(CHIDORI_CU_MEM_ADDRESS_RESERVE, &req, sizeof(req), &result_ptr, &out_len);
+    if (ptr) *ptr = (CUdeviceptr)result_ptr;
+    return r;
 }
 
 CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
-    (void)ptr; (void)size;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t ptr; uint64_t size; } req;
+    req.ptr = (uint64_t)ptr; req.size = (uint64_t)size;
+    return chidori_rpc_async(CHIDORI_CU_MEM_ADDRESS_FREE, &req, sizeof(req));
 }
 
 CUresult cuMemCreate(void **handle, size_t size, void *prop, unsigned long long flags) {
-    (void)size; (void)prop; (void)flags;
-    static int fake_alloc;
-    if (handle) *handle = (void *)&fake_alloc;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t size; uint64_t flags; } req;
+    req.size = (uint64_t)size; req.flags = (uint64_t)flags;
+    uint64_t result_handle = 0;
+    size_t out_len = sizeof(result_handle);
+    CUresult r = chidori_rpc(CHIDORI_CU_MEM_CREATE, &req, sizeof(req), &result_handle, &out_len);
+    if (handle) *handle = (void *)(uintptr_t)result_handle;
+    (void)prop;
+    return r;
 }
 
 CUresult cuMemRelease(void *handle) {
-    (void)handle;
-    return CUDA_SUCCESS;
+    uint64_t h = (uint64_t)(uintptr_t)handle;
+    return chidori_rpc_async(CHIDORI_CU_MEM_RELEASE, &h, sizeof(h));
 }
 
 CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
                    void *handle, unsigned long long flags) {
-    (void)ptr; (void)size; (void)offset; (void)handle; (void)flags;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t ptr; uint64_t size; uint64_t offset; uint64_t handle; uint64_t flags; } req;
+    req.ptr = (uint64_t)ptr; req.size = (uint64_t)size; req.offset = (uint64_t)offset;
+    req.handle = (uint64_t)(uintptr_t)handle; req.flags = (uint64_t)flags;
+    return chidori_rpc(CHIDORI_CU_MEM_MAP, &req, sizeof(req), NULL, NULL);
 }
 
 CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
-    (void)ptr; (void)size;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t ptr; uint64_t size; } req;
+    req.ptr = (uint64_t)ptr; req.size = (uint64_t)size;
+    return chidori_rpc_async(CHIDORI_CU_MEM_UNMAP, &req, sizeof(req));
 }
 
 CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const void *desc, size_t count) {
-    (void)ptr; (void)size; (void)desc; (void)count;
-    return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t ptr; uint64_t size; uint64_t count; } req;
+    req.ptr = (uint64_t)ptr; req.size = (uint64_t)size; req.count = (uint64_t)count;
+    (void)desc; /* desc contains device ordinal + flags, server uses device 0 */
+    return chidori_rpc(CHIDORI_CU_MEM_SET_ACCESS, &req, sizeof(req), NULL, NULL);
 }
 
 CUresult cuMemGetAccess(unsigned long long *flags, const void *location, CUdeviceptr ptr) {
     (void)location; (void)ptr;
-    if (flags) *flags = 0;
+    if (flags) *flags = 3; /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE */
     return CUDA_SUCCESS;
 }
 
 CUresult cuMemGetAllocationGranularity(size_t *granularity, const void *prop, int option) {
-    (void)prop; (void)option;
-    if (granularity) *granularity = 65536;
+    /* Query server for real granularity */
+    uint64_t gran = 0;
+    size_t out_len = sizeof(gran);
+    CUresult r = chidori_rpc(CHIDORI_CU_MEM_GET_ALLOC_GRANULARITY, &option, sizeof(int32_t), &gran, &out_len);
+    if (r == CUDA_SUCCESS && granularity) *granularity = (size_t)gran;
+    else if (granularity) *granularity = 2097152; /* 2MB fallback */
+    (void)prop;
     return CUDA_SUCCESS;
 }
 
@@ -7836,8 +7858,10 @@ CUresult cuFuncSetSharedMemConfig(CUfunction hfunc, int config) {
 }
 
 CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value) {
-    (void)hfunc; (void)attrib; (void)value;
-    return CUDA_SUCCESS;
+    if (g_in_real_cuda > 0) return CUDA_SUCCESS;
+    struct __attribute__((packed)) { uint64_t func; int32_t attrib; int32_t value; } req;
+    req.func = (uint64_t)(uintptr_t)hfunc; req.attrib = attrib; req.value = value;
+    return chidori_rpc_async(CHIDORI_CU_FUNC_SET_ATTRIBUTE, &req, sizeof(req));
 }
 
 /* ---- Peer Context (Driver API) ---- */

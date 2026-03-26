@@ -344,6 +344,16 @@ typedef enum {
      * Response: token_id(4) */
     CHIDORI_GRAPH_DECODE_SPLIT           = 0x0502,
 
+    /* Virtual Memory Management (0x0600-0x060F) */
+    CHIDORI_CU_MEM_ADDRESS_RESERVE       = 0x0600,
+    CHIDORI_CU_MEM_ADDRESS_FREE          = 0x0601,
+    CHIDORI_CU_MEM_CREATE                = 0x0602,
+    CHIDORI_CU_MEM_RELEASE               = 0x0603,
+    CHIDORI_CU_MEM_MAP                   = 0x0604,
+    CHIDORI_CU_MEM_UNMAP                 = 0x0605,
+    CHIDORI_CU_MEM_SET_ACCESS            = 0x0606,
+    CHIDORI_CU_MEM_GET_ALLOC_GRANULARITY = 0x0607,
+
     /* Sentinel */
     CHIDORI_FUNC_MAX                     = 0xFFFF,
 } chidori_func_id_t;

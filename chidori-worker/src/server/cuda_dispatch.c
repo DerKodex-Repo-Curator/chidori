@@ -4281,6 +4281,88 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
     }
 
     /* ================================================================
+     * Virtual Memory Management (VMM)
+     * ================================================================ */
+    case CHIDORI_CU_MEM_ADDRESS_RESERVE: {
+        uint64_t size = 0, alignment = 0, addr = 0, flags = 0;
+        if (req->payload_size >= 32) {
+            memcpy(&size, payload, 8);
+            memcpy(&alignment, (char*)payload + 8, 8);
+            memcpy(&addr, (char*)payload + 16, 8);
+            memcpy(&flags, (char*)payload + 24, 8);
+        }
+        CUdeviceptr ptr = 0;
+        res = cuMemAddressReserve(&ptr, (size_t)size, (size_t)alignment, (CUdeviceptr)addr, (unsigned long long)flags);
+        uint64_t ptr64 = (uint64_t)ptr;
+        return chidori_send_response(fd, req->seq_num, res, &ptr64, sizeof(ptr64));
+    }
+    case CHIDORI_CU_MEM_ADDRESS_FREE: {
+        uint64_t ptr = 0, size = 0;
+        if (req->payload_size >= 16) { memcpy(&ptr, payload, 8); memcpy(&size, (char*)payload + 8, 8); }
+        res = cuMemAddressFree((CUdeviceptr)ptr, (size_t)size);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+    case CHIDORI_CU_MEM_CREATE: {
+        uint64_t size = 0, flags = 0;
+        if (req->payload_size >= 16) { memcpy(&size, payload, 8); memcpy(&flags, (char*)payload + 8, 8); }
+        CUmemGenericAllocationHandle handle = 0;
+        CUmemAllocationProp prop = {0};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = 0;
+        res = cuMemCreate(&handle, (size_t)size, &prop, (unsigned long long)flags);
+        uint64_t h64 = (uint64_t)handle;
+        return chidori_send_response(fd, req->seq_num, res, &h64, sizeof(h64));
+    }
+    case CHIDORI_CU_MEM_RELEASE: {
+        uint64_t handle = 0;
+        if (req->payload_size >= 8) memcpy(&handle, payload, 8);
+        res = cuMemRelease((CUmemGenericAllocationHandle)handle);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+    case CHIDORI_CU_MEM_MAP: {
+        uint64_t ptr = 0, size = 0, offset = 0, handle = 0, flags = 0;
+        if (req->payload_size >= 40) {
+            memcpy(&ptr, payload, 8); memcpy(&size, (char*)payload + 8, 8);
+            memcpy(&offset, (char*)payload + 16, 8); memcpy(&handle, (char*)payload + 24, 8);
+            memcpy(&flags, (char*)payload + 32, 8);
+        }
+        res = cuMemMap((CUdeviceptr)ptr, (size_t)size, (size_t)offset, (CUmemGenericAllocationHandle)handle, (unsigned long long)flags);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+    case CHIDORI_CU_MEM_UNMAP: {
+        uint64_t ptr = 0, size = 0;
+        if (req->payload_size >= 16) { memcpy(&ptr, payload, 8); memcpy(&size, (char*)payload + 8, 8); }
+        res = cuMemUnmap((CUdeviceptr)ptr, (size_t)size);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+    case CHIDORI_CU_MEM_SET_ACCESS: {
+        uint64_t ptr = 0, size = 0, count = 0;
+        if (req->payload_size >= 24) {
+            memcpy(&ptr, payload, 8); memcpy(&size, (char*)payload + 8, 8);
+            memcpy(&count, (char*)payload + 16, 8);
+        }
+        CUmemAccessDesc desc = {0};
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id = 0;
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        res = cuMemSetAccess((CUdeviceptr)ptr, (size_t)size, &desc, 1);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+    case CHIDORI_CU_MEM_GET_ALLOC_GRANULARITY: {
+        int32_t option = 0;
+        if (req->payload_size >= 4) memcpy(&option, payload, 4);
+        CUmemAllocationProp prop = {0};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = 0;
+        size_t gran = 0;
+        res = cuMemGetAllocationGranularity(&gran, &prop, (CUmemAllocationGranularity_flags)option);
+        uint64_t g64 = (uint64_t)gran;
+        return chidori_send_response(fd, req->seq_num, res, &g64, sizeof(g64));
+    }
+
+    /* ================================================================
      * CUDA Graph API
      * ================================================================ */
     case CHIDORI_CU_STREAM_BEGIN_CAPTURE: {
