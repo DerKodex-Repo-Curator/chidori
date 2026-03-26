@@ -40,14 +40,13 @@ inp = tok("Explain GPU-over-IP:", return_tensors="pt").input_ids.to("cuda:0")
 plen = inp.shape[1]
 
 # --- Test 1: Baseline with StaticCache ---
-sc = StaticCache(config=model.config, max_cache_len=plen + MAX_TOKENS + 10)
 print(f"\n[CACHED] Generating {MAX_TOKENS} tokens with StaticCache...", flush=True)
 torch.cuda.synchronize(0)
 torch.cuda.synchronize(1)
 t0 = time.time()
 with torch.no_grad():
     out = model.generate(inp, max_new_tokens=MAX_TOKENS, do_sample=False,
-                         past_key_values=sc, cache_implementation="static")
+                         cache_implementation="static")
 torch.cuda.synchronize(0)
 torch.cuda.synchronize(1)
 dt = time.time() - t0
