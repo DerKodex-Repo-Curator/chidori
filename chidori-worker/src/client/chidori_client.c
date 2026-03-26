@@ -5893,20 +5893,22 @@ const char *cudaGetErrorName(cudaError_t error) {
 /* ---- Pinned (Host) Memory ---- */
 
 cudaError_t cudaMallocHost(void **ptr, size_t size) {
-    *ptr = malloc(size);
+    /* Use aligned allocation — llama.cpp requires TENSOR_ALIGNMENT (32 bytes).
+     * plain malloc only guarantees 16-byte alignment on most systems. */
+    if (posix_memalign(ptr, 64, size) != 0) *ptr = NULL;
     g_last_error = *ptr ? cudaSuccess : 2; /* cudaErrorMemoryAllocation */
     return g_last_error;
 }
 
 cudaError_t cudaFreeHost(void *ptr) {
-    free(ptr);
+    free(ptr); /* posix_memalign'd memory is free()-able */
     g_last_error = cudaSuccess;
     return cudaSuccess;
 }
 
 cudaError_t cudaHostAlloc(void **pHost, size_t size, unsigned int flags) {
     (void)flags;
-    *pHost = malloc(size);
+    if (posix_memalign(pHost, 64, size) != 0) *pHost = NULL;
     g_last_error = *pHost ? cudaSuccess : 2;
     return g_last_error;
 }
