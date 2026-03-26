@@ -133,7 +133,9 @@ lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
 
 if not eptr.value:
     print("FAIL: graph instantiate failed"); sys.exit(1)
-print(f"Remote graph captured! exec={eptr.value:#x}", flush=True)
+# Save the logits data pointer — graph writes to this exact address
+logits_ptr_saved = static_logits_out.data_ptr()
+print(f"Remote graph captured! exec={eptr.value:#x} logits_ptr={logits_ptr_saved:#x}", flush=True)
 
 # --- Generate with: local layers + remote graph via GRAPH_DECODE_SPLIT ---
 generated = [first_token, second_token]
@@ -167,7 +169,7 @@ for step in range(MAX_TOKENS - 2):
         ctypes.c_uint64(sptr.value),
         ctypes.c_uint64(static_activation.data_ptr()),
         ctypes.c_uint64(static_pos_remote.data_ptr()),
-        ctypes.c_uint64(static_logits_out[:, -1:, :].contiguous().data_ptr()),
+        ctypes.c_uint64(logits_ptr_saved),  # use saved ptr from capture
         ctypes.c_int32(VOCAB),
         ctypes.c_int32(position),
         act_buf,
