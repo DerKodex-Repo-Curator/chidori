@@ -1,0 +1,135 @@
+---
+# Ansible playbook to set up a new Chidori GPU server
+# Usage: ansible-playbook -i "IP," -u ubuntu setup-gpu-server.yml
+#   e.g: ansible-playbook -i "185.216.20.134," -u ubuntu setup-gpu-server.yml
+#
+# Prerequisites on target: Ubuntu 22.04/24.04 with NVIDIA drivers + CUDA toolkit
+
+- name: Set up Chidori GPU server
+  hosts: all
+  become: yes
+  vars:
+    chidori_repo: "git@github.com:fpolica91/chidori.git"
+    chidori_port: 43211
+    torch_index: "https://download.pytorch.org/whl/cu128"
+
+  tasks:
+    - name: Install system dependencies
+      apt:
+        name:
+          - git
+          - gcc
+          - make
+          - python3-venv
+          - python3-pip
+          - libcudnn9-dev-cuda-12
+          - libzstd-dev
+          - libcublas-dev-12-8
+        state: present
+        update_cache: yes
+
+    - name: Set TCP buffer tuning for high-bandwidth transfers
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-chidori-tcp.conf
+        reload: yes
+      loop:
+        - { name: net.core.wmem_max, value: "134217728" }
+        - { name: net.core.rmem_max, value: "134217728" }
+        - { name: net.ipv4.tcp_wmem, value: "4096 65536 67108864" }
+        - { name: net.ipv4.tcp_rmem, value: "4096 87380 67108864" }
+
+    - name: Generate SSH key for GitHub (if not exists)
+      become: no
+      command: ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+      args:
+        creates: ~/.ssh/id_ed25519
+
+    - name: Read SSH public key
+      become: no
+      command: cat ~/.ssh/id_ed25519.pub
+      register: ssh_pubkey
+      changed_when: false
+
+    - name: Show SSH deploy key (add to GitHub if not already)
+      debug:
+        msg: "Deploy key: {{ ssh_pubkey.stdout }}"
+
+    - name: Accept GitHub host key
+      become: no
+      shell: ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+      args:
+        creates: ~/.ssh/known_hosts
+
+    - name: Clone Chidori repo
+      become: no
+      git:
+        repo: "{{ chidori_repo }}"
+        dest: ~/chidori
+        version: main
+        accept_hostkey: yes
+
+    - name: Build chidori-worker
+      become: no
+      shell: cd ~/chidori/chidori-worker && make clean && make all
+      register: build_result
+
+    - name: Verify build
+      become: no
+      stat:
+        path: ~/chidori/chidori-worker/build/chidori-worker
+      register: binary
+      failed_when: not binary.stat.exists
+
+    - name: Create Python venv
+      become: no
+      command: python3 -m venv ~/chidori/.venv
+      args:
+        creates: ~/chidori/.venv/bin/python
+
+    - name: Install PyTorch
+      become: no
+      pip:
+        name: torch
+        extra_args: "--index-url {{ torch_index }}"
+        virtualenv: ~/chidori/.venv
+
+    - name: Install Python dependencies
+      become: no
+      pip:
+        name:
+          - transformers
+          - accelerate
+          - bitsandbytes
+        virtualenv: ~/chidori/.venv
+
+    - name: Verify PyTorch + CUDA
+      become: no
+      shell: ~/chidori/.venv/bin/python -c "import torch; assert torch.cuda.is_available(); print(f'torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}')"
+      register: torch_check
+
+    - name: Show PyTorch info
+      debug:
+        msg: "{{ torch_check.stdout }}"
+
+    - name: Add Lenovo SSH key to authorized_keys
+      become: no
+      authorized_key:
+        user: ubuntu
+        key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJQ24mD5n2NF+5w9EleGTvdb89sBP4j7ZIXs0J3rfPcx fabricio@lenovo"
+
+    - name: Start chidori-worker
+      become: no
+      shell: |
+        pkill chidori-worker 2>/dev/null || true
+        sleep 1
+        cd ~/chidori/chidori-worker
+        nohup build/chidori-worker --standalone {{ chidori_port }} > /tmp/server.log 2>&1 &
+        sleep 2
+        pgrep chidori-worker
+      register: server_start
+
+    - name: Server status
+      debug:
+        msg: "Chidori server running on port {{ chidori_port }} (PID: {{ server_start.stdout_lines[-1] }})"
