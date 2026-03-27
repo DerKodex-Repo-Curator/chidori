@@ -3531,9 +3531,17 @@ cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
             return CUBLAS_STATUS_SUCCESS;
         }
     }
+    fprintf(stderr, "[chidori] cublasCreate_v2: server_fd=%d pending=%d\n", g_server_fd, g_pending_responses);
+    if (g_server_fd < 0) {
+        fprintf(stderr, "[chidori] cublasCreate_v2: RECONNECTING (fd was closed)\n");
+        pthread_mutex_lock(&g_lock);
+        if (g_server_fd < 0) chidori_connect();
+        pthread_mutex_unlock(&g_lock);
+    }
     uint64_t h = 0;
     size_t len = sizeof(uint64_t);
     cublasStatus_t r = (cublasStatus_t)chidori_rpc(CHIDORI_CUBLAS_CREATE, NULL, 0, &h, &len);
+    fprintf(stderr, "[chidori] cublasCreate_v2: result=%d handle=%llx\n", (int)r, (unsigned long long)h);
     if (r == CUBLAS_STATUS_SUCCESS) {
         *handle = (cublasHandle_t)(uintptr_t)h;
         g_last_cublas_handle = h;
