@@ -1571,6 +1571,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             }
         }
 
+        /* Log first bytes to identify format */
+        {
+            const uint8_t *fb = (const uint8_t *)payload;
+            fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: size=%u first8=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                    req->payload_size, fb[0], fb[1], fb[2], fb[3], fb[4], fb[5], fb[6], fb[7]);
+        }
         res = cuModuleLoadData(&mod, payload);
         fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: fast-path cuModuleLoadData=%d (size=%u)\n",
                 (int)res, req->payload_size);
