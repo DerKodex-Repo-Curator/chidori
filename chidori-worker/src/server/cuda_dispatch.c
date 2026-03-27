@@ -1891,11 +1891,21 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                                   (char *)func_name, -1, NULL, NULL, NULL, NULL, NULL);
 
             /* Force runtime initialization so cudaGetFuncBySymbol can resolve the function.
-             * Re-establish driver context first — VMM/graph ops may have left it stale. */
+             * Re-establish BOTH driver and runtime contexts — VMM/graph ops may have
+             * left them stale. Synchronize to ensure all pending ops complete first. */
             ensure_device_context(0);
+            cuCtxSynchronize();
             cudaGetLastError(); /* clear any stale runtime error */
-            cudaSetDevice(0);
-            cudaFree(0);
+            {
+                /* Re-initialize runtime by calling a benign runtime function */
+                int dev = 0;
+                cudaGetDevice(&dev);
+                cudaSetDevice(0);
+                void *dummy = NULL;
+                cudaError_t e = cudaMalloc(&dummy, 1);
+                if (e == cudaSuccess && dummy) cudaFree(dummy);
+                else cudaGetLastError(); /* clear alloc error if it failed */
+            }
 
             /* Get the real CUfunction from the runtime */
             cudaError_t rt_err = cudaGetFuncBySymbol(&func, stub);
