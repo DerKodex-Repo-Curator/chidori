@@ -1602,8 +1602,9 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             if (!s_get_module_tried) {
                 s_get_module_tried = 1;
                 /* CUDART_INTERFACE UUID */
+                /* UUID in RFC 4122 / big-endian format (not Windows GUID LE) */
                 unsigned char uuid[16] = {
-                    0x6c, 0xfb, 0xd5, 0x6b, 0xf4, 0x5b, 0x4a, 0xe7,
+                    0x6b, 0xd5, 0xfb, 0x6c, 0x5b, 0xf4, 0xe7, 0x4a,
                     0x89, 0x87, 0xd9, 0x39, 0x12, 0xfd, 0x9d, 0xf9
                 };
                 const void *table = NULL;
