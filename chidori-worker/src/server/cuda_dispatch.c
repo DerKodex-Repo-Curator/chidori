@@ -1608,6 +1608,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 };
                 const void *table = NULL;
                 CUresult tr = cuGetExportTable(&table, (const CUuuid *)uuid);
+                fprintf(stderr, "[cuda_dispatch] cuGetExportTable(CUDART_INTERFACE): tr=%d table=%p\n", (int)tr, table);
                 if (tr == CUDA_SUCCESS && table) {
                     /* Table[1] = get_module_from_cubin(CUmodule*, const void* fatbinc_wrapper) */
                     const void **fns = (const void **)table;
