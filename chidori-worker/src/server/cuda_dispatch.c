@@ -1618,8 +1618,14 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 }
             }
             if (s_get_module) {
+                /* get_module_from_cubin expects a FatbincWrapper, not raw data */
+                struct { int magic; int version; const void *data; const void *filename; } wrapper;
+                wrapper.magic = 0x466243B1;  /* __cudaFatMAGIC2 */
+                wrapper.version = 1;
+                wrapper.data = payload;
+                wrapper.filename = NULL;
                 CUmodule dark_mod = NULL;
-                CUresult dr = s_get_module(&dark_mod, payload);
+                CUresult dr = s_get_module(&dark_mod, &wrapper);
                 if (dr == CUDA_SUCCESS && dark_mod) {
                     uint64_t handle = alloc_handle();
                     hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)dark_mod);
