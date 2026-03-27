@@ -1511,7 +1511,7 @@ CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev) {
      * deinitialization on the server (cuMemCreate/Map are Driver API calls
      * that break the Runtime API's internal state). Applications fall back
      * to cudaMalloc which keeps the runtime consistent. */
-    if (attrib == 117 /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */) {
+    if (attrib == 102 /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */) {
         *pi = 0;
         return CUDA_SUCCESS;
     }
