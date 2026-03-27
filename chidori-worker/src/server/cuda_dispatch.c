@@ -1591,6 +1591,46 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &handle, sizeof(handle));
         }
 
+        /* Try CUDART_INTERFACE dark API: get_module_from_cubin.
+         * This is what the CUDA runtime uses internally. It handles compressed
+         * and cross-arch fat binaries that cuModuleLoadData can't parse.
+         * UUID: {6BD5FB6C-5BF4-E74A-8987-D93912FD9DF9} */
+        {
+            typedef CUresult (*get_module_fn)(CUmodule *, const void *);
+            static get_module_fn s_get_module = NULL;
+            static int s_get_module_tried = 0;
+            if (!s_get_module_tried) {
+                s_get_module_tried = 1;
+                /* CUDART_INTERFACE UUID */
+                unsigned char uuid[16] = {
+                    0x6c, 0xfb, 0xd5, 0x6b, 0xf4, 0x5b, 0x4a, 0xe7,
+                    0x89, 0x87, 0xd9, 0x39, 0x12, 0xfd, 0x9d, 0xf9
+                };
+                const void *table = NULL;
+                CUresult tr = cuGetExportTable(&table, (const CUuuid *)uuid);
+                if (tr == CUDA_SUCCESS && table) {
+                    /* Table[1] = get_module_from_cubin(CUmodule*, const void* fatbinc_wrapper) */
+                    const void **fns = (const void **)table;
+                    s_get_module = (get_module_fn)fns[1];
+                    fprintf(stderr, "[cuda_dispatch] CUDART_INTERFACE: get_module_from_cubin @ %p\n", (void*)s_get_module);
+                }
+            }
+            if (s_get_module) {
+                CUmodule dark_mod = NULL;
+                CUresult dr = s_get_module(&dark_mod, payload);
+                if (dr == CUDA_SUCCESS && dark_mod) {
+                    uint64_t handle = alloc_handle();
+                    hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)dark_mod);
+                    fat_cache_insert(fb_hash, req->payload_size, handle);
+                    fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: DARK API success, handle=0x%llx\n",
+                            (unsigned long long)handle);
+                    return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, &handle, sizeof(handle));
+                } else {
+                    fprintf(stderr, "[cuda_dispatch] RegisterFatBinary: DARK API failed dr=%d\n", (int)dr);
+                }
+            }
+        }
+
         /* Driver API failed — parse fat binary, decompress entries (zstd), retry.
          *
          * Fat binary format (0xba55ed50):
