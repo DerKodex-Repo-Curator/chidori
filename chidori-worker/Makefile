@@ -28,7 +28,7 @@ all: server client
 
 server: $(BUILD_DIR)/chidori-worker
 
-client: $(BUILD_DIR)/libchidori.so $(BUILD_DIR)/libnvidia-ml.so.1
+client: $(BUILD_DIR)/libchidori.so $(BUILD_DIR)/libnvidia-ml.so.1 $(BUILD_DIR)/libcublas.so.12 $(BUILD_DIR)/libcublasLt.so.12
 
 $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol.h src/server/handle_map.h
 	@mkdir -p $(BUILD_DIR)
@@ -37,6 +37,15 @@ $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol
 $(BUILD_DIR)/libchidori.so: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h src/client/chidori_client.map
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libchidori.so -Wl,--version-script=src/client/chidori_client.map -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+
+# cuBLAS/cuBLASLt proxy libs — same interceptor code compiled with cuBLAS soname.
+# When LD_LIBRARY_PATH=build, the dynamic linker finds these instead of real cuBLAS.
+# This is how llama.cpp's cuBLAS calls get routed through our interceptor.
+$(BUILD_DIR)/libcublas.so.12: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
+	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libcublas.so.12 -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+
+$(BUILD_DIR)/libcublasLt.so.12: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
+	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libcublasLt.so.12 -o $@ $(SRC_CLIENT) $(SRC_PROTO)
 
 $(BUILD_DIR)/libnvidia-ml.so.1: src/client/chidori_nvml.c
 	@mkdir -p $(BUILD_DIR)
