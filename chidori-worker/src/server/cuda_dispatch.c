@@ -1553,8 +1553,12 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
 
         CUmodule mod;
 
-        /* Ensure we have an active CUDA context before loading modules */
+        /* Ensure BOTH driver context AND runtime are active before loading.
+         * VMM operations (cuMemCreate/Map) can deinitialize the runtime.
+         * cudaFree(0) forces runtime re-init. */
         ensure_device_context(0);
+        cudaGetLastError();
+        cudaFree(0);
 
         /* Synchronize to flush any pending GPU errors from prior operations */
         {
