@@ -1598,6 +1598,7 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         {
             typedef CUresult (*get_module_fn)(CUmodule *, const void *);
             static get_module_fn s_get_module = NULL;
+            static const void *table = NULL;
             static int s_get_module_tried = 0;
             if (!s_get_module_tried) {
                 s_get_module_tried = 1;
@@ -1607,7 +1608,6 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                     0x6b, 0xd5, 0xfb, 0x6c, 0x5b, 0xf4, 0xe7, 0x4a,
                     0x89, 0x87, 0xd9, 0x39, 0x12, 0xfd, 0x9d, 0xf9
                 };
-                const void *table = NULL;
                 CUresult tr = cuGetExportTable(&table, (const CUuuid *)uuid);
                 fprintf(stderr, "[cuda_dispatch] cuGetExportTable(CUDART_INTERFACE): tr=%d table=%p\n", (int)tr, table);
                 if (tr == CUDA_SUCCESS && table) {
@@ -1626,6 +1626,25 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
                 wrapper.filename = NULL;
                 CUmodule dark_mod = NULL;
                 CUresult dr = s_get_module(&dark_mod, &wrapper);
+                fprintf(stderr, "[cuda_dispatch] DARK API[1] dr=%d dark_mod=%p\n", (int)dr, (void*)dark_mod);
+                /* If [1] fails, try [6] (get_module_from_cubin_ext1) and [8] (ext2) */
+                if (dr != CUDA_SUCCESS) {
+                    typedef CUresult (*get_module_ext_fn)(CUmodule *, const void *, void *, void *, unsigned);
+                    const void **fns = (const void **)table;
+                    /* Try index 6 */
+                    if (fns[6]) {
+                        get_module_ext_fn ext1 = (get_module_ext_fn)fns[6];
+                        dr = ext1(&dark_mod, &wrapper, NULL, NULL, 0);
+                        fprintf(stderr, "[cuda_dispatch] DARK API[6] dr=%d dark_mod=%p\n", (int)dr, (void*)dark_mod);
+                    }
+                    /* Try index 8 — takes FatbinHeader directly */
+                    if (dr != CUDA_SUCCESS && fns[8]) {
+                        typedef CUresult (*get_module_ext2_fn)(const void *, CUmodule *, void *, void *, unsigned);
+                        get_module_ext2_fn ext2 = (get_module_ext2_fn)fns[8];
+                        dr = ext2(payload, &dark_mod, NULL, NULL, 0);
+                        fprintf(stderr, "[cuda_dispatch] DARK API[8] dr=%d dark_mod=%p\n", (int)dr, (void*)dark_mod);
+                    }
+                }
                 if (dr == CUDA_SUCCESS && dark_mod) {
                     uint64_t handle = alloc_handle();
                     hmap_put(&g_modules, handle, (uint64_t)(uintptr_t)dark_mod);
