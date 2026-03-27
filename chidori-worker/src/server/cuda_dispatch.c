@@ -2094,6 +2094,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
      * cuBLAS API
      * ================================================================ */
     case CHIDORI_CUBLAS_CREATE: {
+        /* Ensure CUDA context is active — graph capture/VMM ops may have
+         * left the context in a bad state. Reset any error too. */
+        ensure_device_context(0);
+        cudaGetLastError(); /* clear any stale error */
         cublasHandle_t handle;
         cublasStatus_t st = cublasCreate(&handle);
         if (st == CUBLAS_STATUS_SUCCESS) {
