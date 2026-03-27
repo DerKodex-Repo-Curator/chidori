@@ -28,9 +28,12 @@ cd chidori-worker && make test-e2e
 make clean
 ```
 
-The chidori-worker Makefile compiles C with GCC and links against `libcuda`, `libcudart`, `libcublas`, and `libcudnn`. Build outputs go to `chidori-worker/build/`:
+The chidori-worker Makefile compiles C with GCC and links against `libcuda`, `libcudart`, `libcublas`, `libcublasLt`, and `libcudnn`. Use `CUDA_PATH=/opt/cuda` to override the default `/usr/local/cuda`. Build outputs go to `chidori-worker/build/`:
 - `chidori-worker` — GPU host server binary
-- `libchidori.so` — Client interception library
+- `libchidori.so` — Client interception library (linked as `libcuda.so.1` on client)
+- `libcublas.so.12`, `libcublas.so.13` — cuBLAS proxy libs (same interceptor code, different sonames)
+- `libcublasLt.so.12`, `libcublasLt.so.13` — cuBLASLt proxy libs
+- `libnvidia-ml.so.1` — NVML proxy (intercepts GPU queries)
 
 ## Running Tests
 
@@ -50,6 +53,15 @@ cd chidori-worker/tests && ./run-test.sh <server-ip> <port>
 
 **Python/PyTorch tests** (`test_inference.py`, `test_training.py`, `test_pytorch.py`, etc.) run on the client side with `LD_PRELOAD=build/libchidori.so` pointing at a running server.
 
+**Run a single Python test:**
+```bash
+CHIDORI_DIRECT_CONNECT=1 \
+CHIDORI_CFG_OVERRIDE='{"id":"test","servers":["<server-ip>:<port>"]}' \
+LD_PRELOAD=build/libcuda.so.1 \
+LD_LIBRARY_PATH=build \
+python tests/test_inference.py
+```
+
 ## Architecture
 
 ### Two main components:
@@ -59,9 +71,10 @@ cd chidori-worker/tests && ./run-test.sh <server-ip> <port>
 - `src/server/chidori_worker.c` — Server main loop, socket management, dispatch entry point
 - `src/server/cuda_dispatch.c` — Giant switch dispatching function IDs to real CUDA calls (~3200 lines)
 - `src/server/handle_map.h` — Maps wire handles ↔ real CUDA handles (append-only arrays, 8192 entry limit)
+- `src/server/replay.c` — Server-side call sequence replay (records ops, replays with new data, avoids per-call RPC)
 - `src/protocol/chidori_net.c` — TCP I/O primitives (blocking read/write)
 - `include/chidori_protocol.h` — Wire protocol definitions (request/response headers, function ID ranges, flags)
-- `codegen/` — Tool to auto-generate CUDA stubs from headers
+- `codegen/` — Tool to auto-generate CUDA stubs from headers (not yet functional)
 
 **control-plane/** (Go) — Enterprise orchestration:
 - `cmd/agent/` — Runs on GPU hosts, manages worker processes, reports GPU metrics via NVML
@@ -73,7 +86,7 @@ cd chidori-worker/tests && ./run-test.sh <server-ip> <port>
 - **Request header** (16 bytes): `msg_len(4) | func_id(2) | flags(2) | seq_num(4) | payload_size(4)`
 - **Response header** (12 bytes): `msg_len(4) | seq_num(4) | result(4)` + optional payload
 - Native byte order (x86_64 only), no endian conversion
-- Function ID ranges: `0x0001-0x00FF` (Driver API), `0x0100-0x01FF` (Runtime API), `0x0200-0x02FF` (cuBLAS), `0x0300-0x03FF` (cuDNN)
+- Function ID ranges: `0x0001-0x00FF` (Driver API), `0x0100-0x01FF` (Runtime API), `0x0200-0x02FF` (cuBLAS), `0x0300-0x03FF` (cuDNN), `0x0400-0x04FF` (Replay system), `0x0500+` (Graph decode, split GPU, bulk transfer)
 
 ### Key Performance Patterns
 
@@ -81,6 +94,14 @@ cd chidori-worker/tests && ./run-test.sh <server-ip> <port>
 - **TCP_CORK batching**: Packs multiple async responses into single TCP segment
 - **DtoD zero-network**: Device-to-device copies send only 24 bytes over wire (data stays on GPU)
 - **Async RPC path**: Compute-phase calls use `CHIDORI_FLAG_ASYNC` — no response sent, allowing 100s of queued operations
+
+### Replay System
+
+Records entire CUDA call sequences on the server, then replays them with only changed data (e.g., new input batches). Eliminates per-call RPC overhead for training loops. Uses FNV-1a hashing for sequence fingerprinting. See `src/server/replay.c`.
+
+### Split GPU / Graph Decode
+
+`CHIDORI_GRAPH_DECODE` runs autoregressive decode entirely server-side. `CHIDORI_GRAPH_DECODE_SPLIT` enables pipeline-parallel inference where the local GPU runs some layers and the remote GPU runs others — this is the "split GPU" mode where one client has a local GPU and sends overflow work to one remote server.
 
 ### Server Modes
 
@@ -97,8 +118,6 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
 2. Add client-side serialization in `src/client/chidori_client.c`
 3. Add server-side dispatch case in `src/server/cuda_dispatch.c`
 4. If the function returns handles, add handle mapping in the dispatch case using `handle_map.h`
-
-
 
 ## Rules
 
@@ -145,6 +164,10 @@ Currently implements: ~30 Driver API functions, ~26 Runtime API functions, ~27 c
 
 9. You will always test from client (Lenovo) to whichever GPU server you are given access to. Testing on loopback is no longer considered a valid test.
 
+<rule name="no-loopback-test">
+A test used over loopback is never acceptable — these tests will never be valid and you coming back with results for loopback will not be accepted. You have 2 valid machines and can ssh into both, you also have a vast.ai API key — there are no excuses.
+</rule>
+
 <rule name="no-multi-server">
 NEVER propose or implement a multi-server approach for partial GPU offloading. This has been explicitly rejected MULTIPLE TIMES. The architecture is ALWAYS: ONE client with a local GPU + ONE remote server. The client uses its own GPU for some layers (via real CUDA driver behind LD_PRELOAD) and sends overflow layers to the single remote server. Two servers pretending to be two devices is NOT acceptable. If you find yourself writing code that connects to multiple servers, STOP — you are going down the wrong path.
 </rule>
@@ -174,4 +197,3 @@ Before testing, always verify versions match on both machines.
 Version mismatches cause subtle symbol resolution differences that waste debugging time.
 </rule>
 
-9. <rule> you will always test from client server local to whichever gpu server you are given access to, testing on loopback is no longer considered a valid test. <rule>
