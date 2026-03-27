@@ -1914,15 +1914,30 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             /* Get the real CUfunction from the runtime */
             cudaError_t rt_err = cudaGetFuncBySymbol(&func, stub);
             if (rt_err != cudaSuccess || !func) {
-                fprintf(stderr, "[cuda_dispatch] RegisterFunction: cudaGetFuncBySymbol failed for '%s' (err=%d)\n",
+                fprintf(stderr, "[cuda_dispatch] RegisterFunction: cudaGetFuncBySymbol failed for '%s' (err=%d), trying Driver API\n",
                         func_name, (int)rt_err);
-                /* Return success with 0 params — the function registration was accepted
-                 * but we couldn't resolve it yet. Send a minimal response. */
-                uint64_t f_handle = alloc_handle();
-                uint8_t empty_resp[16];
-                memset(empty_resp, 0, sizeof(empty_resp));
-                memcpy(empty_resp, &f_handle, 8);
-                return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, empty_resp, 16);
+                /* Fallback: try Driver API cuModuleGetFunction on ALL loaded modules.
+                 * The Runtime API may be broken but Driver API modules still work. */
+                for (int mi = 0; mi < g_modules.count && !func; mi++) {
+                    if (!(g_modules.vals[mi] & (1ULL << 63))) {
+                        /* Driver API module — try resolving function by name */
+                        CUmodule drv_mod = (CUmodule)(uintptr_t)g_modules.vals[mi];
+                        CUresult fr = cuModuleGetFunction(&func, drv_mod, func_name);
+                        if (fr == CUDA_SUCCESS && func) {
+                            fprintf(stderr, "[cuda_dispatch] RegisterFunction: Driver API fallback SUCCESS for '%s'\n", func_name);
+                        } else {
+                            func = NULL;
+                        }
+                    }
+                }
+                if (!func) {
+                    /* Still can't find it — return success with empty handle */
+                    uint64_t f_handle = alloc_handle();
+                    uint8_t empty_resp[16];
+                    memset(empty_resp, 0, sizeof(empty_resp));
+                    memcpy(empty_resp, &f_handle, 8);
+                    return chidori_send_response(fd, req->seq_num, (int32_t)CUDA_SUCCESS, empty_resp, 16);
+                }
             }
 
             if (s_verbose)
