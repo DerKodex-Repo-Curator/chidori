@@ -1890,7 +1890,10 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
             g_rt_RegisterFunction(rt_handle, (const char *)stub, (char *)func_name,
                                   (char *)func_name, -1, NULL, NULL, NULL, NULL, NULL);
 
-            /* Force runtime initialization so cudaGetFuncBySymbol can resolve the function */
+            /* Force runtime initialization so cudaGetFuncBySymbol can resolve the function.
+             * Re-establish driver context first — VMM/graph ops may have left it stale. */
+            ensure_device_context(0);
+            cudaGetLastError(); /* clear any stale runtime error */
             cudaSetDevice(0);
             cudaFree(0);
 
