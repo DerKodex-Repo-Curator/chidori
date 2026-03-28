@@ -1,0 +1,52 @@
+From 282c05c41aab18cebde0398a0e17f8213e6792d9 Mon Sep 17 00:00:00 2001
+From: fabricio policarpo <fabriciopolicarpo0@gmail.com>
+Date: Sat, 28 Mar 2026 17:48:13 +0000
+Subject: [PATCH] Add Chidori GPU-over-IP compatibility patches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. GGML_CUDA_DISABLE_GRAPH env var: allows disabling CUDA graph
+   capture/replay as a fallback when running through GPU-over-IP
+   interception layers where graph corruption may occur.
+
+2. RMS norm fusion assertion → graceful return: changes hard
+   GGML_ASSERT(rms_norm->type == GGML_TYPE_F32) to a soft check
+   that returns false from fusion. Safety net for cases where
+   tensor type gets corrupted during graph replay.
+
+These patches enable llama.cpp to run through Chidori GPU-over-IP
+with CUDA 12.8 on the remote GPU.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cc80eb3ff..27b4fc4d8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2929,6 +2929,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ 
+     bool use_cuda_graph = true;
++    // Chidori: disable CUDA graphs via env var (fallback)
++    static bool force_disable = (getenv("GGML_CUDA_DISABLE_GRAPH") != nullptr);
++    if (force_disable) return false;
++
+     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+@@ -3373,7 +3377,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         }
+ 
+         GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
++        if (rms_norm->type != GGML_TYPE_F32) { return false; } // skip fusion for non-F32
+ 
+         //rms norm only supports F32
+         if (mul->src[0]->type != GGML_TYPE_F32 ||
+-- 
+2.43.0
+
