@@ -303,6 +303,7 @@ static void *g_real_cuda_handle = NULL;   /* dlopen handle for real libcuda.so *
 static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so */
 static void *g_real_cublas_handle = NULL; /* dlopen handle for real libcublas.so */
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
+static void xlate_cache_invalidate(void); /* forward decl — defined after cuBLAS section */
 static int g_fatbin_passthrough = -1;    /* 1 if CHIDORI_FATBIN_PASSTHROUGH=1: skip all our fatbin tracking */
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
@@ -3059,6 +3060,9 @@ cudaError_t cudaDeviceSynchronize(void) {
         g_in_real_cuda++;
         CUresult cr = g_real.cuCtxSynchronize();
         g_in_real_cuda--;
+        /* Bump translation cache generation — local data may have changed
+         * (e.g., optimizer.step() updated weights on this device) */
+        xlate_cache_invalidate();
         g_last_error = (cudaError_t)cr;
         return (cudaError_t)cr;
     }
@@ -3528,15 +3532,41 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
 static uint64_t g_last_cublas_handle = 0; /* Track last cuBLAS handle for cublasLt translation */
 
 /*
- * translate_local_to_remote_ptr — translate a local GPU pointer for use on the remote server.
+ * Pointer translation cache for split-mode offload.
  *
- * In split-mode offload, cuBLAS GEMM parameters may contain pointers to allocations
- * on the local GPU. The remote server can't dereference these. This function checks
- * if a pointer belongs to a local device, and if so copies it to the remote server.
+ * When a cuBLAS/cuDNN call on the remote server references a pointer that lives
+ * on the local GPU, we must copy the data to the remote server first. Without
+ * caching, every GEMM call re-allocates + re-copies the same weight matrices
+ * (hundreds of MB per step), making training impossibly slow.
  *
- * Returns the remote pointer (adjusted for sub-allocation offset), or the original
- * pointer if no translation was needed.
+ * Cache strategy:
+ * - First encounter: sync malloc on remote + async HtoD copy → cache entry
+ * - Same allocation, same generation: instant return (no copy, no RPC)
+ * - Same allocation, stale generation: async HtoD update only (no malloc)
+ * - Generation bumps on cudaDeviceSynchronize(local) — marks data as potentially stale
+ *
+ * This reduces per-step overhead from N×(malloc+DtoH+HtoD) to N×(DtoH+HtoD) on first
+ * step, and to zero RPCs within a single forward+backward pass.
  */
+#define XLATE_CACHE_MAX 1024
+
+typedef struct {
+    uintptr_t local_base;    /* base of the local GPU allocation */
+    uint64_t  remote_base;   /* corresponding remote GPU allocation */
+    size_t    size;           /* allocation size */
+    uint64_t  generation;    /* generation when last copied */
+} xlate_cache_entry_t;
+
+static xlate_cache_entry_t g_xlate_cache[XLATE_CACHE_MAX];
+static int g_xlate_count = 0;
+static uint64_t g_xlate_generation = 1; /* bumped on local-device sync */
+
+/* Called from cudaDeviceSynchronize when syncing a local device.
+ * Bumps the generation so next translate knows data may have changed. */
+static void xlate_cache_invalidate(void) {
+    g_xlate_generation++;
+}
+
 static uint64_t translate_local_to_remote_ptr(uint64_t ptr_val) {
     if (!g_partial_offload || ptr_val == 0) return ptr_val;
     if (ptr_val <= 0x100000 || ptr_val >= 0x800000000000ULL) return ptr_val;
@@ -3546,50 +3576,92 @@ static uint64_t translate_local_to_remote_ptr(uint64_t ptr_val) {
 
     /* Find the allocation containing this pointer */
     pthread_mutex_lock(&g_alloc_track_lock);
+    uintptr_t base = 0;
+    size_t alloc_size = 0;
     for (int i = g_alloc_track_count - 1; i >= 0; i--) {
         if (ptr_val >= g_alloc_track[i].ptr &&
             ptr_val < g_alloc_track[i].ptr + g_alloc_track[i].size) {
-            size_t alloc_size = g_alloc_track[i].size;
-            uintptr_t base = g_alloc_track[i].ptr;
-            size_t offset_in_alloc = (size_t)(ptr_val - base);
-            pthread_mutex_unlock(&g_alloc_track_lock);
+            base = g_alloc_track[i].ptr;
+            alloc_size = g_alloc_track[i].size;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_alloc_track_lock);
+    if (!base) return ptr_val;
 
+    size_t offset_in_alloc = (size_t)(ptr_val - base);
+
+    /* Check cache — if we already translated this allocation this generation, instant return */
+    for (int i = 0; i < g_xlate_count; i++) {
+        if (g_xlate_cache[i].local_base == base && g_xlate_cache[i].size == alloc_size) {
+            if (g_xlate_cache[i].generation == g_xlate_generation) {
+                /* Cache hit, same generation — data unchanged, no copy needed */
+                return g_xlate_cache[i].remote_base + offset_in_alloc;
+            }
+            /* Cache hit, stale — remote allocation exists, just re-copy data */
             void *staging = malloc(alloc_size);
-            if (!staging) return ptr_val;
+            if (!staging) return g_xlate_cache[i].remote_base + offset_in_alloc;
 
-            /* DtoH from local GPU (bypasses Chidori interception) */
             g_in_real_cuda++;
             if (g_real.cuMemcpyDtoH_v2)
                 g_real.cuMemcpyDtoH_v2(staging, (CUdeviceptr)base, alloc_size);
             g_in_real_cuda--;
 
-            /* Allocate on remote server */
-            uint64_t remote_size = (uint64_t)alloc_size;
-            uint64_t remote_ptr = 0;
-            size_t rlen = sizeof(remote_ptr);
-            chidori_rpc(CHIDORI_CUDA_MALLOC, &remote_size, sizeof(remote_size),
-                       &remote_ptr, &rlen);
-
-            if (remote_ptr) {
-                /* HtoD to remote server */
-                size_t htod_len = 16 + alloc_size;
-                void *htod_payload = malloc(htod_len);
-                if (htod_payload) {
-                    memcpy(htod_payload, &remote_ptr, 8);
-                    uint64_t sz = (uint64_t)alloc_size;
-                    memcpy((char *)htod_payload + 8, &sz, 8);
-                    memcpy((char *)htod_payload + 16, staging, alloc_size);
-                    chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
-                    free(htod_payload);
-                }
-                free(staging);
-                return remote_ptr + offset_in_alloc;
+            size_t htod_len = 16 + alloc_size;
+            void *htod_payload = malloc(htod_len);
+            if (htod_payload) {
+                memcpy(htod_payload, &g_xlate_cache[i].remote_base, 8);
+                uint64_t sz = (uint64_t)alloc_size;
+                memcpy((char *)htod_payload + 8, &sz, 8);
+                memcpy((char *)htod_payload + 16, staging, alloc_size);
+                chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+                free(htod_payload);
             }
             free(staging);
-            return ptr_val;
+            g_xlate_cache[i].generation = g_xlate_generation;
+            return g_xlate_cache[i].remote_base + offset_in_alloc;
         }
     }
-    pthread_mutex_unlock(&g_alloc_track_lock);
+
+    /* Cache miss — first time seeing this allocation. Malloc on remote + copy. */
+    void *staging = malloc(alloc_size);
+    if (!staging) return ptr_val;
+
+    g_in_real_cuda++;
+    if (g_real.cuMemcpyDtoH_v2)
+        g_real.cuMemcpyDtoH_v2(staging, (CUdeviceptr)base, alloc_size);
+    g_in_real_cuda--;
+
+    uint64_t remote_size = (uint64_t)alloc_size;
+    uint64_t remote_ptr = 0;
+    size_t rlen = sizeof(remote_ptr);
+    chidori_rpc(CHIDORI_CUDA_MALLOC, &remote_size, sizeof(remote_size),
+               &remote_ptr, &rlen);
+
+    if (remote_ptr) {
+        size_t htod_len = 16 + alloc_size;
+        void *htod_payload = malloc(htod_len);
+        if (htod_payload) {
+            memcpy(htod_payload, &remote_ptr, 8);
+            uint64_t sz = (uint64_t)alloc_size;
+            memcpy((char *)htod_payload + 8, &sz, 8);
+            memcpy((char *)htod_payload + 16, staging, alloc_size);
+            chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+            free(htod_payload);
+        }
+        free(staging);
+
+        /* Add to cache */
+        if (g_xlate_count < XLATE_CACHE_MAX) {
+            g_xlate_cache[g_xlate_count].local_base = base;
+            g_xlate_cache[g_xlate_count].remote_base = remote_ptr;
+            g_xlate_cache[g_xlate_count].size = alloc_size;
+            g_xlate_cache[g_xlate_count].generation = g_xlate_generation;
+            g_xlate_count++;
+        }
+        return remote_ptr + offset_in_alloc;
+    }
+    free(staging);
     return ptr_val;
 }
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
