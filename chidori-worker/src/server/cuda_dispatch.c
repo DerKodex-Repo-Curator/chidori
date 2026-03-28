@@ -687,6 +687,33 @@ int cuda_dispatch(int fd, chidori_request_t *req, void *payload) {
         return chidori_send_response(fd, req->seq_num, res, NULL, 0);
     }
 
+    case CHIDORI_CU_MEMCPY_H_TO_D_ZSTD: {
+        /* Payload: dst(8) + decomp_size(8) + comp_size(8) + compressed_data */
+        if (req->payload_size < 24) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+        uint64_t dst = 0, decomp_size = 0, comp_size = 0;
+        memcpy(&dst, payload, 8);
+        memcpy(&decomp_size, (char *)payload + 8, 8);
+        memcpy(&comp_size, (char *)payload + 16, 8);
+
+        void *decompressed = malloc((size_t)decomp_size);
+        if (!decompressed) {
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_OUT_OF_MEMORY, NULL, 0);
+        }
+
+        size_t result = ZSTD_decompress(decompressed, (size_t)decomp_size,
+                                         (char *)payload + 24, (size_t)comp_size);
+        if (ZSTD_isError(result)) {
+            free(decompressed);
+            return chidori_send_response(fd, req->seq_num, CUDA_ERROR_INVALID_VALUE, NULL, 0);
+        }
+
+        res = cuMemcpyHtoD((CUdeviceptr)dst, decompressed, (size_t)decomp_size);
+        free(decompressed);
+        return chidori_send_response(fd, req->seq_num, res, NULL, 0);
+    }
+
     case CHIDORI_CU_MEMCPY_D_TO_H:
     case CHIDORI_CU_MEMCPY_D_TO_H_ASYNC: {
         /* Payload: src(8) + size(8) */

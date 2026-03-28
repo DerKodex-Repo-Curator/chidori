@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <zstd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
@@ -1707,6 +1708,39 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
     return chidori_rpc_async(CHIDORI_CU_MEM_FREE, &ptr, sizeof(ptr));
 }
 
+/* Try to compress and send HtoD data via zstd. Returns 0 if compressed and sent,
+ * -1 if caller should fall back to uncompressed path. */
+static int send_htod_zstd(uint64_t dst, const void *data, size_t size) {
+    if (size <= 4096) return -1; /* too small to bother */
+
+    size_t bound = ZSTD_compressBound(size);
+    void *compressed = malloc(bound);
+    if (!compressed) return -1;
+
+    size_t csize = ZSTD_compress(compressed, bound, data, size, 1);
+    if (ZSTD_isError(csize) || csize >= size * 9 / 10) {
+        free(compressed);
+        return -1; /* compression not worth it */
+    }
+
+    /* Payload: dst(8) + decomp_size(8) + comp_size(8) + compressed_data */
+    size_t pl = 24 + csize;
+    void *payload = malloc(pl);
+    if (!payload) { free(compressed); return -1; }
+
+    memcpy(payload, &dst, 8);
+    uint64_t ds = size;
+    memcpy((char*)payload + 8, &ds, 8);
+    uint64_t cs = csize;
+    memcpy((char*)payload + 16, &cs, 8);
+    memcpy((char*)payload + 24, compressed, csize);
+
+    chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D_ZSTD, payload, pl);
+    free(payload);
+    free(compressed);
+    return 0;
+}
+
 CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byteCount) {
     if (g_in_real_cuda > 0 && g_real.cuMemcpyHtoD_v2) return g_real.cuMemcpyHtoD_v2(dstDevice, srcHost, byteCount); /* reentrance guard */
     /* Local device: copy to real local GPU */
@@ -1716,6 +1750,9 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t byte
         g_in_real_cuda--;
         return r;
     }
+    /* Try compressed path first */
+    if (send_htod_zstd((uint64_t)dstDevice, srcHost, byteCount) == 0)
+        return CUDA_SUCCESS;
     /* Payload: dst_ptr(8) + size(8) + data(byteCount) */
     size_t payload_len = 16 + byteCount;
     void *payload = malloc(payload_len);
@@ -1778,14 +1815,16 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t by
                 r = g_real.cuMemcpyDtoH_v2(staging, srcDevice, byteCount);
                 g_in_real_cuda--;
                 if (r == CUDA_SUCCESS) {
-                    size_t pl = 16 + byteCount;
-                    void *payload = malloc(pl);
-                    memcpy(payload, &dstDevice, 8);
-                    uint64_t sz = (uint64_t)byteCount;
-                    memcpy((char *)payload + 8, &sz, 8);
-                    memcpy((char *)payload + 16, staging, byteCount);
-                    r = chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, payload, pl);
-                    free(payload);
+                    if (send_htod_zstd((uint64_t)dstDevice, staging, byteCount) != 0) {
+                        size_t pl = 16 + byteCount;
+                        void *payload = malloc(pl);
+                        memcpy(payload, &dstDevice, 8);
+                        uint64_t sz = (uint64_t)byteCount;
+                        memcpy((char *)payload + 8, &sz, 8);
+                        memcpy((char *)payload + 16, staging, byteCount);
+                        r = chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, payload, pl);
+                        free(payload);
+                    }
                 }
             } else {
                 /* src=remote → DtoH via RPC, HtoD via real driver */
@@ -2068,15 +2107,17 @@ CUresult cuLaunchKernel(CUfunction f,
                                            &remote_ptr, &rlen);
 
                                 if (remote_ptr) {
-                                    /* HtoD to remote */
-                                    size_t htod_len = 16 + alloc_size;
-                                    void *htod_payload = malloc(htod_len);
-                                    memcpy(htod_payload, &remote_ptr, 8);
-                                    uint64_t sz = (uint64_t)alloc_size;
-                                    memcpy((char *)htod_payload + 8, &sz, 8);
-                                    memcpy((char *)htod_payload + 16, staging, alloc_size);
-                                    chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
-                                    free(htod_payload);
+                                    /* HtoD to remote — try compressed first */
+                                    if (send_htod_zstd(remote_ptr, staging, alloc_size) != 0) {
+                                        size_t htod_len = 16 + alloc_size;
+                                        void *htod_payload = malloc(htod_len);
+                                        memcpy(htod_payload, &remote_ptr, 8);
+                                        uint64_t sz = (uint64_t)alloc_size;
+                                        memcpy((char *)htod_payload + 8, &sz, 8);
+                                        memcpy((char *)htod_payload + 16, staging, alloc_size);
+                                        chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+                                        free(htod_payload);
+                                    }
 
                                     /* Substitute pointer in param buffer */
                                     uint64_t new_val = remote_ptr + offset_in_alloc;
@@ -2747,7 +2788,12 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
             }
         }
 
-        /* Standard path: dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + data(count) */
+        /* Standard path: try compressed first */
+        if (send_htod_zstd((uint64_t)(uintptr_t)dst, src, count) == 0) {
+            r = cudaSuccess;
+            break;
+        }
+        /* Fallback: uncompressed dst_ptr(8) + src_ptr(8=0) + size(8) + kind(4) + data(count) */
         size_t payload_len = 8 + 8 + 8 + 4 + count;
         void *payload = malloc(payload_len);
         if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
@@ -2921,7 +2967,12 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
             }
         }
 
-        /* Standard async path */
+        /* Standard async path: try compressed first */
+        if (send_htod_zstd((uint64_t)(uintptr_t)dst, src, count) == 0) {
+            r = cudaSuccess;
+            break;
+        }
+        /* Fallback: uncompressed */
         size_t payload_len = 8 + 8 + 8 + 4 + 8 + count;
         void *payload = malloc(payload_len);
         if (!payload) { g_last_error = CUDA_ERROR_INVALID_VALUE; return CUDA_ERROR_INVALID_VALUE; }
@@ -3607,15 +3658,17 @@ static uint64_t translate_local_to_remote_ptr(uint64_t ptr_val) {
                 g_real.cuMemcpyDtoH_v2(staging, (CUdeviceptr)base, alloc_size);
             g_in_real_cuda--;
 
-            size_t htod_len = 16 + alloc_size;
-            void *htod_payload = malloc(htod_len);
-            if (htod_payload) {
-                memcpy(htod_payload, &g_xlate_cache[i].remote_base, 8);
-                uint64_t sz = (uint64_t)alloc_size;
-                memcpy((char *)htod_payload + 8, &sz, 8);
-                memcpy((char *)htod_payload + 16, staging, alloc_size);
-                chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
-                free(htod_payload);
+            if (send_htod_zstd(g_xlate_cache[i].remote_base, staging, alloc_size) != 0) {
+                size_t htod_len = 16 + alloc_size;
+                void *htod_payload = malloc(htod_len);
+                if (htod_payload) {
+                    memcpy(htod_payload, &g_xlate_cache[i].remote_base, 8);
+                    uint64_t sz = (uint64_t)alloc_size;
+                    memcpy((char *)htod_payload + 8, &sz, 8);
+                    memcpy((char *)htod_payload + 16, staging, alloc_size);
+                    chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+                    free(htod_payload);
+                }
             }
             free(staging);
             g_xlate_cache[i].generation = g_xlate_generation;
@@ -3639,15 +3692,17 @@ static uint64_t translate_local_to_remote_ptr(uint64_t ptr_val) {
                &remote_ptr, &rlen);
 
     if (remote_ptr) {
-        size_t htod_len = 16 + alloc_size;
-        void *htod_payload = malloc(htod_len);
-        if (htod_payload) {
-            memcpy(htod_payload, &remote_ptr, 8);
-            uint64_t sz = (uint64_t)alloc_size;
-            memcpy((char *)htod_payload + 8, &sz, 8);
-            memcpy((char *)htod_payload + 16, staging, alloc_size);
-            chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
-            free(htod_payload);
+        if (send_htod_zstd(remote_ptr, staging, alloc_size) != 0) {
+            size_t htod_len = 16 + alloc_size;
+            void *htod_payload = malloc(htod_len);
+            if (htod_payload) {
+                memcpy(htod_payload, &remote_ptr, 8);
+                uint64_t sz = (uint64_t)alloc_size;
+                memcpy((char *)htod_payload + 8, &sz, 8);
+                memcpy((char *)htod_payload + 16, staging, alloc_size);
+                chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+                free(htod_payload);
+            }
         }
         free(staging);
 

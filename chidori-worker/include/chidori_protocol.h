@@ -120,6 +120,7 @@ typedef enum {
     CHIDORI_CU_POINTER_GET_ATTRIBUTE     = 0x007F,
     CHIDORI_CU_MEM_ALLOC_MANAGED         = 0x0080,
     CHIDORI_CU_MEMCPY                    = 0x0081,
+    CHIDORI_CU_MEMCPY_H_TO_D_ZSTD        = 0x0082,
 
     /* Execution Control (0x00A0 - 0x00BF) */
     CHIDORI_CU_LAUNCH_KERNEL             = 0x00A0,
