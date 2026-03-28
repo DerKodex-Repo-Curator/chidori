@@ -303,6 +303,7 @@ static void *g_real_cuda_handle = NULL;   /* dlopen handle for real libcuda.so *
 static void *g_real_cudart_handle = NULL; /* dlopen handle for real libcudart.so */
 static void *g_real_cublas_handle = NULL; /* dlopen handle for real libcublas.so */
 static int g_partial_offload = 0;         /* 1 if CHIDORI_LOCAL_DEVICES is set */
+static void xlate_cache_invalidate(void); /* forward decl — defined after cuBLAS section */
 static int g_fatbin_passthrough = -1;    /* 1 if CHIDORI_FATBIN_PASSTHROUGH=1: skip all our fatbin tracking */
 static int g_device_count_cache = -1;    /* cached device count, -1 = not cached */
 static int g_real_cuda_inited = 0;       /* 1 after real cuInit(0) called */
@@ -3059,6 +3060,9 @@ cudaError_t cudaDeviceSynchronize(void) {
         g_in_real_cuda++;
         CUresult cr = g_real.cuCtxSynchronize();
         g_in_real_cuda--;
+        /* Bump translation cache generation — local data may have changed
+         * (e.g., optimizer.step() updated weights on this device) */
+        xlate_cache_invalidate();
         g_last_error = (cudaError_t)cr;
         return (cudaError_t)cr;
     }
@@ -3526,6 +3530,140 @@ static cublasHandle_t ensure_local_cublas_handle(void) {
 }
 
 static uint64_t g_last_cublas_handle = 0; /* Track last cuBLAS handle for cublasLt translation */
+
+/*
+ * Pointer translation cache for split-mode offload.
+ *
+ * When a cuBLAS/cuDNN call on the remote server references a pointer that lives
+ * on the local GPU, we must copy the data to the remote server first. Without
+ * caching, every GEMM call re-allocates + re-copies the same weight matrices
+ * (hundreds of MB per step), making training impossibly slow.
+ *
+ * Cache strategy:
+ * - First encounter: sync malloc on remote + async HtoD copy → cache entry
+ * - Same allocation, same generation: instant return (no copy, no RPC)
+ * - Same allocation, stale generation: async HtoD update only (no malloc)
+ * - Generation bumps on cudaDeviceSynchronize(local) — marks data as potentially stale
+ *
+ * This reduces per-step overhead from N×(malloc+DtoH+HtoD) to N×(DtoH+HtoD) on first
+ * step, and to zero RPCs within a single forward+backward pass.
+ */
+#define XLATE_CACHE_MAX 1024
+
+typedef struct {
+    uintptr_t local_base;    /* base of the local GPU allocation */
+    uint64_t  remote_base;   /* corresponding remote GPU allocation */
+    size_t    size;           /* allocation size */
+    uint64_t  generation;    /* generation when last copied */
+} xlate_cache_entry_t;
+
+static xlate_cache_entry_t g_xlate_cache[XLATE_CACHE_MAX];
+static int g_xlate_count = 0;
+static uint64_t g_xlate_generation = 1; /* bumped on local-device sync */
+
+/* Called from cudaDeviceSynchronize when syncing a local device.
+ * Bumps the generation so next translate knows data may have changed. */
+static void xlate_cache_invalidate(void) {
+    g_xlate_generation++;
+}
+
+static uint64_t translate_local_to_remote_ptr(uint64_t ptr_val) {
+    if (!g_partial_offload || ptr_val == 0) return ptr_val;
+    if (ptr_val <= 0x100000 || ptr_val >= 0x800000000000ULL) return ptr_val;
+
+    int dev = alloc_track_device((uintptr_t)ptr_val);
+    if (dev < 0 || !is_local_device(dev)) return ptr_val;
+
+    /* Find the allocation containing this pointer */
+    pthread_mutex_lock(&g_alloc_track_lock);
+    uintptr_t base = 0;
+    size_t alloc_size = 0;
+    for (int i = g_alloc_track_count - 1; i >= 0; i--) {
+        if (ptr_val >= g_alloc_track[i].ptr &&
+            ptr_val < g_alloc_track[i].ptr + g_alloc_track[i].size) {
+            base = g_alloc_track[i].ptr;
+            alloc_size = g_alloc_track[i].size;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_alloc_track_lock);
+    if (!base) return ptr_val;
+
+    size_t offset_in_alloc = (size_t)(ptr_val - base);
+
+    /* Check cache — if we already translated this allocation this generation, instant return */
+    for (int i = 0; i < g_xlate_count; i++) {
+        if (g_xlate_cache[i].local_base == base && g_xlate_cache[i].size == alloc_size) {
+            if (g_xlate_cache[i].generation == g_xlate_generation) {
+                /* Cache hit, same generation — data unchanged, no copy needed */
+                return g_xlate_cache[i].remote_base + offset_in_alloc;
+            }
+            /* Cache hit, stale — remote allocation exists, just re-copy data */
+            void *staging = malloc(alloc_size);
+            if (!staging) return g_xlate_cache[i].remote_base + offset_in_alloc;
+
+            g_in_real_cuda++;
+            if (g_real.cuMemcpyDtoH_v2)
+                g_real.cuMemcpyDtoH_v2(staging, (CUdeviceptr)base, alloc_size);
+            g_in_real_cuda--;
+
+            size_t htod_len = 16 + alloc_size;
+            void *htod_payload = malloc(htod_len);
+            if (htod_payload) {
+                memcpy(htod_payload, &g_xlate_cache[i].remote_base, 8);
+                uint64_t sz = (uint64_t)alloc_size;
+                memcpy((char *)htod_payload + 8, &sz, 8);
+                memcpy((char *)htod_payload + 16, staging, alloc_size);
+                chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+                free(htod_payload);
+            }
+            free(staging);
+            g_xlate_cache[i].generation = g_xlate_generation;
+            return g_xlate_cache[i].remote_base + offset_in_alloc;
+        }
+    }
+
+    /* Cache miss — first time seeing this allocation. Malloc on remote + copy. */
+    void *staging = malloc(alloc_size);
+    if (!staging) return ptr_val;
+
+    g_in_real_cuda++;
+    if (g_real.cuMemcpyDtoH_v2)
+        g_real.cuMemcpyDtoH_v2(staging, (CUdeviceptr)base, alloc_size);
+    g_in_real_cuda--;
+
+    uint64_t remote_size = (uint64_t)alloc_size;
+    uint64_t remote_ptr = 0;
+    size_t rlen = sizeof(remote_ptr);
+    chidori_rpc(CHIDORI_CUDA_MALLOC, &remote_size, sizeof(remote_size),
+               &remote_ptr, &rlen);
+
+    if (remote_ptr) {
+        size_t htod_len = 16 + alloc_size;
+        void *htod_payload = malloc(htod_len);
+        if (htod_payload) {
+            memcpy(htod_payload, &remote_ptr, 8);
+            uint64_t sz = (uint64_t)alloc_size;
+            memcpy((char *)htod_payload + 8, &sz, 8);
+            memcpy((char *)htod_payload + 16, staging, alloc_size);
+            chidori_rpc_async(CHIDORI_CU_MEMCPY_H_TO_D, htod_payload, htod_len);
+            free(htod_payload);
+        }
+        free(staging);
+
+        /* Add to cache */
+        if (g_xlate_count < XLATE_CACHE_MAX) {
+            g_xlate_cache[g_xlate_count].local_base = base;
+            g_xlate_cache[g_xlate_count].remote_base = remote_ptr;
+            g_xlate_cache[g_xlate_count].size = alloc_size;
+            g_xlate_cache[g_xlate_count].generation = g_xlate_generation;
+            g_xlate_count++;
+        }
+        return remote_ptr + offset_in_alloc;
+    }
+    free(staging);
+    return ptr_val;
+}
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
     { char _b[128]; int _l = snprintf(_b, sizeof(_b), "[TRACE] cublasCreate_v2 dev=%d local=%d\n", g_current_device, is_local_device(g_current_device));
       if (_l > 0) write(STDERR_FILENO, _b, _l); }
@@ -3731,12 +3869,12 @@ cublasStatus_t cublasSgemm_v2(cublasHandle_t handle,
     req.transb = (int32_t)transb;
     req.m = m; req.n = n; req.k = k;
     req.alpha = *alpha;
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.lda = lda;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.ldb = ldb;
     req.beta = *beta;
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.ldc = ldc;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMM, &req, sizeof(req));
@@ -3788,12 +3926,12 @@ cublasStatus_t cublasDgemm_v2(cublasHandle_t handle,
     req.transb = (int32_t)transb;
     req.m = m; req.n = n; req.k = k;
     req.alpha = *alpha;
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.lda = lda;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.ldb = ldb;
     req.beta = *beta;
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.ldc = ldc;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DGEMM, &req, sizeof(req));
@@ -3845,12 +3983,12 @@ cublasStatus_t cublasHgemm(cublasHandle_t handle,
     req.transb = (int32_t)transb;
     req.m = m; req.n = n; req.k = k;
     memcpy(&req.alpha, alpha, 2);
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.lda = lda;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.ldb = ldb;
     memcpy(&req.beta, beta, 2);
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.ldc = ldc;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_HGEMM, &req, sizeof(req));
@@ -3901,12 +4039,12 @@ cublasStatus_t cublasSgemmEx(cublasHandle_t handle,
     req.transb = (int32_t)transb;
     req.m = m; req.n = n; req.k = k;
     req.alpha = *alpha;
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.Atype = Atype; req.lda = lda;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.Btype = Btype; req.ldb = ldb;
     req.beta = *beta;
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.Ctype = Ctype; req.ldc = ldc;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMM_EX, &req, sizeof(req));
@@ -3975,12 +4113,12 @@ cublasStatus_t cublasGemmEx(cublasHandle_t handle,
 
     size_t scalar_sz = chidori_cublas_scalar_size(computeType);
     memcpy(req.alpha, alpha, scalar_sz);
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.Atype = Atype; req.lda = lda;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.Btype = Btype; req.ldb = ldb;
     memcpy(req.beta, beta, scalar_sz);
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.Ctype = Ctype; req.ldc = ldc;
     req.computeType = computeType;
     req.algo = algo;
@@ -4033,12 +4171,12 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t handle,
     req.trans = (int32_t)trans;
     req.m = m; req.n = n;
     req.alpha = *alpha;
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.lda = lda;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
     req.beta = *beta;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SGEMV, &req, sizeof(req));
@@ -4085,12 +4223,12 @@ cublasStatus_t cublasDgemv_v2(cublasHandle_t handle,
     req.trans = (int32_t)trans;
     req.m = m; req.n = n;
     req.alpha = *alpha;
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.lda = lda;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
     req.beta = *beta;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DGEMV, &req, sizeof(req));
@@ -4131,9 +4269,9 @@ cublasStatus_t cublasSaxpy_v2(cublasHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
     req.alpha = *alpha;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SAXPY, &req, sizeof(req));
@@ -4171,9 +4309,9 @@ cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
     req.alpha = *alpha;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DAXPY, &req, sizeof(req));
@@ -4209,7 +4347,7 @@ cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle,
 
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
 
     size_t len = sizeof(float);
@@ -4242,7 +4380,7 @@ cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle,
 
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
 
     size_t len = sizeof(double);
@@ -4281,9 +4419,9 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle,
 
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     size_t len = sizeof(float);
@@ -4319,9 +4457,9 @@ cublasStatus_t cublasDdot_v2(cublasHandle_t handle,
 
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     size_t len = sizeof(double);
@@ -4359,7 +4497,7 @@ cublasStatus_t cublasSscal_v2(cublasHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
     req.alpha = *alpha;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SSCAL, &req, sizeof(req));
@@ -4393,7 +4531,7 @@ cublasStatus_t cublasDscal_v2(cublasHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
     req.alpha = *alpha;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DSCAL, &req, sizeof(req));
@@ -4430,9 +4568,9 @@ cublasStatus_t cublasScopy_v2(cublasHandle_t handle,
 
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_SCOPY, &req, sizeof(req));
@@ -4466,9 +4604,9 @@ cublasStatus_t cublasDcopy_v2(cublasHandle_t handle,
 
     req.handle = (uint64_t)(uintptr_t)handle;
     req.n = n;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.incx = incx;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.incy = incy;
 
     return (cublasStatus_t)chidori_rpc_async(CHIDORI_CUBLAS_DCOPY, &req, sizeof(req));
@@ -4536,17 +4674,17 @@ cublasStatus_t cublasSgemmBatched(cublasHandle_t handle,
     memcpy(p, &ldc32, 4); p += 4;
     memcpy(p, &bc32, 4); p += 4;
 
-    /* Copy device pointer arrays */
+    /* Copy device pointer arrays — translate local pointers for split-mode */
     for (int i = 0; i < batchCount; i++) {
-        uint64_t ptr = (uint64_t)(uintptr_t)Aarray[i];
+        uint64_t ptr = translate_local_to_remote_ptr((uint64_t)(uintptr_t)Aarray[i]);
         memcpy(p, &ptr, 8); p += 8;
     }
     for (int i = 0; i < batchCount; i++) {
-        uint64_t ptr = (uint64_t)(uintptr_t)Barray[i];
+        uint64_t ptr = translate_local_to_remote_ptr((uint64_t)(uintptr_t)Barray[i]);
         memcpy(p, &ptr, 8); p += 8;
     }
     for (int i = 0; i < batchCount; i++) {
-        uint64_t ptr = (uint64_t)(uintptr_t)Carray[i];
+        uint64_t ptr = translate_local_to_remote_ptr((uint64_t)(uintptr_t)Carray[i]);
         memcpy(p, &ptr, 8); p += 8;
     }
 
@@ -4605,14 +4743,14 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
     req.transb = (int32_t)transb;
     req.m = m; req.n = n; req.k = k;
     req.alpha = *alpha;
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.lda = lda;
     req.strideA = (int64_t)strideA;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.ldb = ldb;
     req.strideB = (int64_t)strideB;
     req.beta = *beta;
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.ldc = ldc;
     req.strideC = (int64_t)strideC;
     req.batchCount = batchCount;
@@ -4675,14 +4813,14 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
 
     size_t scalar_sz = chidori_cublas_scalar_size(computeType);
     memcpy(req.alpha, alpha, scalar_sz);
-    req.A = (uint64_t)(uintptr_t)A;
+    req.A = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
     req.Atype = Atype; req.lda = lda;
     req.strideA = (int64_t)strideA;
-    req.B = (uint64_t)(uintptr_t)B;
+    req.B = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
     req.Btype = Btype; req.ldb = ldb;
     req.strideB = (int64_t)strideB;
     memcpy(req.beta, beta, scalar_sz);
-    req.C = (uint64_t)(uintptr_t)C;
+    req.C = translate_local_to_remote_ptr((uint64_t)(uintptr_t)C);
     req.Ctype = Ctype; req.ldc = ldc;
     req.strideC = (int64_t)strideC;
     req.batchCount = batchCount;
@@ -5214,16 +5352,16 @@ cudnnStatus_t cudnnConvolutionForward(cudnnHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     memcpy(req.alpha, alpha, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.wDesc = (uint64_t)(uintptr_t)wDesc;
-    req.w = (uint64_t)(uintptr_t)w;
+    req.w = translate_local_to_remote_ptr((uint64_t)(uintptr_t)w);
     req.convDesc = (uint64_t)(uintptr_t)convDesc;
     req.algo = (int32_t)algo;
-    req.workSpace = (uint64_t)(uintptr_t)workSpace;
+    req.workSpace = translate_local_to_remote_ptr((uint64_t)(uintptr_t)workSpace);
     req.workSpaceSizeInBytes = (uint64_t)workSpaceSizeInBytes;
     memcpy(req.beta, beta, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_CONVOLUTION_FORWARD,
                                            &req, sizeof(req));
@@ -5261,16 +5399,16 @@ cudnnStatus_t cudnnConvolutionBackwardData(cudnnHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     memcpy(req.alpha, alpha, 8);
     req.wDesc = (uint64_t)(uintptr_t)wDesc;
-    req.w = (uint64_t)(uintptr_t)w;
+    req.w = translate_local_to_remote_ptr((uint64_t)(uintptr_t)w);
     req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
-    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dy = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dy);
     req.convDesc = (uint64_t)(uintptr_t)convDesc;
     req.algo = (int32_t)algo;
-    req.workSpace = (uint64_t)(uintptr_t)workSpace;
+    req.workSpace = translate_local_to_remote_ptr((uint64_t)(uintptr_t)workSpace);
     req.workSpaceSizeInBytes = (uint64_t)workSpaceSizeInBytes;
     memcpy(req.beta, beta, 8);
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
-    req.dx = (uint64_t)(uintptr_t)dx;
+    req.dx = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dx);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_CONVOLUTION_BACKWARD_DATA,
                                            &req, sizeof(req));
@@ -5308,16 +5446,16 @@ cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t handle,
     req.handle = (uint64_t)(uintptr_t)handle;
     memcpy(req.alpha, alpha, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
-    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dy = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dy);
     req.convDesc = (uint64_t)(uintptr_t)convDesc;
     req.algo = (int32_t)algo;
-    req.workSpace = (uint64_t)(uintptr_t)workSpace;
+    req.workSpace = translate_local_to_remote_ptr((uint64_t)(uintptr_t)workSpace);
     req.workSpaceSizeInBytes = (uint64_t)workSpaceSizeInBytes;
     memcpy(req.beta, beta, 8);
     req.dwDesc = (uint64_t)(uintptr_t)dwDesc;
-    req.dw = (uint64_t)(uintptr_t)dw;
+    req.dw = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dw);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_CONVOLUTION_BACKWARD_FILTER,
                                            &req, sizeof(req));
@@ -5384,10 +5522,10 @@ cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
     req.activationDesc = (uint64_t)(uintptr_t)activationDesc;
     memcpy(req.alpha, alpha, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     memcpy(req.beta, beta, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_ACTIVATION_FORWARD,
                                            &req, sizeof(req));
@@ -5422,14 +5560,14 @@ cudnnStatus_t cudnnActivationBackward(cudnnHandle_t handle,
     req.activationDesc = (uint64_t)(uintptr_t)activationDesc;
     memcpy(req.alpha, alpha, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
-    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dy = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dy);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     memcpy(req.beta, beta, 8);
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
-    req.dx = (uint64_t)(uintptr_t)dx;
+    req.dx = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dx);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_ACTIVATION_BACKWARD,
                                            &req, sizeof(req));
@@ -5505,10 +5643,10 @@ cudnnStatus_t cudnnPoolingForward(cudnnHandle_t handle,
     req.poolingDesc = (uint64_t)(uintptr_t)poolingDesc;
     memcpy(req.alpha, alpha, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     memcpy(req.beta, beta, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_POOLING_FORWARD,
                                            &req, sizeof(req));
@@ -5543,14 +5681,14 @@ cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t handle,
     req.poolingDesc = (uint64_t)(uintptr_t)poolingDesc;
     memcpy(req.alpha, alpha, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
-    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dy = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dy);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     memcpy(req.beta, beta, 8);
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
-    req.dx = (uint64_t)(uintptr_t)dx;
+    req.dx = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dx);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_POOLING_BACKWARD,
                                            &req, sizeof(req));
@@ -5596,18 +5734,18 @@ cudnnStatus_t cudnnBatchNormalizationForwardTraining(cudnnHandle_t handle,
     memcpy(req.alpha, alpha, 8);
     memcpy(req.beta, beta, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.bnScaleBiasMeanVarDesc = (uint64_t)(uintptr_t)bnScaleBiasMeanVarDesc;
-    req.bnScale = (uint64_t)(uintptr_t)bnScale;
-    req.bnBias = (uint64_t)(uintptr_t)bnBias;
+    req.bnScale = translate_local_to_remote_ptr((uint64_t)(uintptr_t)bnScale);
+    req.bnBias = translate_local_to_remote_ptr((uint64_t)(uintptr_t)bnBias);
     req.exponentialAverageFactor = exponentialAverageFactor;
-    req.resultRunningMean = (uint64_t)(uintptr_t)resultRunningMean;
-    req.resultRunningVariance = (uint64_t)(uintptr_t)resultRunningVariance;
+    req.resultRunningMean = translate_local_to_remote_ptr((uint64_t)(uintptr_t)resultRunningMean);
+    req.resultRunningVariance = translate_local_to_remote_ptr((uint64_t)(uintptr_t)resultRunningVariance);
     req.epsilon = epsilon;
-    req.resultSaveMean = (uint64_t)(uintptr_t)resultSaveMean;
-    req.resultSaveInvVariance = (uint64_t)(uintptr_t)resultSaveInvVariance;
+    req.resultSaveMean = translate_local_to_remote_ptr((uint64_t)(uintptr_t)resultSaveMean);
+    req.resultSaveInvVariance = translate_local_to_remote_ptr((uint64_t)(uintptr_t)resultSaveInvVariance);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_BATCH_NORM_FORWARD_TRAINING,
                                            &req, sizeof(req));
@@ -5646,14 +5784,14 @@ cudnnStatus_t cudnnBatchNormalizationForwardInference(cudnnHandle_t handle,
     memcpy(req.alpha, alpha, 8);
     memcpy(req.beta, beta, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.bnScaleBiasMeanVarDesc = (uint64_t)(uintptr_t)bnScaleBiasMeanVarDesc;
-    req.bnScale = (uint64_t)(uintptr_t)bnScale;
-    req.bnBias = (uint64_t)(uintptr_t)bnBias;
-    req.estimatedMean = (uint64_t)(uintptr_t)estimatedMean;
-    req.estimatedVariance = (uint64_t)(uintptr_t)estimatedVariance;
+    req.bnScale = translate_local_to_remote_ptr((uint64_t)(uintptr_t)bnScale);
+    req.bnBias = translate_local_to_remote_ptr((uint64_t)(uintptr_t)bnBias);
+    req.estimatedMean = translate_local_to_remote_ptr((uint64_t)(uintptr_t)estimatedMean);
+    req.estimatedVariance = translate_local_to_remote_ptr((uint64_t)(uintptr_t)estimatedVariance);
     req.epsilon = epsilon;
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_BATCH_NORM_FORWARD_INFERENCE,
@@ -5703,18 +5841,18 @@ cudnnStatus_t cudnnBatchNormalizationBackward(cudnnHandle_t handle,
     memcpy(req.alphaParamDiff, alphaParamDiff, 8);
     memcpy(req.betaParamDiff, betaParamDiff, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
-    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dy = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dy);
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
-    req.dx = (uint64_t)(uintptr_t)dx;
+    req.dx = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dx);
     req.dBnScaleBiasDesc = (uint64_t)(uintptr_t)dBnScaleBiasDesc;
-    req.bnScale = (uint64_t)(uintptr_t)bnScale;
-    req.dBnScaleResult = (uint64_t)(uintptr_t)dBnScaleResult;
-    req.dBnBiasResult = (uint64_t)(uintptr_t)dBnBiasResult;
+    req.bnScale = translate_local_to_remote_ptr((uint64_t)(uintptr_t)bnScale);
+    req.dBnScaleResult = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dBnScaleResult);
+    req.dBnBiasResult = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dBnBiasResult);
     req.epsilon = epsilon;
-    req.savedMean = (uint64_t)(uintptr_t)savedMean;
-    req.savedInvVariance = (uint64_t)(uintptr_t)savedInvVariance;
+    req.savedMean = translate_local_to_remote_ptr((uint64_t)(uintptr_t)savedMean);
+    req.savedInvVariance = translate_local_to_remote_ptr((uint64_t)(uintptr_t)savedInvVariance);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_BATCH_NORM_BACKWARD,
                                            &req, sizeof(req));
@@ -5747,10 +5885,10 @@ cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t handle,
     req.mode = (int32_t)mode;
     memcpy(req.alpha, alpha, 8);
     req.xDesc = (uint64_t)(uintptr_t)xDesc;
-    req.x = (uint64_t)(uintptr_t)x;
+    req.x = translate_local_to_remote_ptr((uint64_t)(uintptr_t)x);
     memcpy(req.beta, beta, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SOFTMAX_FORWARD,
                                            &req, sizeof(req));
@@ -5784,12 +5922,12 @@ cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t handle,
     req.mode = (int32_t)mode;
     memcpy(req.alpha, alpha, 8);
     req.yDesc = (uint64_t)(uintptr_t)yDesc;
-    req.y = (uint64_t)(uintptr_t)y;
+    req.y = translate_local_to_remote_ptr((uint64_t)(uintptr_t)y);
     req.dyDesc = (uint64_t)(uintptr_t)dyDesc;
-    req.dy = (uint64_t)(uintptr_t)dy;
+    req.dy = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dy);
     memcpy(req.beta, beta, 8);
     req.dxDesc = (uint64_t)(uintptr_t)dxDesc;
-    req.dx = (uint64_t)(uintptr_t)dx;
+    req.dx = translate_local_to_remote_ptr((uint64_t)(uintptr_t)dx);
 
     return (cudnnStatus_t)chidori_rpc_async(CHIDORI_CUDNN_SOFTMAX_BACKWARD,
                                            &req, sizeof(req));
@@ -8401,12 +8539,12 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t lightHandle,
     memset(p, 0, 8);
     if (beta) memcpy(p, beta, 4);
     p += 8;
-    /* 40 bytes: A_ptr B_ptr C_ptr D_ptr stream */
+    /* 40 bytes: A_ptr B_ptr C_ptr D_ptr stream — translate local pointers for split-mode */
     uint64_t ptrs[5];
-    ptrs[0] = (uint64_t)(uintptr_t)A;
-    ptrs[1] = (uint64_t)(uintptr_t)B;
-    ptrs[2] = (uint64_t)(uintptr_t)(layC ? C : D);
-    ptrs[3] = (uint64_t)(uintptr_t)D;
+    ptrs[0] = translate_local_to_remote_ptr((uint64_t)(uintptr_t)A);
+    ptrs[1] = translate_local_to_remote_ptr((uint64_t)(uintptr_t)B);
+    ptrs[2] = translate_local_to_remote_ptr((uint64_t)(uintptr_t)(layC ? C : D));
+    ptrs[3] = translate_local_to_remote_ptr((uint64_t)(uintptr_t)D);
     ptrs[4] = (uint64_t)(uintptr_t)stream;
     memcpy(p, ptrs, 40); p += 40;
     /* 64 bytes: algo */
