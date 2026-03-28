@@ -2522,6 +2522,7 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     SET_INT(612, 37);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth (offset 612 in CUDA 12.8) */
     SET_INT(624, 39);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
     SET_INT(648, 82);     /* regsPerMultiprocessor = cudaDevAttrMaxRegistersPerMultiprocessor */
+    SET_SIZE_T(696, 97);  /* sharedMemPerBlockOptin = cudaDevAttrMaxSharedMemoryPerBlockOptin (offset 696 in CUDA 12.8) */
 
     #undef SET_INT
     #undef SET_SIZE_T
@@ -7054,13 +7055,16 @@ cudaError_t cudaGraphInstantiate(void **pGraphExec, void *graph,
 }
 
 cudaError_t cudaGraphExecUpdate(void *hGraphExec, void *hGraph,
-                                 void *hErrorNode_out, int *updateResult_out) {
-    (void)hErrorNode_out;
+                                 void *pResultInfo) {
     struct __attribute__((packed)) { uint64_t exec; uint64_t graph; } req;
     req.exec = (uint64_t)(uintptr_t)hGraphExec;
     req.graph = (uint64_t)(uintptr_t)hGraph;
     CUresult r = chidori_rpc(CHIDORI_CU_GRAPH_EXEC_UPDATE, &req, sizeof(req), NULL, NULL);
-    if (updateResult_out) *updateResult_out = (r == CUDA_SUCCESS) ? 0 : 1;
+    /* CUDA 12.x: pResultInfo is cudaGraphExecUpdateResultInfo*
+     * Do NOT write through it — the server-side update result is conveyed
+     * via the RPC return code. Writing through a stale/garbage 4th argument
+     * (from the old CUDA 11 4-param signature) was corrupting heap memory. */
+    (void)pResultInfo;
     g_last_error = (cudaError_t)r;
     return (cudaError_t)r;
 }
