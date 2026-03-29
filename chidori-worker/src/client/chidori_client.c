@@ -404,6 +404,11 @@ static struct { uintptr_t ptr; size_t size; int device; } g_alloc_track[MAX_ALLO
 static int g_alloc_track_count = 0;
 static pthread_mutex_t g_alloc_track_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Kernel param-size cache — avoids sync RPC per cuLaunchKernel for PARAM_SIZE */
+#define MAX_PARAM_SIZE_CACHE 4096
+static struct { uint64_t func_handle; int param_size; } g_param_size_cache[MAX_PARAM_SIZE_CACHE];
+static int g_param_size_cache_count = 0;
+
 static void alloc_track_add(uintptr_t ptr, size_t size, int device) {
     pthread_mutex_lock(&g_alloc_track_lock);
     if (g_alloc_track_count < MAX_ALLOC_TRACK) {
@@ -1961,11 +1966,27 @@ CUresult cuFuncGetAttribute(int *pi, int attrib, CUfunction hfunc) {
         g_in_real_cuda--;
         return r;
     }
+    /* Cache PARAM_SIZE queries (attrib 74) — the value is constant per function */
+    uint64_t handle = (uint64_t)(uintptr_t)hfunc;
+    if (attrib == 74 /* CU_FUNC_ATTRIBUTE_PARAM_SIZE */) {
+        for (int i = 0; i < g_param_size_cache_count; i++) {
+            if (g_param_size_cache[i].func_handle == handle) {
+                *pi = g_param_size_cache[i].param_size;
+                return CUDA_SUCCESS;
+            }
+        }
+    }
     struct __attribute__((packed)) { int32_t attrib; uint64_t func; } req;
     req.attrib = attrib;
-    req.func = (uint64_t)(uintptr_t)hfunc;
+    req.func = handle;
     size_t len = sizeof(int32_t);
-    return chidori_rpc(CHIDORI_CU_FUNC_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
+    CUresult r = chidori_rpc(CHIDORI_CU_FUNC_GET_ATTRIBUTE, &req, sizeof(req), pi, &len);
+    if (r == CUDA_SUCCESS && attrib == 74 && g_param_size_cache_count < MAX_PARAM_SIZE_CACHE) {
+        g_param_size_cache[g_param_size_cache_count].func_handle = handle;
+        g_param_size_cache[g_param_size_cache_count].param_size = *pi;
+        g_param_size_cache_count++;
+    }
+    return r;
 }
 
 CUresult cuLaunchKernel(CUfunction f,
