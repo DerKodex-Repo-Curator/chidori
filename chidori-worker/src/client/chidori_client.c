@@ -9057,8 +9057,10 @@ cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t lightHandle,
 
     /* Heuristic cache: same matrix dims → same algorithm.
      * Eliminates a 50ms sync RPC round-trip per matmul.
-     * PyTorch calls with the same shapes every training step. */
-    #define HEUR_CACHE_SIZE 64
+     * PyTorch calls with the same shapes every training step.
+     * During inference, sequence length grows creating new dims —
+     * 64 entries was too small, causing cache misses and sync RPCs. */
+    #define HEUR_CACHE_SIZE 256
     static struct {
         uint8_t key[188];
         uint8_t result[100]; /* algoCount(4) + heuristicResult(96) */
