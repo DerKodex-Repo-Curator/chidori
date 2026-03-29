@@ -883,6 +883,18 @@ static uint32_t g_seq_num = 0;
 static int g_initialized = 0;
 
 /*
+ * Fork handling — critical for frameworks like vLLM that use multiprocessing
+ * (fork) to create EngineCore child processes. Without this, parent and child
+ * share the same TCP socket, corrupting the protocol.
+ */
+static void chidori_fork_child(void);
+
+__attribute__((constructor))
+static void chidori_register_fork_handler(void) {
+    pthread_atfork(NULL, NULL, chidori_fork_child);
+}
+
+/*
  * Connect to the Chidori GPU worker.
  * Parses CHIDORI_CFG_OVERRIDE for server address, or falls back to
  * connecting to the Agent's address directly.
@@ -9770,6 +9782,45 @@ CUresult cuTensorMapEncodeIm2col(void *tensorMap, int tensorRank,
     (void)pad; (void)stride; (void)dilation;
     (void)interleave; (void)swizzle; (void)l2promote; (void)oobFill;
     return (CUresult)801; /* CUDA_ERROR_NOT_SUPPORTED */
+}
+
+/*
+ * Fork child handler — resets all connection state so the child process
+ * establishes a fresh TCP connection to the GPU server on the next CUDA call.
+ * Without this, parent and child share the same socket, corrupting the protocol.
+ * (Forward-declared near g_server_fd; registered via constructor.)
+ */
+static void chidori_fork_child(void) {
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+    g_initialized = 0;
+    g_seq_num = 0;
+
+    /* Reinitialize mutexes (undefined state after fork in child) */
+    pthread_mutex_init(&g_lock, NULL);
+    pthread_mutex_init(&g_alloc_track_lock, NULL);
+
+    /* Clear handle caches — the new connection won't have these handles */
+    g_param_size_cache_count = 0;
+    g_attr_cache_count = 0;
+    g_event_track_count = 0;
+    g_alloc_track_count = 0;
+    g_event_pool_count = 0;
+    g_event_pool_inited = 0;
+
+    /* Reset deferred init and other state */
+    g_deferred_init = -1;
+    g_deferred_replay_done = 0;
+    g_real_cuda_initialized = 0;
+    g_cached_ctx_valid = 0;
+    g_driver_version_cached = 0;
+    g_runtime_version_cached = 0;
+    g_cuda_driver_version_cached = 0;
+    g_cublas_version_cached = 0;
+
+    LOG_DEBUG("fork() child handler: reset connection state, pid=%d", (int)getpid());
 }
 
 /*
