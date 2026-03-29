@@ -1894,9 +1894,18 @@ CUresult cuModuleLoadData(CUmodule *module, const void *image) {
     const unsigned char *data = (const unsigned char *)image;
 
     if (data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
-        /* ELF CUBIN — read size from ELF header (e_shoff + e_shnum * e_shentsize) */
-        /* For safety, send 64KB which covers most kernels */
-        image_len = 64 * 1024;
+        /* ELF CUBIN (used by Triton) — read actual size from ELF header */
+        /* ELF64: e_shoff at offset 40 (8 bytes), e_shentsize at 58 (2 bytes),
+         *         e_shnum at 60 (2 bytes). Total = e_shoff + e_shnum * e_shentsize */
+        uint64_t e_shoff;
+        uint16_t e_shentsize, e_shnum;
+        memcpy(&e_shoff, data + 40, 8);
+        memcpy(&e_shentsize, data + 58, 2);
+        memcpy(&e_shnum, data + 60, 2);
+        image_len = (size_t)(e_shoff + (uint64_t)e_shnum * e_shentsize);
+        /* Sanity: if ELF header parsing gives something unreasonable, cap it */
+        if (image_len < 64 || image_len > 100 * 1024 * 1024)
+            image_len = 64 * 1024;
     } else if (memcmp(data, "\xed\xfe\xba\xbe", 4) == 0 || memcmp(data, "\xba\xbe\xfe\xed", 4) == 0) {
         /* Fat binary magic */
         uint64_t fat_size;
@@ -9587,6 +9596,10 @@ static const char *g_intercepted_symbols[] = {
     "cuGetErrorString", "cuGetErrorName",
     "cuPointerGetAttribute",
     "cuGetExportTable",
+    "cuTensorMapEncodeTiled", "cuTensorMapEncodeIm2col",
+    "cuFuncSetCacheConfig", "cuFuncSetAttribute",
+    "cuModuleLoadDataEx", "cuModuleGetGlobal",
+    "cuOccupancyMaxActiveBlocksPerMultiprocessor",
     NULL
 };
 
@@ -9723,6 +9736,40 @@ cudaError_t cudaGetDriverEntryPointByVersion(const char *symbol, void **funcPtr,
     *funcPtr = NULL;
     if (queryResult) *queryResult = 0;
     return (cudaError_t)500;
+}
+
+/* ---- Tensor Memory Access (TMA) stubs ---- */
+/* cuTensorMapEncodeTiled: Required by vLLM's _C extension.
+ * TMA is only available on Hopper+ (sm_90+). Ampere (sm_86) doesn't support it.
+ * Return CUDA_ERROR_NOT_SUPPORTED so callers fall back to non-TMA paths. */
+CUresult cuTensorMapEncodeTiled(void *tensorMap, int tensorRank,
+                                CUdeviceptr globalAddress,
+                                const uint64_t *globalDim,
+                                const uint64_t *globalStrides,
+                                const uint32_t *boxDim,
+                                const uint32_t *boxStrides,
+                                int interleave, int swizzle, int l2promote,
+                                int oobFill) {
+    (void)tensorMap; (void)tensorRank; (void)globalAddress;
+    (void)globalDim; (void)globalStrides; (void)boxDim; (void)boxStrides;
+    (void)interleave; (void)swizzle; (void)l2promote; (void)oobFill;
+    return (CUresult)801; /* CUDA_ERROR_NOT_SUPPORTED */
+}
+
+CUresult cuTensorMapEncodeIm2col(void *tensorMap, int tensorRank,
+                                 CUdeviceptr globalAddress,
+                                 const uint64_t *globalDim,
+                                 const uint64_t *globalStrides,
+                                 const int *pixelDim,
+                                 const uint32_t *pad, const uint32_t *stride,
+                                 const uint32_t *dilation,
+                                 int interleave, int swizzle, int l2promote,
+                                 int oobFill) {
+    (void)tensorMap; (void)tensorRank; (void)globalAddress;
+    (void)globalDim; (void)globalStrides; (void)pixelDim;
+    (void)pad; (void)stride; (void)dilation;
+    (void)interleave; (void)swizzle; (void)l2promote; (void)oobFill;
+    return (CUresult)801; /* CUDA_ERROR_NOT_SUPPORTED */
 }
 
 /*

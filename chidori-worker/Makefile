@@ -28,7 +28,7 @@ all: server client
 
 server: $(BUILD_DIR)/chidori-worker
 
-client: $(BUILD_DIR)/libchidori.so $(BUILD_DIR)/libnvidia-ml.so.1 $(BUILD_DIR)/libcublas.so.12 $(BUILD_DIR)/libcublasLt.so.12 $(BUILD_DIR)/libcublas.so.13 $(BUILD_DIR)/libcublasLt.so.13
+client: $(BUILD_DIR)/libchidori.so $(BUILD_DIR)/libnvidia-ml.so.1 $(BUILD_DIR)/libcublas.so.12 $(BUILD_DIR)/libcublasLt.so.12 $(BUILD_DIR)/libcublas.so.13 $(BUILD_DIR)/libcublasLt.so.13 $(BUILD_DIR)/libcudart.so.12 $(BUILD_DIR)/libcudart.so.13
 
 $(BUILD_DIR)/chidori-worker: $(SRC_SERVER) $(SRC_PROTO) include/chidori_protocol.h src/server/handle_map.h
 	@mkdir -p $(BUILD_DIR)
@@ -53,6 +53,14 @@ $(BUILD_DIR)/libcublas.so.13: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protoco
 
 $(BUILD_DIR)/libcublasLt.so.13: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
 	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libcublasLt.so.13 -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+
+# CUDA Runtime proxy libs — same interceptor code compiled with cudart soname.
+# When LD_LIBRARY_PATH=build, the dynamic linker finds these instead of real cudart.
+$(BUILD_DIR)/libcudart.so.12: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
+	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libcudart.so.12 -o $@ $(SRC_CLIENT) $(SRC_PROTO)
+
+$(BUILD_DIR)/libcudart.so.13: $(SRC_CLIENT) $(SRC_PROTO) include/chidori_protocol.h
+	$(CC) $(CFLAGS) $(LDFLAGS_CLIENT) -Wl,-soname,libcudart.so.13 -o $@ $(SRC_CLIENT) $(SRC_PROTO)
 
 $(BUILD_DIR)/libnvidia-ml.so.1: src/client/chidori_nvml.c
 	@mkdir -p $(BUILD_DIR)
