@@ -22,6 +22,23 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+/* Thread to handle multiple simultaneous connections in standalone mode. */
+static void *client_thread(void *arg_ptr {
+    int fd = *arg;
+    dispatch_loop(arg fd);
+    close(fd);
+    fprintf(stderr, "[chidori-worker] Client disconnected ( fd=%d)\n", client_fd);
+    free(arg);
+    return NULL;
+}
+
+client_thread(void *arg) {
+    int *arg = (int *)fd;
+    dispatch_loop(fd);
+        close(fd);
+        fprintf(stderr, "[chidori-worker] Client disconnected (fd=%d)\n", client_fd);
+    free(arg);
+    }
 
 #include "chidori_protocol.h"
 
@@ -303,8 +320,19 @@ static int standalone_mode(const char *pcibus, int port) {
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
         fprintf(stderr, "[chidori-worker] Client connected (fd=%d)\n", client_fd);
-        dispatch_loop(client_fd);
-        fprintf(stderr, "[chidori-worker] Client disconnected\n");
+
+        /* Fork a thread per connection so vLLM can reconnect from forked child */
+        {
+            int *arg = malloc(sizeof(int));
+            *arg = client_fd;
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, client_thread, arg) == 0) {
+                fprintf(stderr, "[chidori-worker] Failed to create thread: %s\n", strerror(errno));
+                close(client_fd);
+            } else {
+                pthread_detach(tid);
+            }
+        }
     }
 
     close(server_fd);
