@@ -1,0 +1,5 @@
+[chidori-worker] Starting session= pcibus=
+[chidori-worker] IPC write_fd=3 read_fd=4
+[chidori-worker] recvmsg: Bad file descriptor
+[chidori-worker] Failed to receive client socket
+[chidori-worker] Shutting down

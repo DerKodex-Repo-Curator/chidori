@@ -1,0 +1,93 @@
+typedef char __nv_bool;
+# 3121 "/opt/cuda/bin/../targets/x86_64-linux/include/driver_types.h"
+struct CUstream_st;
+# 229 "/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include/stddef.h" 3
+typedef unsigned long size_t;
+#include "crt/device_runtime.h"
+# 338 "/usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/c++config.h" 3
+typedef unsigned long _ZSt6size_t;
+#if !defined(__CUDABE__)
+#endif
+#if !defined(__CUDABE__)
+#endif
+#if !defined(__CUDABE__)
+#endif
+# 112 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+___device__(static  __no_sc__) __inline__ enum cudaError __cudaCDP2Malloc(void **, size_t);
+# 609 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+___device__(static  __no_sc__) __inline__ enum cudaError _ZN45_INTERNAL_d9f6526b_14_test_kernel_cu_f028883210cudaMallocEPPvm(void **, size_t);
+#if !defined(__CUDABE__)
+# 153 "/opt/cuda/bin/../targets/x86_64-linux/include/crt/common_functions.h"
+ __device_builtin__ ___device__(extern  __no_sc__) int printf(const char *__restrict__, ...);
+#endif
+# 2924 "/opt/cuda/bin/../targets/x86_64-linux/include/crt/device_functions.h"
+___device__(extern  __no_sc__) unsigned __cudaPushCallConfiguration(struct dim3, struct dim3, size_t, struct CUstream_st *);
+# 875 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+___device__(static  __no_sc__) __inline__ enum cudaError _ZN45_INTERNAL_d9f6526b_14_test_kernel_cu_f028883210cudaMallocIfEE9cudaErrorPPT_m(float **, size_t);
+# 2 "/tmp/test_kernel.cu"
+__global__ __var_used__ extern void _Z7add_onePfi(float *, int);
+#include "common_functions.h"
+#if !defined(__CUDABE__)
+#endif
+#if !defined(__CUDABE__)
+#endif
+#if !defined(__CUDABE__)
+#endif
+# 112 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+___device__(static  __no_sc__) __inline__ enum cudaError __cudaCDP2Malloc(
+# 112 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+void **p, 
+# 112 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+size_t s){
+# 113 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+{
+# 114 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+return cudaErrorUnknown;
+# 115 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+}}
+# 609 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+___device__(static  __no_sc__) __inline__ enum cudaError _ZN45_INTERNAL_d9f6526b_14_test_kernel_cu_f028883210cudaMallocEPPvm(
+# 609 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+void **devPtr, 
+# 609 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+size_t size){
+# 610 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+{  void **__T0;
+ size_t __T1;
+# 611 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+return ((__T0 = devPtr) , (void)(__T1 = size)) , (__cudaCDP2Malloc(__T0, __T1));
+# 612 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_device_runtime_api.h"
+}}
+#if !defined(__CUDABE__)
+#endif
+# 875 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+___device__(static  __no_sc__) __inline__ enum cudaError _ZN45_INTERNAL_d9f6526b_14_test_kernel_cu_f028883210cudaMallocIfEE9cudaErrorPPT_m(
+# 876 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+float **devPtr, 
+# 877 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+size_t size){
+# 879 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+{  void **__T2;
+ size_t __T3;
+# 880 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+return ((__T2 = ((void **)((void *)devPtr))) , (void)(__T3 = size)) , (_ZN45_INTERNAL_d9f6526b_14_test_kernel_cu_f028883210cudaMallocEPPvm(__T2, __T3));
+# 881 "/opt/cuda/bin/../targets/x86_64-linux/include/cuda_runtime.h"
+}}
+# 2 "/tmp/test_kernel.cu"
+__global__ __var_used__ void _Z7add_onePfi(
+# 2 "/tmp/test_kernel.cu"
+float *data, 
+# 2 "/tmp/test_kernel.cu"
+int n){
+# 2 "/tmp/test_kernel.cu"
+{
+# 3 "/tmp/test_kernel.cu"
+ int __cuda_local_var_37596_9_non_const_i;
+# 3 "/tmp/test_kernel.cu"
+__cuda_local_var_37596_9_non_const_i = ((int)(((blockIdx.x) * (blockDim.x)) + (threadIdx.x)));
+# 4 "/tmp/test_kernel.cu"
+if (__cuda_local_var_37596_9_non_const_i < n) {
+# 4 "/tmp/test_kernel.cu"
+(data[__cuda_local_var_37596_9_non_const_i]) += (1.0F); } 
+# 5 "/tmp/test_kernel.cu"
+}}

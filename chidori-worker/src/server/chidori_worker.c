@@ -129,8 +129,9 @@ static int dispatch_loop(int client_fd) {
     if (s_verbose)
         fprintf(stderr, "[dispatch] Entering batch-read loop for fd=%d\n", client_fd);
 
-    #define BATCH_BUF_SIZE (256 * 1024)
-    char buf[BATCH_BUF_SIZE];
+    #define BATCH_BUF_SIZE (4 * 1024 * 1024)
+    char *buf = malloc(BATCH_BUF_SIZE);
+    if (!buf) { fprintf(stderr, "[dispatch] malloc failed\n"); return -1; }
     size_t buf_len = 0;
     int request_count = 0;
     int batch_count = 0;
@@ -250,6 +251,7 @@ static int dispatch_loop(int client_fd) {
     }
 
 done:
+    free(buf);
     free(big_payload);
     fprintf(stderr, "[chidori-worker] Processed %d requests in %d recv batches (fd=%d)\n",
             request_count, batch_count, client_fd);

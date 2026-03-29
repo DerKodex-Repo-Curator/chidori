@@ -1,0 +1,31 @@
+[13:28:11] === Cross-Architecture Test Suite ===
+[13:28:11] Server: ssh7.vast.ai:14434 → localhost:43212
+[13:28:11] Client: lenovo → /home/fabricio/chidori/chidori-worker/build
+[13:28:11] Python: /home/fabricio/chidori/chidori-worker/../.venv/bin/python
+[13:28:11] Log: /home/fabricio/chidori/chidori-worker/.claude/crossarch_20260322_132811.log
+[13:28:11] 
+[13:28:12] FATAL: Server restart failed
+[13:28:14] Server GPU: 
+[13:28:14] 
+[13:28:14] --- TEST: init_device ---
+[13:28:15] FATAL: Server restart failed
+[13:28:15] RESULT: init_device FAIL (server restart)
+[13:28:15] --- TEST: tensor_readback ---
+[13:28:16] FATAL: Server restart failed
+[13:28:16] RESULT: tensor_readback FAIL (server restart)
+[13:28:16] --- TEST: kernel_elementwise ---
+[13:28:18] FATAL: Server restart failed
+[13:28:18] RESULT: kernel_elementwise FAIL (server restart)
+[13:28:18] --- TEST: matmul_verified ---
+[13:28:19] FATAL: Server restart failed
+[13:28:19] RESULT: matmul_verified FAIL (server restart)
+[13:28:19] --- TEST: matmul_large_verified ---
+[13:28:21] FATAL: Server restart failed
+[13:28:21] RESULT: matmul_large_verified FAIL (server restart)
+[13:28:21] --- TEST: training_convergence ---
+[13:28:22] FATAL: Server restart failed
+[13:28:22] RESULT: training_convergence FAIL (server restart)
+[13:28:22] === RESULTS ===
+[13:28:22] 0/6 passed, 6 failed
+[13:28:22] Log saved to: /home/fabricio/chidori/chidori-worker/.claude/crossarch_20260322_132811.log
+[13:28:22] SOME TESTS FAILED
