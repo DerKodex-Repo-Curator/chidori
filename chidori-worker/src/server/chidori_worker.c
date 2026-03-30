@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include "chidori_protocol.h"
 
@@ -291,6 +292,9 @@ static int standalone_mode(const char *pcibus, int port) {
 
     fprintf(stderr, "[chidori-worker] Listening on port %d\n", port);
 
+    /* Reap zombie children */
+    signal(SIGCHLD, SIG_IGN);
+
     for (;;) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) { perror("accept"); break; }
@@ -304,9 +308,25 @@ static int standalone_mode(const char *pcibus, int port) {
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
         fprintf(stderr, "[chidori-worker] Client connected (fd=%d)\n", client_fd);
-        dispatch_loop(client_fd);
+
+        /* Fork per connection — each child gets its own CUDA context and handle maps.
+         * All static globals in cuda_dispatch.c are duplicated by fork(). */
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(client_fd);
+            continue;
+        }
+        if (pid == 0) {
+            /* Child: handle this client */
+            close(server_fd);
+            dispatch_loop(client_fd);
+            close(client_fd);
+            fprintf(stderr, "[chidori-worker] Client disconnected (pid=%d)\n", getpid());
+            _exit(0);
+        }
+        /* Parent: close client fd (child owns it now), accept next */
         close(client_fd);
-        fprintf(stderr, "[chidori-worker] Client disconnected\n");
     }
 
     close(server_fd);
