@@ -2521,100 +2521,28 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    memset(prop, 0, 1008);  /* Zero the minimum cudaDeviceProp size (CUDA 13.1=1008, 12.8=1032).
-                              * We only write up to offset 704, so 1008 covers everything safely.
-                              * The caller (PyTorch) allocates >= 1008 for any CUDA version. */
-
-    char *p = (char *)prop;
-    int val;
-
-    /* Offset diagnostic mode */
-    static int g_offset_diag_early = -1;
-    if (g_offset_diag_early == -1) {
-        const char *d = getenv("CHIDORI_OFFSET_DIAG");
-        g_offset_diag_early = (d && d[0] == '1') ? 1 : 0;
+    /* Server fills the entire cudaDeviceProp struct via real cudaGetDeviceProperties.
+     * Single RPC, no offset guessing, works across all CUDA versions.
+     *
+     * IMPORTANT: limit received bytes to 1008 (smallest known cudaDeviceProp size,
+     * CUDA 13.1). The caller may have allocated only 1008 bytes if compiled against
+     * CUDA 13.1, even though the server sends 1032 (CUDA 12.8). We receive into a
+     * local buffer and copy the safe amount. */
+    int32_t dev32 = (int32_t)device;
+    char buf[1040];
+    memset(buf, 0, sizeof(buf));
+    size_t resp_len = sizeof(buf);
+    CUresult r = chidori_rpc(CHIDORI_CUDA_GET_DEVICE_PROPERTIES, &dev32, sizeof(dev32), buf, &resp_len);
+    if (r == CUDA_SUCCESS && resp_len > 0) {
+        /* Copy at most 1008 bytes to the caller's struct (safe for all CUDA versions) */
+        size_t copy_len = resp_len < 1008 ? resp_len : 1008;
+        memcpy(prop, buf, copy_len);
     }
-    if (g_offset_diag_early) {
-        /* Fill EVERY 4-byte slot with its offset — then the macros overwrite specific slots */
-        for (int _i = 256; _i < 1008; _i += 4) {
-            int _ov = _i; memcpy(p + _i, &_ov, 4);
-        }
-        /* Return immediately — don't overwrite with real values */
-        cuDeviceGetName(p, 256, device);
-        g_last_error = cudaSuccess;
-        return cudaSuccess;
-    }
+    fprintf(stderr, "[chidori] cudaGetDeviceProperties: r=%d resp_len=%zu name=%.20s\n",
+            (int)r, resp_len, (char *)prop);
 
-    /* name: use cuDeviceGetName (routes to local or remote) */
-    cuDeviceGetName(p, 256, device);
-
-    /* totalGlobalMem at offset 288 (size_t = 8) — use cuDeviceTotalMem */
-    {
-        size_t total = 0;
-        cuDeviceTotalMem_v2(&total, device); /* routes to local or remote */
-        memcpy(p + 288, &total, 8);
-    }
-
-    /* DIAGNOSTIC MODE: write offset markers instead of real values */
-    static int g_offset_diag = -1;
-    if (g_offset_diag == -1) {
-        const char *d = getenv("CHIDORI_OFFSET_DIAG");
-        g_offset_diag = (d && d[0] == '1') ? 1 : 0;
-    }
-
-    /* Helper macro: query a Runtime API device attribute and write to the struct */
-    #define SET_INT(offset, cuda_attr) do { \
-        if (g_offset_diag) { int _ov = (offset); memcpy(p + (offset), &_ov, 4); } \
-        else { val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); memcpy(p + (offset), &val, 4); } \
-    } while(0)
-
-    #define SET_SIZE_T(offset, cuda_attr) do { \
-        if (g_offset_diag) { size_t _ov = (size_t)(offset); memcpy(p + (offset), &_ov, 8); } \
-        else { val = 0; cudaDeviceGetAttribute(&val, cuda_attr, device); size_t sv = (size_t)val; memcpy(p + (offset), &sv, 8); } \
-    } while(0)
-
-    /* cudaDevAttr enum values (stable across CUDA versions) */
-    SET_SIZE_T(296, 8);   /* sharedMemPerBlock = cudaDevAttrMaxSharedMemoryPerBlock */
-    SET_INT(304, 12);     /* regsPerBlock = cudaDevAttrMaxRegistersPerBlock */
-    SET_INT(308, 10);     /* warpSize = cudaDevAttrWarpSize */
-    SET_SIZE_T(312, 11);  /* memPitch = cudaDevAttrMaxPitch */
-    SET_INT(320, 1);      /* maxThreadsPerBlock = cudaDevAttrMaxThreadsPerBlock */
-    SET_INT(324, 2);      /* maxThreadsDim[0] = cudaDevAttrMaxBlockDimX */
-    SET_INT(328, 3);      /* maxThreadsDim[1] = cudaDevAttrMaxBlockDimY */
-    SET_INT(332, 4);      /* maxThreadsDim[2] = cudaDevAttrMaxBlockDimZ */
-    SET_INT(336, 5);      /* maxGridSize[0] = cudaDevAttrMaxGridDimX */
-    SET_INT(340, 6);      /* maxGridSize[1] = cudaDevAttrMaxGridDimY */
-    SET_INT(344, 7);      /* maxGridSize[2] = cudaDevAttrMaxGridDimZ */
-    SET_INT(348, 13);     /* clockRate = cudaDevAttrClockRate */
-    SET_SIZE_T(352, 9);   /* totalConstMem = cudaDevAttrTotalConstantMemory */
-    SET_INT(360, 75);     /* major = cudaDevAttrComputeCapabilityMajor */
-    SET_INT(364, 76);     /* minor = cudaDevAttrComputeCapabilityMinor */
-    SET_SIZE_T(368, 14);  /* textureAlignment = cudaDevAttrTextureAlignment */
-    SET_SIZE_T(376, 52);  /* texturePitchAlignment = cudaDevAttrTexturePitchAlignment */
-    SET_INT(384, 15);     /* deviceOverlap = cudaDevAttrGpuOverlap */
-    SET_INT(388, 16);     /* multiProcessorCount = cudaDevAttrMultiProcessorCount */
-    SET_INT(392, 17);     /* kernelExecTimeoutEnabled = cudaDevAttrKernelExecTimeout */
-    SET_INT(396, 18);     /* integrated = cudaDevAttrIntegrated */
-    SET_INT(400, 19);     /* canMapHostMemory = cudaDevAttrCanMapHostMemory */
-    SET_INT(404, 20);     /* computeMode = cudaDevAttrComputeMode */
-    SET_INT(408, 21);     /* maxTexture1D = cudaDevAttrMaxTexture1DWidth */
-    SET_INT(424, 35);     /* concurrentKernels = cudaDevAttrConcurrentKernels */
-    SET_INT(432, 36);     /* ECCEnabled = cudaDevAttrEccEnabled */
-    SET_INT(436, 33);     /* pciBusID = cudaDevAttrPciBusId */
-    SET_INT(440, 34);     /* pciDeviceID = cudaDevAttrPciDeviceId */
-    /* Offsets below diverge between CUDA versions due to added fields.
-     * These offsets are empirically determined from PyTorch 2.10+cu128
-     * (CUDA 12.8) using CHIDORI_OFFSET_DIAG=1 pattern-fill technique. */
-    SET_INT(612, 37);     /* memoryBusWidth = cudaDevAttrGlobalMemoryBusWidth (offset 612 in CUDA 12.8) */
-    SET_INT(624, 39);     /* maxThreadsPerMultiProcessor = cudaDevAttrMaxThreadsPerMultiProcessor */
-    SET_INT(648, 82);     /* regsPerMultiprocessor = cudaDevAttrMaxRegistersPerMultiprocessor */
-    SET_SIZE_T(696, 97);  /* sharedMemPerBlockOptin = cudaDevAttrMaxSharedMemoryPerBlockOptin (offset 696 in CUDA 12.8) */
-
-    #undef SET_INT
-    #undef SET_SIZE_T
-
-    g_last_error = cudaSuccess;
-    return cudaSuccess;
+    g_last_error = (cudaError_t)r;
+    return (cudaError_t)r;
 }
 
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
