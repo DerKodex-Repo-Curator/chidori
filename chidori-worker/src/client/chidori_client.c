@@ -1002,6 +1002,9 @@ static int tcp_connect(const char *host, int port) {
     return fd;
 }
 
+/* Forward declaration — implemented after variable declarations */
+static int chidori_reconnect(void);
+
 static int chidori_connect(void) {
     if (g_server_fd >= 0)
         return 0;
@@ -1269,8 +1272,7 @@ static CUresult chidori_rpc_async(uint16_t func_id, const void *payload, size_t 
 
     if (chidori_send_request(g_server_fd, &req, payload, payload_len) != 0) {
         fprintf(stderr, "[chidori] Async send failed func=0x%04x: %s\n", func_id, strerror(errno));
-        close(g_server_fd);
-        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+        chidori_reconnect();  /* attempt reconnect for next call */
         g_cork_active = 0;
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
@@ -1339,8 +1341,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
     if (chidori_send_request(g_server_fd, &req, payload, payload_len) != 0) {
         fprintf(stderr, "[chidori] Failed to send func=0x%04x: %s (errno=%d)\n",
                 func_id, strerror(errno), errno);
-        close(g_server_fd);
-        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+        chidori_reconnect();  /* attempt reconnect for next call */
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
     }
@@ -1350,8 +1351,7 @@ static CUresult chidori_rpc(uint16_t func_id, const void *payload, size_t payloa
     if (chidori_recv_response(g_server_fd, &resp) != 0) {
         fprintf(stderr, "[chidori] Failed to recv response for func=0x%04x: %s (errno=%d)\n",
                 func_id, strerror(errno), errno);
-        close(g_server_fd);
-        fprintf(stderr, "[chidori] SOCKET CLOSED at %s:%d\n", __FILE__, __LINE__); g_server_fd = -1;
+        chidori_reconnect();  /* attempt reconnect for next call */
         pthread_mutex_unlock(&g_lock);
         return CUDA_ERROR_NOT_INITIALIZED;
     }
@@ -2521,7 +2521,7 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    memset(prop, 0, 1008);
+    memset(prop, 0, 2048);  /* cudaDeviceProp is ~2048 bytes in CUDA 12.8+ */
 
     char *p = (char *)prop;
     int val;
@@ -6555,6 +6555,43 @@ static struct {
     void **real_handle;     /* handle from real CUDA runtime (for local execution) */
 } g_fat_binaries[MAX_FAT_BINARIES];
 static int g_fat_binary_count = 0;
+
+/*
+ * Reconnect after connection loss.
+ * Retries with exponential backoff. Clears cached state on success.
+ */
+#define CHIDORI_RECONNECT_RETRIES 5
+
+static int chidori_reconnect(void) {
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+    g_cork_active = 0;
+    g_pending_responses = 0;
+    g_seq_num = 0;
+
+    for (int attempt = 1; attempt <= CHIDORI_RECONNECT_RETRIES; attempt++) {
+        int backoff_ms = 500 * attempt;
+        fprintf(stderr, "[chidori] Connection lost. Reconnecting (attempt %d/%d, backoff %dms)...\n",
+                attempt, CHIDORI_RECONNECT_RETRIES, backoff_ms);
+        usleep(backoff_ms * 1000);
+
+        if (chidori_connect() == 0) {
+            fprintf(stderr, "[chidori] Reconnected successfully (attempt %d)\n", attempt);
+            /* Clear caches — new server process has no state */
+            g_param_size_cache_count = 0;
+            g_xlate_count = 0;
+            g_event_track_count = 0;
+            /* Fat binaries need re-registration on next use */
+            for (int i = 0; i < g_fat_binary_count; i++)
+                g_fat_binaries[i].server_handle = 0;
+            return 0;
+        }
+    }
+    fprintf(stderr, "[chidori] Reconnect failed after %d attempts\n", CHIDORI_RECONNECT_RETRIES);
+    return -1;
+}
 
 /* Stored function registrations (not yet sent to server) */
 /* (forward-declared before, defined here after g_fat_binaries is available) */

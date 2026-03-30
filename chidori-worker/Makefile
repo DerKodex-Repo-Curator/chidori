@@ -15,7 +15,7 @@ CUDA_CFLAGS = -I$(CUDA_PATH)/include
 CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcuda -lcudart -lcublas -lcublasLt -lcudnn
 
 LDFLAGS_SERVER = -lpthread -lzstd $(CUDA_LDFLAGS)
-LDFLAGS_CLIENT = -lpthread -ldl -lzstd -shared
+LDFLAGS_CLIENT = -shared -Wl,--no-as-needed -lpthread -ldl -lzstd
 
 BUILD_DIR = build
 SRC_PROTO = src/protocol/chidori_net.c
