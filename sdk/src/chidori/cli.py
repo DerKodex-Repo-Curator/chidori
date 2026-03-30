@@ -1,4 +1,4 @@
-"""chidori run — execute any command with transparent remote GPU access."""
+"""chidori — GPU-over-IP CLI. Run scripts on remote GPUs or serve your GPU."""
 
 import argparse
 import os
@@ -12,79 +12,59 @@ def _find_libs():
     if libs_dir.exists() and any(libs_dir.glob("*.so*")):
         return libs_dir
     # Fallback: check if chidori-worker/build exists (dev mode)
-    repo_root = Path(__file__).parent.parent.parent.parent.parent
-    build_dir = repo_root / "chidori-worker" / "build"
-    if build_dir.exists() and (build_dir / "libchidori.so").exists():
-        return build_dir
+    for parent in [Path(__file__).parent] + list(Path(__file__).parents):
+        build_dir = parent / "chidori-worker" / "build"
+        if build_dir.exists() and (build_dir / "libchidori.so").exists():
+            return build_dir
     return None
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        prog="chidori",
-        description="Run any PyTorch script on a remote GPU. Zero code changes.",
-        usage="chidori run --server HOST:PORT [OPTIONS] COMMAND...",
-    )
-    sub = parser.add_subparsers(dest="subcmd")
+def _find_worker():
+    """Find the chidori-worker binary."""
+    libs_dir = _find_libs()
+    if libs_dir:
+        worker = libs_dir / "chidori-worker"
+        if worker.exists():
+            return worker
+    # Check PATH
+    from shutil import which
+    w = which("chidori-worker")
+    if w:
+        return Path(w)
+    return None
 
-    run_p = sub.add_parser("run", help="Execute a command with remote GPU access")
-    run_p.add_argument("--server", "-s", required=True, action="append",
-                       help="GPU server address (host:port). Can specify multiple.")
-    run_p.add_argument("--optimize", choices=["inference", "training", "all"], default="all",
-                       help="Which workloads to optimize (default: all)")
-    run_p.add_argument("--verbose", "-v", action="store_true",
-                       help="Enable Chidori debug logging")
-    run_p.add_argument("--trace", action="store_true",
-                       help="Enable RPC tracing with timestamps")
-    run_p.add_argument("--libs", type=str, default=None,
-                       help="Path to Chidori shared libraries (auto-detected)")
-    run_p.add_argument("command", nargs=argparse.REMAINDER,
-                       help="Command to execute (e.g., python train.py)")
 
-    args = parser.parse_args()
-
-    if args.subcmd != "run":
-        parser.print_help()
-        sys.exit(1)
-
+def cmd_run(args):
+    """Execute a command with transparent remote GPU access."""
     if not args.command:
-        run_p.print_help()
+        print("Error: no command specified", file=sys.stderr)
+        print("Usage: chidori run --server HOST:PORT python train.py", file=sys.stderr)
         sys.exit(1)
 
-    # Strip leading -- if present
     cmd = args.command
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
 
-    # Find libraries
     libs_dir = Path(args.libs) if args.libs else _find_libs()
     if not libs_dir:
         print("Error: Could not find Chidori libraries.", file=sys.stderr)
-        print("Build them first: cd chidori-worker && make all", file=sys.stderr)
-        print("Or specify --libs /path/to/build/", file=sys.stderr)
+        print("Install with: pip install chidori-gpu", file=sys.stderr)
         sys.exit(1)
 
-    libchidori = libs_dir / "libchidori.so"
-    if not libchidori.exists():
-        print(f"Error: {libchidori} not found", file=sys.stderr)
+    # Use libcuda.so.1 symlink as LD_PRELOAD (resolves to libchidori.so)
+    libcuda = libs_dir / "libcuda.so.1"
+    if not libcuda.exists():
+        libcuda = libs_dir / "libchidori.so"
+    if not libcuda.exists():
+        print(f"Error: no libchidori.so in {libs_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Build LD_PRELOAD — libchidori.so is the main interceptor
-    preload_libs = [str(libchidori)]
-
-    # Add libcuda.so.1 symlink if it exists (for CUDA driver interception)
-    libcuda_sym = libs_dir / "libcuda.so.1"
-    if libcuda_sym.exists():
-        preload_libs = [str(libcuda_sym)]
-
-    # Build server config
     servers = [s if ":" in s else f"{s}:43211" for s in args.server]
     server_list = ",".join(f'"{s}"' for s in servers)
     cfg = '{"id":"chidori-sdk","servers":[' + server_list + ']}'
 
-    # Set environment
     env = os.environ.copy()
-    env["LD_PRELOAD"] = " ".join(preload_libs)
+    env["LD_PRELOAD"] = str(libcuda)
     env["LD_LIBRARY_PATH"] = str(libs_dir) + ":" + env.get("LD_LIBRARY_PATH", "")
     env["CHIDORI_DIRECT_CONNECT"] = "1"
     env["CHIDORI_CFG_OVERRIDE"] = cfg
@@ -93,10 +73,72 @@ def main():
         env["CHIDORI_DEBUG"] = "1"
     if args.trace:
         env["CHIDORI_TRACE"] = "1"
-
-    # Enable inference optimization via sitecustomize hook
     if args.optimize in ("inference", "all"):
         env["CHIDORI_OPTIMIZE_INFERENCE"] = "1"
 
-    # Execute the user's command
     os.execvpe(cmd[0], cmd, env)
+
+
+def cmd_serve(args):
+    """Start a GPU server that accepts remote CUDA connections."""
+    worker = _find_worker()
+    if not worker:
+        print("Error: chidori-worker binary not found.", file=sys.stderr)
+        print("Build it: cd chidori-worker && make all", file=sys.stderr)
+        sys.exit(1)
+
+    port = args.port
+    print(f"Starting Chidori GPU server on port {port}...", file=sys.stderr)
+    print(f"Binary: {worker}", file=sys.stderr)
+    print(f"Clients connect with: chidori run --server {_get_ip()}:{port} python script.py", file=sys.stderr)
+
+    cmd = [str(worker), "--standalone", str(port)]
+    os.execv(str(worker), cmd)
+
+
+def _get_ip():
+    """Best-effort: get the machine's external IP."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "YOUR_IP"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="chidori",
+        description="GPU-over-IP: run any CUDA workload on a remote GPU.",
+    )
+    sub = parser.add_subparsers(dest="subcmd")
+
+    # chidori run
+    run_p = sub.add_parser("run", help="Run a command on a remote GPU")
+    run_p.add_argument("--server", "-s", required=True, action="append",
+                       help="GPU server (host:port, default port 43211)")
+    run_p.add_argument("--optimize", choices=["inference", "training", "all"], default="all",
+                       help="Optimize workloads (default: all)")
+    run_p.add_argument("--verbose", "-v", action="store_true")
+    run_p.add_argument("--trace", action="store_true")
+    run_p.add_argument("--libs", type=str, default=None,
+                       help="Path to shared libraries (auto-detected)")
+    run_p.add_argument("command", nargs=argparse.REMAINDER)
+
+    # chidori serve
+    serve_p = sub.add_parser("serve", help="Start a GPU server")
+    serve_p.add_argument("--port", "-p", type=int, default=43211,
+                         help="Port to listen on (default: 43211)")
+
+    args = parser.parse_args()
+
+    if args.subcmd == "run":
+        cmd_run(args)
+    elif args.subcmd == "serve":
+        cmd_serve(args)
+    else:
+        parser.print_help()
+        sys.exit(0)

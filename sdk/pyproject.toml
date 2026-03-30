@@ -23,4 +23,4 @@ chidori = "chidori.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"chidori.libs" = ["*.so", "*.so.*"]
+"chidori.libs" = ["*.so", "*.so.*", "chidori-worker"]

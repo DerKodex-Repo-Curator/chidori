@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: chidori-gpu
+Version: 0.1.0
+Summary: Run any PyTorch script on a remote GPU. Change zero lines of code.
+License: Apache-2.0
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown

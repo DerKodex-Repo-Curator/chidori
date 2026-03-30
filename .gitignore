@@ -13,3 +13,6 @@ research/cudart-internals/deep_trace
 research/cudart-internals/probe_runtime_state
 research/cudart-internals/test_isolated_context_first
 research/cudart-internals/test_isolated_register_first
+sdk/src/chidori/libs/*.so*
+sdk/src/chidori/libs/chidori-worker
+sdk/dist/
