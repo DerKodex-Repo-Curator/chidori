@@ -35,6 +35,7 @@
 #endif
 
 #include "chidori_protocol.h"
+#include "cuda_prop_map.h"
 
 /*
  * ============================================================================
@@ -2491,58 +2492,98 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device);
 cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     /*
      * cudaDeviceProp struct layout varies between CUDA versions.
-     * The server may run a different CUDA version than the application.
-     * We fill the struct using individual cudaDeviceGetAttribute calls
-     * at CUDA 12.x offsets (the dominant PyTorch runtime version).
-     *
-     * CUDA 12.x layout (first ~420 bytes):
-     *   0:   char name[256]
-     *   288: size_t totalGlobalMem
-     *   296: size_t sharedMemPerBlock
-     *   304: int regsPerBlock
-     *   308: int warpSize
-     *   312: size_t memPitch
-     *   320: int maxThreadsPerBlock
-     *   324: int maxThreadsDim[3]
-     *   336: int maxGridSize[3]
-     *   348: int clockRate
-     *   352: size_t totalConstMem
-     *   360: int major
-     *   364: int minor
-     *   368: size_t textureAlignment
-     *   376: size_t texturePitchAlignment
-     *   384: int deviceOverlap
-     *   388: int multiProcessorCount
-     *   392: int kernelExecTimeoutEnabled
-     *   396: int integrated
-     *   400: int canMapHostMemory
-     *   404: int computeMode
+     * The server sends a blob in its native layout (e.g., 1032 bytes for CUDA 12.8).
+     * The caller expects their layout (e.g., 1032 for cu128 PyTorch, 1008 for cu131).
+     * We translate field-by-field using offset tables in cuda_prop_map.h.
      */
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    /* Server fills the entire cudaDeviceProp struct via real cudaGetDeviceProperties.
-     * Single RPC, no offset guessing, works across all CUDA versions.
-     *
-     * IMPORTANT: limit received bytes to 1008 (smallest known cudaDeviceProp size,
-     * CUDA 13.1). The caller may have allocated only 1008 bytes if compiled against
-     * CUDA 13.1, even though the server sends 1032 (CUDA 12.8). We receive into a
-     * local buffer and copy the safe amount. */
+    /* Get the blob from the server */
     int32_t dev32 = (int32_t)device;
     char buf[1040];
     memset(buf, 0, sizeof(buf));
     size_t resp_len = sizeof(buf);
     CUresult r = chidori_rpc(CHIDORI_CUDA_GET_DEVICE_PROPERTIES, &dev32, sizeof(dev32), buf, &resp_len);
+
     if (r == CUDA_SUCCESS && resp_len > 0) {
-        /* Copy the full server response into the caller's struct.
-         * The caller's struct is sized for their CUDA version (PyTorch cu128 = 1032 bytes).
-         * The server sends its sizeof(cudaDeviceProp) which may differ.
-         * Copy the smaller of the two to avoid overflow. */
-        size_t caller_size = resp_len;  /* assume caller has at least as much as server sends */
-        memcpy(prop, buf, caller_size);
+        /* Detect caller's expected struct size.
+         * CHIDORI_CLIENT_CUDA overrides auto-detection (e.g., "12.8" or "13.1").
+         * Otherwise try to detect from linked libcudart or use compiled default. */
+        static size_t s_caller_struct_size = 0;
+        if (s_caller_struct_size == 0) {
+            const char *env = getenv("CHIDORI_CLIENT_CUDA");
+            if (env) {
+                int major = 0, minor = 0;
+                if (sscanf(env, "%d.%d", &major, &minor) == 2) {
+                    int ver = major * 100 + minor * 10;
+                    if (ver == 1280) s_caller_struct_size = 1032;
+                    else if (ver == 1310) s_caller_struct_size = 1008;
+                }
+            }
+            if (s_caller_struct_size == 0) {
+                /* Try to detect from the CUDA runtime the app linked against.
+                 * PyTorch bundles its own libcudart — check torch.version.cuda. */
+                /* Default: detect by trying to find the app's CUDA version.
+                 * For now, try reading /proc/self/maps for libcudart soname. */
+                FILE *f = fopen("/proc/self/maps", "r");
+                if (f) {
+                    char line[512];
+                    while (fgets(line, sizeof(line), f)) {
+                        /* Look for torch/lib/libcu* or libcudart* */
+                        if (strstr(line, "libcudart") || strstr(line, "libcuda.so")) {
+                            /* Check soname pattern like libcudart.so.12 */
+                            char *soname = strstr(line, "libcudart.so.");
+                            if (soname) {
+                                int major = 0;
+                                if (sscanf(soname + 13, "%d", &major) == 1) {
+                                    /* CUDA 12.x → assume 12.8 (1032) for now */
+                                    if (major == 12) s_caller_struct_size = 1032;
+                                    else if (major == 13) s_caller_struct_size = 1008;
+                                    break;
+                                }
+                            }
+                            /* Also check for libcuda.so.1 from Chidori itself */
+                            if (strstr(line, "libcuda.so.1") || strstr(line, "libchidori")) {
+                                /* This is our own LD_PRELOAD — skip */
+                                continue;
+                            }
+                        }
+                    }
+                    fclose(f);
+                }
+            }
+            if (s_caller_struct_size == 0) {
+                /* Last resort: use our compiled struct size.
+                 * This works if client and app use the same CUDA headers. */
+                s_caller_struct_size = resp_len; /* match server as best guess */
+                fprintf(stderr, "[chidori] cudaDeviceProp: unknown caller version, using server size %zu\n",
+                        s_caller_struct_size);
+            } else {
+                fprintf(stderr, "[chidori] cudaDeviceProp: detected caller struct size=%zu\n",
+                        s_caller_struct_size);
+            }
+        }
+
+        /* Translate server blob → caller's struct layout */
+        cuda_prop_translate(buf, resp_len, prop, s_caller_struct_size);
+
+        /* Debug: log key fields (read from caller's struct using detected offsets) */
+        {
+            char name[257] = {0};
+            memcpy(name, (char *)prop, 256);
+            int major = 0, minor = 0, mpc = 0;
+            /* Read major/minor from stable offsets */
+            memcpy(&major, (char *)prop + 360, 4);
+            memcpy(&minor, (char *)prop + 364, 4);
+            /* Read multiProcessorCount using the correct offset for caller's version */
+            int caller_ver = cuda_version_from_size(s_caller_struct_size);
+            if (caller_ver == 1280) memcpy(&mpc, (char *)prop + 388, 4);
+            else if (caller_ver == 1310) memcpy(&mpc, (char *)prop + 384, 4);
+            fprintf(stderr, "[chidori] cudaGetDeviceProperties: r=%d server=%zu caller=%zu name=%s sm=%d.%d mpc=%d\n",
+                    (int)r, resp_len, s_caller_struct_size, name, major, minor, mpc);
+        }
     }
-    fprintf(stderr, "[chidori] cudaGetDeviceProperties: r=%d resp_len=%zu name=%.20s\n",
-            (int)r, resp_len, (char *)prop);
 
     g_last_error = (cudaError_t)r;
     return (cudaError_t)r;
