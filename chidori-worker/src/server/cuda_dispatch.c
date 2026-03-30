@@ -303,6 +303,22 @@ int cuda_dispatch_init(const char *pcibus) {
     return 0;
 }
 
+/* Reset all state after fork() — parent's CUDA contexts are invalid in child.
+ * Just zero the pointers without calling any CUDA cleanup functions. */
+void cuda_dispatch_reset(void) {
+    g_initialized = 0;
+    g_current_ctx = NULL;
+    g_current_dev = 0;
+    g_device_count = 0;
+    g_lt_handle = NULL;
+    g_lt_workspace = NULL;
+    g_lt_workspace_size = 0;
+    memset(g_devices, 0, sizeof(g_devices));
+    memset(g_contexts, 0, sizeof(g_contexts));
+    g_next_handle = 0x10000;
+    g_capturing_stream = NULL;
+}
+
 void cuda_dispatch_shutdown(void) {
     if (g_initialized) {
         replay_shutdown();
