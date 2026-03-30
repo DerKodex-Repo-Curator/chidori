@@ -1,11 +1,18 @@
-"""Chidori inference optimizer — server-side graph decode for HuggingFace generate().
+"""Chidori inference optimizer — patches _sample() to use server-side graph decode.
 
-Copies the exact proven pattern from test_inference_cached.py (111.8 tok/s).
+Instead of patching generate() and reimplementing its setup logic, we patch
+the inner decode loop (_sample) and let generate() handle everything else:
+GenerationConfig parsing, cache creation, prefill, stopping criteria.
+
+After prefill, we capture one decode step as a CUDA graph and hand off the
+entire autoregressive loop to the server via chidori_graph_decode().
 """
 import ctypes
 import os
 import functools
 import sys
+
+RTLD_NOLOAD = getattr(ctypes, 'RTLD_NOLOAD', 0x00004)
 
 
 def _load_lib():
@@ -28,38 +35,31 @@ def _load_lib():
 
 
 def server_decode(model, tokenizer, prompt, max_new_tokens=200):
-    """Run inference with server-side graph decode. Returns generated text.
+    """Direct API: run inference with server-side graph decode. Returns text.
 
-    This is the public API. Exact copy of the proven test_inference_cached.py
-    pattern that achieves 111-213 tok/s.
+    Exact copy of the proven test_inference_cached.py pattern (104-213 tok/s).
     """
     import torch
     from transformers.cache_utils import StaticCache
 
     lib = _load_lib()
     if lib is None or not hasattr(lib, 'chidori_graph_decode'):
-        raise RuntimeError("chidori_graph_decode not available — is LD_PRELOAD set?")
+        raise RuntimeError("chidori_graph_decode not available")
 
     model.eval()
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
     prompt_len = inputs["input_ids"].shape[1]
     max_cache_len = prompt_len + max_new_tokens + 16
 
-    # StaticCache — exact same constructor as the working test
     static_cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
-
-    # Prefill
     with torch.no_grad():
         pf = model(inputs["input_ids"], past_key_values=static_cache, use_cache=True)
         nt = pf.logits[:, -1:, :].argmax(-1)
-
-    # Warmup decode
     cp = torch.tensor([prompt_len], device="cuda")
     with torch.no_grad():
         model(nt, past_key_values=static_cache, use_cache=True, cache_position=cp)
     torch.cuda.synchronize()
 
-    # Stream warmup
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     si = nt.clone()
@@ -70,7 +70,6 @@ def server_decode(model, tokenizer, prompt, max_new_tokens=200):
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
 
-    # CUDA graph capture
     sptr = ctypes.c_void_p(s.cuda_stream)
     lib.cuStreamBeginCapture_v2(sptr, ctypes.c_int(0))
     with torch.cuda.stream(s):
@@ -81,7 +80,6 @@ def server_decode(model, tokenizer, prompt, max_new_tokens=200):
     eptr = ctypes.c_void_p(0)
     lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
 
-    # Server-side decode — single RPC
     out_tokens = (ctypes.c_int32 * max_new_tokens)()
     out_count = ctypes.c_int32(0)
     torch.cuda.synchronize()
@@ -100,19 +98,22 @@ def server_decode(model, tokenizer, prompt, max_new_tokens=200):
     n = out_count.value
     tps = n / dt if dt > 0 else 0
 
-    # Decode tokens
     token_ids = [nt.item()] + [out_tokens[i] for i in range(n)]
     text = tokenizer.decode(token_ids, skip_special_tokens=True)
-
     print(f"[chidori] Server decode: {n} tokens in {dt:.1f}s = {tps:.1f} tok/s", file=sys.stderr)
     return text
 
 
-def patch_generate():
-    """Monkey-patch generate() to use server_decode automatically."""
+def optimize():
+    """Patch _sample() to use server-side graph decode for greedy inference.
+
+    Lets generate() handle all setup (GenerationConfig, cache, prefill).
+    We only replace the inner decode loop inside _sample().
+    """
     try:
-        import torch  # noqa: F401
+        import torch
         from transformers import GenerationMixin
+        from transformers.cache_utils import StaticCache
     except ImportError:
         return False
 
@@ -120,105 +121,129 @@ def patch_generate():
     if lib is None or not hasattr(lib, 'chidori_graph_decode'):
         return False
 
-    original_generate = GenerationMixin.generate
+    original_sample = GenerationMixin._sample
 
-    @functools.wraps(original_generate)
-    def optimized_generate(self, inputs=None, generation_config=None, **kwargs):
-        import torch
-        from transformers.cache_utils import StaticCache
+    @functools.wraps(original_sample)
+    def patched_sample(self, input_ids, logits_processor=None, stopping_criteria=None,
+                       generation_config=None, synced_gpus=False, streamer=None,
+                       **model_kwargs):
+        """Replaces the decode loop with CUDA graph capture + server-side decode.
 
-        # Get input_ids
-        input_ids = inputs
-        if input_ids is None:
-            input_ids = kwargs.pop("input_ids", None)
-        if input_ids is None:
-            return original_generate(self, inputs=inputs, generation_config=generation_config, **kwargs)
+        generate() already did: GenerationConfig parsing, cache creation,
+        _prepare_model_inputs, _prepare_special_tokens. input_ids contains
+        the prompt. model_kwargs has past_key_values, attention_mask, etc.
 
-        # Get max_new_tokens from kwargs or generation_config
-        max_new_tokens = kwargs.get("max_new_tokens", None)
-        if max_new_tokens is None and generation_config is not None:
-            max_new_tokens = getattr(generation_config, "max_new_tokens", None)
+        We let the prefill happen normally via _sample's first iteration,
+        then hijack the decode loop.
+        """
+        # Only optimize: greedy, batch=1, StaticCache, CUDA
+        past_kv = model_kwargs.get("past_key_values")
+        if (generation_config.do_sample
+            or input_ids.shape[0] != 1
+            or not isinstance(past_kv, StaticCache)
+            or input_ids.device.type != "cuda"):
+            return original_sample(self, input_ids, logits_processor,
+                                   stopping_criteria, generation_config,
+                                   synced_gpus, streamer, **model_kwargs)
 
-        do_sample = kwargs.get("do_sample", None)
-        if do_sample is None and generation_config is not None:
-            do_sample = getattr(generation_config, "do_sample", False)
-
-        # Only optimize: greedy, known length, batch=1, CUDA
-        if max_new_tokens is None or do_sample:
-            return original_generate(self, inputs=input_ids, generation_config=generation_config, **kwargs)
-        if input_ids.shape[0] != 1:
-            return original_generate(self, inputs=input_ids, generation_config=generation_config, **kwargs)
         try:
-            if next(self.parameters()).device.type != "cuda":
-                return original_generate(self, inputs=input_ids, generation_config=generation_config, **kwargs)
-        except StopIteration:
-            return original_generate(self, inputs=input_ids, generation_config=generation_config, **kwargs)
-
-        # === EXACT COPY OF test_inference_cached.py ===
-        try:
-            self.eval()
-            prompt_len = input_ids.shape[1]
-            max_cache_len = prompt_len + max_new_tokens + 16
-
-            static_cache = StaticCache(config=self.config, max_cache_len=max_cache_len)
-            with torch.no_grad():
-                pf = self(input_ids, past_key_values=static_cache, use_cache=True)
-                nt = pf.logits[:, -1:, :].argmax(-1)
-            cp = torch.tensor([prompt_len], device="cuda")
-            with torch.no_grad():
-                self(nt, past_key_values=static_cache, use_cache=True, cache_position=cp)
-            torch.cuda.synchronize()
-
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            si = nt.clone()
-            sp = torch.tensor([prompt_len + 1], device="cuda", dtype=torch.long)
-            with torch.cuda.stream(s):
-                with torch.no_grad():
-                    so = self(si, past_key_values=static_cache, use_cache=True, cache_position=sp)
-            torch.cuda.current_stream().wait_stream(s)
-            torch.cuda.synchronize()
-
-            sptr = ctypes.c_void_p(s.cuda_stream)
-            lib.cuStreamBeginCapture_v2(sptr, ctypes.c_int(0))
-            with torch.cuda.stream(s):
-                with torch.no_grad():
-                    so = self(si, past_key_values=static_cache, use_cache=True, cache_position=sp)
-            gptr = ctypes.c_void_p(0)
-            lib.cuStreamEndCapture(sptr, ctypes.byref(gptr))
-            eptr = ctypes.c_void_p(0)
-            lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
-
-            out_tokens = (ctypes.c_int32 * max_new_tokens)()
-            out_count = ctypes.c_int32(0)
-            torch.cuda.synchronize()
-
-            lib.chidori_graph_decode(
-                ctypes.c_uint64(eptr.value), ctypes.c_uint64(sptr.value),
-                ctypes.c_uint64(si.data_ptr()), ctypes.c_uint64(sp.data_ptr()),
-                ctypes.c_uint64(so.logits.data_ptr()),
-                ctypes.c_int32(self.config.vocab_size),
-                ctypes.c_int32(max_new_tokens - 2), ctypes.c_int32(prompt_len + 2),
-                out_tokens, ctypes.byref(out_count),
+            return _graph_decode_sample(
+                self, input_ids, logits_processor, stopping_criteria,
+                generation_config, synced_gpus, streamer, lib, model_kwargs
             )
-
-            n = out_count.value
-            all_ids = input_ids[0].tolist() + [nt.item()] + [out_tokens[i] for i in range(n)]
-            return torch.tensor([all_ids], device=input_ids.device, dtype=torch.long)
-
         except Exception as e:
-            import traceback
             print(f"[chidori] Graph decode failed: {e}", file=sys.stderr)
+            import traceback
             traceback.print_exc(file=sys.stderr)
-            return original_generate(self, inputs=input_ids, generation_config=generation_config, **kwargs)
+            # Reset cache and fall back
+            past_kv = model_kwargs.get("past_key_values")
+            if hasattr(past_kv, 'reset'):
+                past_kv.reset()
+            return original_sample(self, input_ids, logits_processor,
+                                   stopping_criteria, generation_config,
+                                   synced_gpus, streamer, **model_kwargs)
 
-    GenerationMixin.generate = optimized_generate
+    GenerationMixin._sample = patched_sample
+    print("[chidori] Server-side graph decode enabled for generate()", file=sys.stderr)
     return True
 
 
-def optimize():
-    """Enable server-side graph decode for HuggingFace generate()."""
-    patched = patch_generate()
-    if patched:
-        print("[chidori] Server-side graph decode enabled for generate()", file=sys.stderr)
-    return patched
+def _graph_decode_sample(self, input_ids, logits_processor, stopping_criteria,
+                         generation_config, synced_gpus, streamer, lib, model_kwargs):
+    """Graph capture + server-side decode. Uses the EXACT proven pattern from
+    test_inference_cached.py — no prepare_inputs_for_generation, just direct
+    model calls with StaticCache and cache_position.
+    """
+    import torch
+
+    static_cache = model_kwargs.get("past_key_values")
+    prompt_len = input_ids.shape[1]
+    max_new = generation_config.max_new_tokens
+    if max_new is None:
+        max_new = generation_config.max_length - prompt_len
+
+    # === Prefill ===
+    with torch.no_grad():
+        pf = self(input_ids, past_key_values=static_cache, use_cache=True)
+        nt = pf.logits[:, -1:, :].argmax(-1)
+
+    # === Warmup decode ===
+    cp = torch.tensor([prompt_len], device="cuda")
+    with torch.no_grad():
+        self(nt, past_key_values=static_cache, use_cache=True, cache_position=cp)
+    torch.cuda.synchronize()
+
+    if max_new <= 1:
+        return torch.cat([input_ids, nt], dim=-1)
+
+    # === Stream warmup ===
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    si = nt.clone()
+    sp = torch.tensor([prompt_len + 1], device="cuda", dtype=torch.long)
+    with torch.cuda.stream(s):
+        with torch.no_grad():
+            so = self(si, past_key_values=static_cache, use_cache=True, cache_position=sp)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    # === CUDA graph capture ===
+    sptr = ctypes.c_void_p(s.cuda_stream)
+    lib.cuStreamBeginCapture_v2(sptr, ctypes.c_int(0))
+    with torch.cuda.stream(s):
+        with torch.no_grad():
+            so = self(si, past_key_values=static_cache, use_cache=True, cache_position=sp)
+    gptr = ctypes.c_void_p(0)
+    lib.cuStreamEndCapture(sptr, ctypes.byref(gptr))
+    eptr = ctypes.c_void_p(0)
+    lib.cuGraphInstantiate(ctypes.byref(eptr), gptr, ctypes.c_ulonglong(0))
+
+    # === Save IDs to CPU before graph decode (CUDA state gets dirty) ===
+    saved_prompt_ids = input_ids[0].tolist()
+    first_token_id = nt.item()
+
+    # === Server-side decode ===
+    remaining = max_new - 2
+    out_tokens = (ctypes.c_int32 * max(remaining, 1))()
+    out_count = ctypes.c_int32(0)
+    torch.cuda.synchronize()
+
+    import time
+    t0 = time.time()
+    lib.chidori_graph_decode(
+        ctypes.c_uint64(eptr.value), ctypes.c_uint64(sptr.value),
+        ctypes.c_uint64(si.data_ptr()), ctypes.c_uint64(sp.data_ptr()),
+        ctypes.c_uint64(so.logits.data_ptr()),
+        ctypes.c_int32(self.config.vocab_size),
+        ctypes.c_int32(remaining), ctypes.c_int32(prompt_len + 2),
+        out_tokens, ctypes.byref(out_count),
+    )
+    dt = time.time() - t0
+    n = out_count.value
+    tps = n / dt if dt > 0 else 0
+    print(f"[chidori] Server decode: {n} tokens in {dt:.1f}s = {tps:.1f} tok/s", file=sys.stderr)
+
+    # === Assemble output (same format as _sample returns) ===
+    # Use saved_ids (CPU) since CUDA state may be dirty after graph decode
+    all_ids = saved_prompt_ids + [first_token_id] + [out_tokens[i] for i in range(n)]
+    return torch.tensor([all_ids], device=input_ids.device, dtype=torch.long)

@@ -2,4 +2,4 @@
 
 __version__ = "0.1.0"
 
-from chidori.optimize import optimize, patch_generate
+from chidori.optimize import optimize, server_decode
