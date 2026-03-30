@@ -244,6 +244,6 @@ def _graph_decode_sample(self, input_ids, logits_processor, stopping_criteria,
     print(f"[chidori] Server decode: {n} tokens in {dt:.1f}s = {tps:.1f} tok/s", file=sys.stderr)
 
     # === Assemble output (same format as _sample returns) ===
-    # Use saved_ids (CPU) since CUDA state may be dirty after graph decode
+    # Keep on CPU — CUDA state is dirty after graph decode
     all_ids = saved_prompt_ids + [first_token_id] + [out_tokens[i] for i in range(n)]
-    return torch.tensor([all_ids], device=input_ids.device, dtype=torch.long)
+    return torch.tensor([all_ids], dtype=torch.long)
