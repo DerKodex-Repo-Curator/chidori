@@ -2534,9 +2534,12 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     size_t resp_len = sizeof(buf);
     CUresult r = chidori_rpc(CHIDORI_CUDA_GET_DEVICE_PROPERTIES, &dev32, sizeof(dev32), buf, &resp_len);
     if (r == CUDA_SUCCESS && resp_len > 0) {
-        /* Copy at most 1008 bytes to the caller's struct (safe for all CUDA versions) */
-        size_t copy_len = resp_len < 1008 ? resp_len : 1008;
-        memcpy(prop, buf, copy_len);
+        /* Copy the full server response into the caller's struct.
+         * The caller's struct is sized for their CUDA version (PyTorch cu128 = 1032 bytes).
+         * The server sends its sizeof(cudaDeviceProp) which may differ.
+         * Copy the smaller of the two to avoid overflow. */
+        size_t caller_size = resp_len;  /* assume caller has at least as much as server sends */
+        memcpy(prop, buf, caller_size);
     }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties: r=%d resp_len=%zu name=%.20s\n",
             (int)r, resp_len, (char *)prop);
