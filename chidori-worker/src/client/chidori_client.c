@@ -2521,7 +2521,9 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     if (!prop) { g_last_error = (cudaError_t)1; return (cudaError_t)1; }
     fprintf(stderr, "[chidori] cudaGetDeviceProperties(dev=%d) CALLED\n", device);
 
-    memset(prop, 0, 2048);  /* cudaDeviceProp is ~2048 bytes in CUDA 12.8+ */
+    memset(prop, 0, 1008);  /* Zero the minimum cudaDeviceProp size (CUDA 13.1=1008, 12.8=1032).
+                              * We only write up to offset 704, so 1008 covers everything safely.
+                              * The caller (PyTorch) allocates >= 1008 for any CUDA version. */
 
     char *p = (char *)prop;
     int val;
