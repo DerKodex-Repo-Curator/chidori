@@ -2509,16 +2509,33 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device) {
     if (r == CUDA_SUCCESS && resp_len > 0) {
         /* Detect caller's expected struct size.
          * CHIDORI_CLIENT_CUDA overrides auto-detection (e.g., "12.8" or "13.1").
-         * Otherwise try to detect from linked libcudart or use compiled default. */
+         * Also accepts PyTorch tags like "cu128", "cu118", etc.
+         * Otherwise try to detect from linked libcudart or use compiled default.
+         *
+         * Two layout families:
+         *   LAYOUT_12x (1032 bytes): cu118, cu121, cu126, cu128
+         *   LAYOUT_13x (1008 bytes): cu130, cu131
+         */
         static size_t s_caller_struct_size = 0;
         if (s_caller_struct_size == 0) {
             const char *env = getenv("CHIDORI_CLIENT_CUDA");
             if (env) {
-                int major = 0, minor = 0;
-                if (sscanf(env, "%d.%d", &major, &minor) == 2) {
-                    int ver = major * 100 + minor * 10;
-                    if (ver == 1280) s_caller_struct_size = 1032;
-                    else if (ver == 1310) s_caller_struct_size = 1008;
+                /* Accept "cu128", "12.8", "1280" etc */
+                if (strncmp(env, "cu", 2) == 0) {
+                    /* PyTorch tag: cu118, cu121, cu126, cu128 → 12x; cu130, cu131 → 13x */
+                    int ver = atoi(env + 2);
+                    if (ver >= 130) s_caller_struct_size = 1008;  /* cu130, cu131 */
+                    else s_caller_struct_size = 1032;              /* cu118, cu121, cu126, cu128 */
+                } else {
+                    int major = 0, minor = 0;
+                    if (sscanf(env, "%d.%d", &major, &minor) == 2) {
+                        if (major >= 13) s_caller_struct_size = 1008;
+                        else s_caller_struct_size = 1032;
+                    } else {
+                        int ver = atoi(env);
+                        if (ver >= 1300) s_caller_struct_size = 1008;
+                        else s_caller_struct_size = 1032;
+                    }
                 }
             }
             if (s_caller_struct_size == 0) {

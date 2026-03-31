@@ -1,15 +1,19 @@
 /*
  * cuda_prop_map.h — Version-aware cudaDeviceProp struct mapping.
  *
- * cudaDeviceProp layout differs between CUDA versions (e.g., 12.8 = 1032 bytes,
- * 13.1 = 1008 bytes). Fields after ~offset 384 shift due to removed/added fields.
+ * cudaDeviceProp layout differs between CUDA major versions.
+ * CUDA 11.8–12.8 share one layout (1032 bytes).
+ * CUDA 13.0–13.1 share another (1008 bytes, removed clockRate, memPitch,
+ * deviceOverlap, kernelExecTimeoutEnabled, computeMode, maxTexture1DLinear,
+ * memoryClockRate).
  *
- * This header provides:
- *   1. Offset tables for known CUDA versions
- *   2. Runtime detection of caller's CUDA version
- *   3. Translation from server blob to caller's native struct
+ * Two layout families:
+ *   LAYOUT_12x (1032 bytes): cu118, cu121, cu126, cu128
+ *   LAYOUT_13x (1008 bytes): cu130, cu131
  *
- * Usage: call cuda_prop_translate(server_blob, server_blob_len, caller_struct)
+ * Offset tables verified by compiling against each CUDA version's headers.
+ *
+ * Usage: call cuda_prop_translate(server_blob, server_blob_len, caller_struct, caller_size)
  */
 
 #ifndef CUDA_PROP_MAP_H
@@ -114,24 +118,27 @@ static const cuda_prop_field_t cuda_prop_128_only[] = {
 };
 
 /*
- * Detect CUDA version from struct size.
- *   1032 → CUDA 12.8
- *   1008 → CUDA 13.1
- *   0    → unknown
+ * Map struct size → layout family.
+ *   1032 → LAYOUT_12x (cu118, cu121, cu126, cu128)
+ *   1008 → LAYOUT_13x (cu130, cu131)
+ *   0    → unknown (fallback to direct copy)
+ *
+ * All CUDA 11.x–12.x versions have the same field set and offsets.
+ * CUDA 13.x removed several deprecated fields, shrinking the struct by 24 bytes.
  */
 static int cuda_version_from_size(size_t struct_size) {
-    if (struct_size == 1032) return 1280;  /* CUDA 12.8 */
-    if (struct_size == 1008) return 1310;  /* CUDA 13.1 */
+    if (struct_size == 1032) return 1280;  /* LAYOUT_12x: cu118, cu121, cu126, cu128 */
+    if (struct_size == 1008) return 1310;  /* LAYOUT_13x: cu130, cu131 */
     return 0;
 }
 
 /*
- * Get the offset for a field in a given CUDA version.
+ * Get the offset for a field in a given CUDA layout family.
  * Returns the offset, or -1 if the field doesn't exist in that version.
  */
 static int cuda_prop_get_offset(int cuda_version, const cuda_prop_field_t *field) {
-    if (cuda_version == 1280) return field->off_128;
-    if (cuda_version == 1310) return field->off_131;
+    if (cuda_version == 1280) return field->off_128;  /* LAYOUT_12x */
+    if (cuda_version == 1310) return field->off_131;  /* LAYOUT_13x */
     return -1;
 }
 
