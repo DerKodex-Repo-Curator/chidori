@@ -1,5 +1,5 @@
 """Chidori — Run any PyTorch script on a remote GPU. Zero code changes."""
 
-__version__ = "0.1.3"
+__version__ = "0.1.5"
 
 from chidori.optimize import optimize, server_decode

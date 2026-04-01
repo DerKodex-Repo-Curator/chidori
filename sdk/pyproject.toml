@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chidori-gpu"
-version = "0.1.3"
+version = "0.1.5"
 description = "Run any PyTorch script on a remote GPU. Change zero lines of code."
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = {text = "Proprietary"}
 requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 3 - Alpha",
