@@ -81,10 +81,12 @@ def cmd_run(args):
 
 def cmd_serve(args):
     """Start a GPU server that accepts remote CUDA connections."""
-    worker = _find_worker()
-    if not worker:
-        print("Error: chidori-worker binary not found.", file=sys.stderr)
-        print("Build it: cd chidori-worker && make all", file=sys.stderr)
+    from chidori.worker_build import ensure_worker
+
+    try:
+        worker = ensure_worker()
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     port = args.port

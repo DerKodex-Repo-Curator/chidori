@@ -24,3 +24,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "chidori.libs" = ["*.so", "*.so.*", "chidori-worker"]
+"chidori.src" = ["**/*.c", "**/*.h"]
