@@ -98,6 +98,38 @@ def cmd_serve(args):
     os.execv(str(worker), cmd)
 
 
+def cmd_test(args):
+    """Run the built-in test suite against a GPU server."""
+    libs_dir = Path(args.libs) if args.libs else _find_libs()
+    if not libs_dir:
+        print("Error: Could not find Chidori libraries.", file=sys.stderr)
+        sys.exit(1)
+
+    libcuda = libs_dir / "libcuda.so.1"
+    if not libcuda.exists():
+        libcuda = libs_dir / "libchidori.so"
+
+    servers = [s if ":" in s else f"{s}:43211" for s in args.server]
+    server_list = ",".join(f'"{s}"' for s in servers)
+    cfg = '{"id":"chidori-test","servers":[' + server_list + ']}'
+
+    # Find the test suite module
+    test_module = Path(__file__).parent / "test_suite.py"
+    if not test_module.exists():
+        print(f"Error: test_suite.py not found at {test_module}", file=sys.stderr)
+        sys.exit(1)
+
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = str(libcuda)
+    env["LD_LIBRARY_PATH"] = str(libs_dir) + ":" + env.get("LD_LIBRARY_PATH", "")
+    env["CHIDORI_DIRECT_CONNECT"] = "1"
+    env["CHIDORI_CFG_OVERRIDE"] = cfg
+
+    # Find python
+    python = sys.executable
+    os.execvpe(python, [python, str(test_module)], env)
+
+
 def _get_ip():
     """Best-effort: get the machine's external IP."""
     import socket
@@ -135,12 +167,20 @@ def main():
     serve_p.add_argument("--port", "-p", type=int, default=43211,
                          help="Port to listen on (default: 43211)")
 
+    # chidori test
+    test_p = sub.add_parser("test", help="Test your GPU connection")
+    test_p.add_argument("--server", "-s", required=True, action="append",
+                        help="GPU server (host:port)")
+    test_p.add_argument("--libs", type=str, default=None)
+
     args = parser.parse_args()
 
     if args.subcmd == "run":
         cmd_run(args)
     elif args.subcmd == "serve":
         cmd_serve(args)
+    elif args.subcmd == "test":
+        cmd_test(args)
     else:
         parser.print_help()
         sys.exit(0)
