@@ -4,6 +4,7 @@ src/chidori/__init__.py
 src/chidori/cli.py
 src/chidori/optimize.py
 src/chidori/sitecustomize.py
+src/chidori/worker_build.py
 src/chidori/libs/__init__.py
 src/chidori/libs/chidori-worker
 src/chidori/libs/libchidori.so
@@ -15,6 +16,14 @@ src/chidori/libs/libcuda.so.1
 src/chidori/libs/libcudart.so.12
 src/chidori/libs/libcudart.so.13
 src/chidori/libs/libnvidia-ml.so.1
+src/chidori/src/include/chidori_protocol.h
+src/chidori/src/include/cuda_prop_map.h
+src/chidori/src/protocol/chidori_net.c
+src/chidori/src/server/chidori_worker.c
+src/chidori/src/server/cuda_dispatch.c
+src/chidori/src/server/handle_map.h
+src/chidori/src/server/replay.c
+src/chidori/src/server/replay.h
 src/chidori_gpu.egg-info/PKG-INFO
 src/chidori_gpu.egg-info/SOURCES.txt
 src/chidori_gpu.egg-info/dependency_links.txt
