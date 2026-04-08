@@ -16,3 +16,13 @@ research/cudart-internals/test_isolated_register_first
 sdk/src/chidori/libs/*.so*
 sdk/src/chidori/libs/chidori-worker
 sdk/dist/
+
+# Juice Labs control plane — not part of chidori fair source
+control-plane/
+
+# Upstream framework sources used only for local testing
+jax/
+pytorch/
+transformers/
+
+.DS_Store
