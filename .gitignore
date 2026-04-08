@@ -5,7 +5,8 @@ chidori-worker/src/generated/
 *.exe
 chidori-worker/tests/request.sh
 .env
-.claude/worktrees/
+.claude/
+.letta/
 validate.sh
 research/cudart-internals/*.fatbin
 research/cudart-internals/*.bin

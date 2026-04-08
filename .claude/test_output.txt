@@ -1,2 +1,0 @@
-ERROR: ld.so: object 'build/libcuda.so.1' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
-/home/fabricio/chidori/.venv/bin/python: can't open file '/home/fabricio/chidori/tests/test_inference.py': [Errno 2] No such file or directory
